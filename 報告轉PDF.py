@@ -21,7 +21,8 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 pdfmetrics.registerFont(TTFont("JhengHei", "C:/Windows/Fonts/msjh.ttc", subfontIndex=0))
 pdfmetrics.registerFont(TTFont("JhengHeiBd", "C:/Windows/Fonts/msjhbd.ttc", subfontIndex=0))
 
-S_TITLE = ParagraphStyle("t", fontName="JhengHeiBd", fontSize=16, leading=22, spaceAfter=4)
+S_TITLE = ParagraphStyle("t", fontName="JhengHeiBd", fontSize=16, leading=22, spaceAfter=4, alignment=1)
+S_SUB = ParagraphStyle("sub", fontName="JhengHeiBd", fontSize=10, leading=15, spaceBefore=2, spaceAfter=8, alignment=1)
 S_META = ParagraphStyle("m", fontName="JhengHei", fontSize=8.5, leading=13, textColor=colors.HexColor("#555555"))
 S_HEAD = ParagraphStyle("h", fontName="JhengHeiBd", fontSize=10, leading=15, spaceBefore=8, spaceAfter=2)
 S_BODY = ParagraphStyle("b", fontName="JhengHei", fontSize=9.5, leading=14.5)
@@ -52,6 +53,7 @@ def main():
     story = []
     table_rows = []
     footers = []
+    seen_sub = False
 
     # 品牌頁首 logo(Meow House),置中約 1/3 頁寬
     logo_path = Path(__file__).parent / "assets" / "貓貓滿屋logo.png"
@@ -59,11 +61,11 @@ def main():
         from reportlab.lib.utils import ImageReader
         from reportlab.platypus import Image as RLImage
         liw, lih = ImageReader(str(logo_path)).getSize()
-        lw = 60 * mm
+        lw = 26 * mm
         limg = RLImage(str(logo_path), width=lw, height=lw * lih / liw)
         limg.hAlign = "CENTER"
         story.append(limg)
-        story.append(Spacer(1, 6))
+        story.append(Spacer(1, 2))
 
     def flush_table():
         nonlocal table_rows
@@ -116,7 +118,12 @@ def main():
         if not line.strip() or line.strip() == "---":
             continue
         if line.startswith("## "):
-            story.append(Paragraph(md_inline(line[3:]), S_HEAD))
+            # 第一個 ## = 副標(置中,跟標題湊招牌);其後 ## = section 標題(靠左)
+            if not seen_sub:
+                story.append(Paragraph(md_inline(line[3:]), S_SUB))
+                seen_sub = True
+            else:
+                story.append(Paragraph(md_inline(line[3:]), S_HEAD))
         elif line.startswith("# "):
             story.append(Paragraph(md_inline(line[2:]), S_TITLE))
         elif line.startswith("- "):
