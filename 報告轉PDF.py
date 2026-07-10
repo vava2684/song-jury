@@ -53,6 +53,18 @@ def main():
     table_rows = []
     footers = []
 
+    # 品牌頁首 logo(Meow House),置中約 1/3 頁寬
+    logo_path = Path(__file__).parent / "assets" / "logo_透明.png"
+    if logo_path.exists():
+        from reportlab.lib.utils import ImageReader
+        from reportlab.platypus import Image as RLImage
+        liw, lih = ImageReader(str(logo_path)).getSize()
+        lw = 60 * mm
+        limg = RLImage(str(logo_path), width=lw, height=lw * lih / liw)
+        limg.hAlign = "CENTER"
+        story.append(limg)
+        story.append(Spacer(1, 6))
+
     def flush_table():
         nonlocal table_rows
         if not table_rows:
