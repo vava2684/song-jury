@@ -1,0 +1,8 @@
+.venv/
+.venv-ml/
+SongEval/
+lexicon/nrc-vad/
+lexicon/*.zip
+下載/
+__pycache__/
+*.zip

@@ -1,0 +1,108 @@
+{
+  "meta": {
+    "file": "demo_mix.wav",
+    "key": "C 大調",
+    "key_conf": 0.957,
+    "bpm": 99.4,
+    "duration": 24.0
+  },
+  "scores": {
+    "vocal": 96.5,
+    "mix": 88.7,
+    "total": 93.0,
+    "grade": "S"
+  },
+  "vocal_detail": {
+    "pitch": {
+      "score": 99.6,
+      "mean_cents": 6.0,
+      "in_scale_rate": 1.0,
+      "n_notes": 25,
+      "comment": "平均偏差 6 音分,100% 落在調內"
+    },
+    "rhythm": {
+      "score": 100.0,
+      "consistency_ms": 9.3,
+      "systematic_offset_ms": -46.4,
+      "n_onsets": 25,
+      "beat_ms": 603.7,
+      "comment": "對拍一致性偏差 9 毫秒(整體習慣性提前 46 毫秒)"
+    },
+    "stability": {
+      "score": 100.0,
+      "mad_cents": 0.0,
+      "comment": "直音平均波動 0 音分"
+    },
+    "vibrato": {
+      "score": 95.8,
+      "rate_hz": 4.97,
+      "extent_cents": 16.3,
+      "presence": 1.0,
+      "comment": "速率 5.0 Hz、深度 16 音分,100% 長音有顫音"
+    },
+    "dynamics": {
+      "score": 95.9,
+      "spread_db": 8.2,
+      "comment": "強弱起伏 8.2 dB"
+    },
+    "voice_quality": {
+      "score": 100.0,
+      "jitter_pct": 0.09,
+      "shimmer_pct": 0.86,
+      "hnr_db": 52.0,
+      "comment": "jitter 0.09%、shimmer 0.9%、HNR 52.0 dB"
+    },
+    "range": {
+      "score": 74.4,
+      "span_semitones": 9.2,
+      "low": "C4",
+      "high": "A4",
+      "comment": "C4 到 A4,約 9 個半音"
+    }
+  },
+  "mix_detail": {
+    "loudness": {
+      "score": 100.0,
+      "lufs": -13.0,
+      "comment": "整體響度 -13.0 LUFS(串流平台常見目標約 -14)"
+    },
+    "dynamic_range": {
+      "score": 100.0,
+      "crest_db": 13.3,
+      "comment": "峰值均方根比 13.3 dB"
+    },
+    "spectral_balance": {
+      "score": 64.6,
+      "fractions": {
+        "low": 0.176,
+        "lowmid": 0.644,
+        "highmid": 0.0,
+        "air": 0.002
+      },
+      "comment": "低頻 18%|中頻 64%|中高頻 0%|高頻 0%"
+    },
+    "stereo": {
+      "score": 78.0,
+      "width": 0.12,
+      "corr": 0.972,
+      "comment": "寬度指數 0.12"
+    },
+    "clipping": {
+      "score": 100.0,
+      "clip_fraction": 0.0,
+      "comment": "無削波"
+    },
+    "structure": {
+      "score": 87.6,
+      "energy_contrast_db": 5.4,
+      "timbre_variation": 0.089,
+      "comment": "段落能量落差 5.4 dB,音色變化係數 0.09"
+    },
+    "harmony": {
+      "score": 97.9,
+      "n_pitch_classes": 7,
+      "changes_per_sec": 0.38,
+      "comment": "使用 7 個音級,和聲變化約每秒 0.38 次"
+    }
+  }
+}
