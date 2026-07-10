@@ -6,3 +6,4 @@ lexicon/*.zip
 下載/
 __pycache__/
 *.zip
+lexicon/*.tsv
