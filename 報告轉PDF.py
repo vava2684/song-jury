@@ -54,7 +54,7 @@ def main():
     footers = []
 
     # 品牌頁首 logo(Meow House),置中約 1/3 頁寬
-    logo_path = Path(__file__).parent / "assets" / "logo_透明.png"
+    logo_path = Path(__file__).parent / "assets" / "貓貓滿屋logo.png"
     if logo_path.exists():
         from reportlab.lib.utils import ImageReader
         from reportlab.platypus import Image as RLImage
