@@ -122,16 +122,21 @@ def main():
     # 自動內嵌情感弧線圖(找 歌名_歌詞_情感弧線.png 或同資料夾含「情感弧線」的 png)
     song = src.stem.replace("_評審團報告", "")
     arc = src.parent / f"{song}_歌詞_情感弧線.png"
+    heading = "情感弧線圖"
     if not arc.exists():
         cands = sorted(src.parent.glob(f"{song}*情感弧線*.png"))
         arc = cands[0] if cands else None
+    if not arc:  # PK 等報告:找雷達圖
+        cands = sorted(src.parent.glob("*雷達*.png"))
+        if cands:
+            arc, heading = cands[0], "多維雷達圖"
     if arc:
         from reportlab.lib.utils import ImageReader
         from reportlab.platypus import Image as RLImage
         iw, ih = ImageReader(str(arc)).getSize()
-        w = A4[0] - 30 * mm
+        w = (A4[0] - 30 * mm) * (0.72 if heading == "多維雷達圖" else 1.0)
         story.append(Spacer(1, 6))
-        story.append(Paragraph("<b>情感弧線圖</b>", S_HEAD))
+        story.append(Paragraph(f"<b>{heading}</b>", S_HEAD))
         story.append(RLImage(str(arc), width=w, height=w * ih / iw))
 
     if footers:
