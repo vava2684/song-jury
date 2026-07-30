@@ -1,0 +1,41 @@
+# 第三個環境 .venv-audition —— 新柱管線(演唱聽感 SingMOS + 真實距離 MuQ + AI 感 SONICS)
+#
+# 為什麼要獨立一個 venv:這三個模型的 torch/transformers 版本與 .venv-ml(SongEval/Audiobox)
+# 相衝,硬裝同一個環境會互相踩死。三個環境各司其職是實測後的結論,不是潔癖。
+#
+# 安裝(Windows PowerShell;Linux/macOS 把 Scripts 換成 bin):
+#   python -m venv .venv-audition
+#   .\.venv-audition\Scripts\pip install -r requirements-audition.txt
+#   .\.venv-audition\Scripts\pip install "git+https://github.com/awsaf49/sonics.git"
+#
+# ⚠️ torch 這行是 CUDA 12.4 版(NVIDIA GPU)。純 CPU 或其他 CUDA 版本請改用官方選擇器:
+#    https://pytorch.org/get-started/locally/  —— 沒有 GPU 也能跑,只是慢。
+#
+# 權重會在第一次執行時自動下載(SingMOS 走 torch.hub、MuQ/SONICS 走 HuggingFace),
+# 合計約 3 GB。SONICS 的 checkpoint 需放在 _審核/ckpt/sonics-alpha-120s(見 真實距離.py)。
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0
+torchaudio==2.6.0
+transformers==5.14.1
+huggingface_hub==1.24.0
+safetensors==0.8.0
+
+# SingMOS(歌唱聽感 MOS;透過 torch.hub 載入,需要 s3prl 提供 SSL backbone)
+s3prl==0.4.18
+
+# MuQ(真實距離用的音樂嵌入編碼器)
+muq==0.1.0
+nnaudio==0.3.4
+einops==0.8.2
+omegaconf==2.3.1
+peft==0.19.1
+
+# 音訊 I/O
+librosa==0.11.0
+soundfile==0.14.0
+numpy==2.4.6
+
+# SONICS(AI 生成偵測,顯示軸不計分)—— PyPI 上沒有,請用上面註解的 git 指令安裝
+# sonics==0.1.0

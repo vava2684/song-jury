@@ -1,0 +1,227 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""批次評測 + 鑑別力分析 —— Phase 2「八家對決定權重」的證據產生器。
+
+為什麼需要這支:
+    權重要有依據,不能靠印象投票。判斷「某個指標值不值得高權重」的前提是
+    ——【它在一批歌之間分得出高低嗎】。只有一首歌的分數,任何權重討論都是空談。
+    本工具把 N 首歌跑過完整七關,再算出每個指標的離散程度與相關性,
+    產出一份「哪些指標有鑑別力、哪些是常數」的證據表交給評審。
+
+⛔ 必須循序跑,不可平行:SongEval 尖峰約 20.1GB、Music Flamingo 約 16.7GB,
+   同時上卡會 OOM。一首約 5-8 分鐘。
+
+用法:
+    python 批次評測.py <歌單.txt 或 資料夾>  [--out 結果夾] [--skip-existing]
+    歌單.txt = 一行一個音檔路徑(# 開頭是註解;可在路徑後加 ` | 標籤` 註明她的主觀評價)
+
+輸出:
+    <結果夾>/批次結果.json    每首的完整七關數據
+    <結果夾>/鑑別力報告.md    給八家評審看的證據表
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from statistics import mean, pstdev
+
+os.environ.setdefault("PYTHONUTF8", "1")
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+BASE = Path(__file__).parent.resolve()
+_WIN = sys.platform == "win32"
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {}
+VENV_PY = BASE / (".venv/Scripts/python.exe" if _WIN else ".venv/bin/python")
+
+AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
+
+
+def collect_songs(target: Path):
+    """歌單檔或資料夾 → [(音檔路徑, 標籤)]。標籤是她可選填的主觀評價,用來對照指標準不準。"""
+    out = []
+    if target.is_dir():
+        for p in sorted(target.iterdir()):
+            if p.suffix.lower() in AUDIO_EXT:
+                out.append((p, ""))
+        return out
+    for line in target.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        path, _, label = line.partition("|")
+        p = Path(path.strip())
+        if p.exists():
+            out.append((p, label.strip()))
+        else:
+            print(f"⚠ 找不到,跳過:{p}", file=sys.stderr)
+    return out
+
+
+def run_one(song: Path, timeout=3600):
+    """跑六關,回 merged dict 或 None。
+
+    ⛔ 預設【略過 Gemini】—— 2026-07-20 教訓:批次是一首接一首零間隔跑,
+       39 首 = 39 次連續呼叫 → 她的 Gemini 金鑰被 Google 擋掉,**約 28 天才恢復**。
+       批次的用途是算鑑別力(本機確定性關卡就夠),不該把外部 API 綁進來。
+       真的要在批次裡跑 Gemini:設環境變數 SONG_JURY_BATCH_GEMINI=1(自負風險)。
+    """
+    out_json = song.with_name(song.stem + "_評審團.json")
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    if os.environ.get("SONG_JURY_BATCH_GEMINI") != "1":
+        env["SONG_JURY_SKIP_GEMINI"] = "1"
+    r = subprocess.run([str(VENV_PY), str(BASE / "評審團.py"), str(song)],
+                       cwd=str(BASE), capture_output=True, text=True, env=env,
+                       encoding="utf-8", errors="replace", timeout=timeout, **_NO_WINDOW)
+    if not out_json.exists():
+        return None, (r.stderr or r.stdout or "")[-300:]
+    d = json.loads(out_json.read_text(encoding="utf-8"))
+    return d, ""
+
+
+def flatten(m: dict):
+    """把七關的 merged JSON 壓成 {指標名: 數值},方便跨歌比較。
+    只取數值型,且明確標出來源關卡,免得評審看不出誰是誰。"""
+    f = {}
+    p = (m.get("layer1_physical") or {})
+    for k, v in (p.get("scores") or {}).items():
+        if isinstance(v, (int, float)):
+            f[f"物理.{k}"] = v
+    for k, v in (p.get("mix_detail") or {}).items():
+        if isinstance(v, dict) and isinstance(v.get("score"), (int, float)):
+            f[f"物理.混音.{k}"] = v["score"]
+    for k, v in (p.get("vocal_detail") or {}).items():
+        if isinstance(v, dict) and isinstance(v.get("score"), (int, float)):
+            f[f"演唱.{k}"] = v["score"]
+
+    a = m.get("layer1_arrangement") or {}
+    for grp in ("layers", "arrangement", "spectrum"):
+        for k, v in (a.get(grp) or {}).items():
+            if isinstance(v, (int, float)):
+                f[f"編曲.{k}"] = v
+
+    h = m.get("layer1_harmony") or {}
+    for k, v in (h.get("metrics") or {}).items():
+        if isinstance(v, dict) and isinstance(v.get("score"), (int, float)):
+            f[f"和聲.{k}"] = v["score"]
+
+    for k, v in (m.get("layer2_songeval_1to5") or {}).items():
+        if isinstance(v, (int, float)):
+            f[f"SongEval.{k}"] = v
+    for k, v in (m.get("layer2_audiobox_1to10") or {}).items():
+        if isinstance(v, (int, float)):
+            f[f"Audiobox.{k}"] = v
+
+    g = m.get("layer2_gemini") or {}
+    for k, v in (g.get("dimensions") or {}).items():
+        if isinstance(v, dict) and isinstance(v.get("score"), (int, float)):
+            f[f"Gemini.{k}"] = v["score"]
+
+    mf = m.get("layer2_flamingo") or {}
+    for k, v in (mf.get("scored_items") or {}).items():
+        if isinstance(v, dict) and isinstance(v.get("score"), (int, float)):
+            f[f"Flamingo.{k}"] = v["score"]
+    return f
+
+
+def discrimination_report(rows, out_md: Path):
+    """算每個指標的鑑別力,寫成給評審看的證據表。
+
+    ⭐ 判準:一個在所有歌上都給幾乎相同分數的指標,不管理論多漂亮,
+       實務上都無法區分作品 —— 給它高權重等於把總分交給雜訊。
+       這裡只呈現事實(全距/標準差/是否常數),【不自行給權重建議】,
+       權重由八家對決裁定。
+    """
+    keys = sorted({k for _, f in rows for k in f})
+    stats = []
+    for k in keys:
+        vals = [f[k] for _, f in rows if k in f and f[k] is not None]
+        if len(vals) < 2:
+            continue
+        lo, hi = min(vals), max(vals)
+        sd = pstdev(vals)
+        rng = hi - lo
+        # 以該指標自身的量尺正規化(0-100 / 1-5 / 1-10 混在一起不能直接比)
+        scale = 100.0 if hi > 10 else (10.0 if hi > 5 else 5.0)
+        stats.append((k, len(vals), lo, hi, rng, sd, rng / scale))
+    stats.sort(key=lambda x: x[6], reverse=True)
+
+    L = [f"# 指標鑑別力報告(N = {len(rows)} 首)", "",
+         "> 這份表回答一個問題:**哪些指標在這批歌之間真的分得出高低?**",
+         "> 全距接近 0 的指標 = 對任何歌都給差不多的分數,無論理論多完備,",
+         "> 給它高權重就是把總分交給雜訊。⚠️ 本表只陳述事實,不建議權重 —— 權重由八家對決裁定。", "",
+         "| 指標 | 樣本 | 最低 | 最高 | 全距 | 標準差 | 正規化全距 |",
+         "|---|---|---|---|---|---|---|"]
+    for k, n, lo, hi, rng, sd, nr in stats:
+        flag = "  ⛔常數" if nr < 0.02 else ("  ⚠️低" if nr < 0.10 else "")
+        L.append(f"| {k}{flag} | {n} | {lo:.2f} | {hi:.2f} | {rng:.2f} | {sd:.2f} | {nr:.3f} |")
+
+    dead = [s for s in stats if s[6] < 0.02]
+    weak = [s for s in stats if 0.02 <= s[6] < 0.10]
+    L += ["", f"## 摘要", "",
+          f"- 共 {len(stats)} 個數值指標",
+          f"- **無鑑別力(正規化全距 < 0.02):{len(dead)} 個** —— {', '.join(s[0] for s in dead[:12]) or '無'}",
+          f"- 鑑別力偏低(< 0.10):{len(weak)} 個 —— {', '.join(s[0] for s in weak[:12]) or '無'}",
+          "",
+          "## 這批歌", "",
+          "| 歌名 | 她的標籤 |", "|---|---|"]
+    for name, _ in rows:
+        L.append(f"| {name} |  |")
+    out_md.write_text("\n".join(L), encoding="utf-8")
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    target = Path(sys.argv[1])
+    out_dir = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else BASE / "_批次結果"
+    skip = "--skip-existing" in sys.argv
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    songs = collect_songs(target)
+    if not songs:
+        sys.exit("沒有找到任何音檔")
+    print(f"共 {len(songs)} 首,循序評測(GPU 不可平行)。預估 {len(songs) * 6} 分鐘\n")
+
+    results, rows = {}, []
+    store = out_dir / "批次結果.json"
+    if skip and store.exists():
+        results = json.loads(store.read_text(encoding="utf-8"))
+
+    for i, (song, label) in enumerate(songs, 1):
+        key = song.name
+        if key in results:
+            print(f"[{i}/{len(songs)}] {key} — 已有結果,跳過")
+        else:
+            t0 = time.time()
+            print(f"[{i}/{len(songs)}] {key} … ", end="", flush=True)
+            try:
+                m, err = run_one(song)
+            except subprocess.TimeoutExpired:
+                m, err = None, "逾時"
+            if m is None:
+                print(f"✗ {err[:70]}")
+                results[key] = {"error": err, "label": label}
+            else:
+                m["_label"] = label
+                results[key] = m
+                print(f"✓ {time.time()-t0:.0f}s")
+            store.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
+
+        m = results.get(key)
+        if m and "error" not in m:
+            rows.append((key, flatten(m)))
+
+    if len(rows) >= 2:
+        discrimination_report(rows, out_dir / "鑑別力報告.md")
+        print(f"\n鑑別力報告:{out_dir / '鑑別力報告.md'}")
+    else:
+        print("\n⚠ 成功的歌少於 2 首,無法算鑑別力")
+    print(f"完整數據:{store}")
+
+
+if __name__ == "__main__":
+    main()

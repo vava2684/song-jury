@@ -90,8 +90,27 @@ def split_sections(text):
             if TEXTY.search(body or ""):
                 sections.append((label, body))
     else:
-        for i, blk in enumerate([b for b in re.split(r"\n\s*\n", text) if TEXTY.search(b)], 1):
-            sections.append((f"段{i}", blk.strip()))
+        blocks = [b for b in re.split(r"\n\s*\n", text) if TEXTY.search(b)]
+        if len(blocks) >= 2:
+            for i, blk in enumerate(blocks, 1):
+                sections.append((f"段{i}", blk.strip()))
+        else:
+            # ⚖️ 2026-07-25 第三層退路(她回報「弧線圖只有一個點」):
+            #    SUNO 新模式(v5.5 Preview)吐的詞常常【既無 [Verse] 標記、也無空行】→
+            #    前兩層退路全落空,整首擠成一段,弧線退化成單點、看不出情緒走向。
+            #    改依行數均分(最多 8 段,近似主副歌長度);段名標「自動」,
+            #    誠實提醒使用者這是系統切的、不是作者標的段落。
+            lines = [ln.strip() for ln in text.splitlines() if TEXTY.search(ln)]
+            if len(lines) >= 8:
+                n = min(8, max(2, len(lines) // 4))        # 目標每段 4–5 行,最多 8 段
+                base, rem = divmod(len(lines), n)          # 餘數分給前幾段
+                idx = 0                                    # → 不留「尾段只剩 1 行」把弧線尾巴帶偏
+                for i in range(n):
+                    take = base + (1 if i < rem else 0)
+                    sections.append((f"自動{i + 1}", "\n".join(lines[idx:idx + take])))
+                    idx += take
+            elif lines:
+                sections.append(("段1", "\n".join(lines)))
     return sections
 
 
@@ -182,12 +201,28 @@ def main():
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams["font.family"] = "Microsoft JhengHei"
+        from matplotlib import font_manager
+        # 跨平台綁定中文字型(取代寫死的 Windows 微軟正黑;沒字型時 matplotlib 會把中文畫成豆腐 □□□)
+        for _fp in ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+                    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                    "C:/Windows/Fonts/msjh.ttc",                       # Windows 微軟正黑
+                    "/System/Library/Fonts/PingFang.ttc",             # macOS 蘋方
+                    str(BASE / "assets" / "NotoSansTC-Regular.otf")):  # repo 內建(如有)
+            if Path(_fp).exists():
+                try:
+                    font_manager.fontManager.addfont(_fp)
+                    plt.rcParams["font.sans-serif"] = [font_manager.FontProperties(fname=_fp).get_name()]
+                    plt.rcParams["font.family"] = "sans-serif"
+                    break
+                except Exception:
+                    continue
         plt.rcParams["axes.unicode_minus"] = False
         labels = [r["section"] for r in results]
         vs = [r["valence"] for r in results]
         as_ = [r["arousal"] for r in results]
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 12))   # 上下堆疊(直式)→ 手機塞得下、看得清
         x = range(len(results))
         ax1.plot(x, vs, "o-", label="Valence 愉悅度", linewidth=2)
         ax1.plot(x, as_, "s--", label="Arousal 激動度", linewidth=2)
@@ -198,8 +233,10 @@ def main():
         ax1.set_title("逐段情緒軌跡(0.5=中性)")
         ax1.legend()
         ax2.plot(vs, as_, "o-", alpha=0.7)
-        for i, lb in enumerate(labels):
-            ax2.annotate(f"{i+1}.{lb}", (vs[i], as_[i]), fontsize=8)
+        # 點上只標「號碼」(避免情緒平坦時段落名全擠在一起);號碼→段落名放右側對照表
+        for i in range(len(results)):
+            ax2.annotate(str(i + 1), (vs[i], as_[i]), fontsize=9, fontweight="bold",
+                         color="#c026d3", xytext=(4, 4), textcoords="offset points")
         ax2.axhline(0.5, color="gray", linewidth=0.8, alpha=0.6)
         ax2.axvline(0.5, color="gray", linewidth=0.8, alpha=0.6)
         ax2.set_xlim(0, 1)
@@ -207,8 +244,12 @@ def main():
         ax2.set_xlabel("Valence 愉悅度")
         ax2.set_ylabel("Arousal 激動度")
         ax2.set_title("Russell 情感環狀平面路徑")
+        # 號碼 → 段落名 對照(放最底、自動換行,不擠在點上)
+        key = "    ".join(f"{i + 1}. {lb}" for i, lb in enumerate(labels))
+        fig.text(0.5, 0.015, key, fontsize=8, va="bottom", ha="center", wrap=True,
+                 bbox=dict(boxstyle="round,pad=0.5", fc="#faf5ff", ec="#e9d5ff"))
         fig.suptitle(src.stem)
-        fig.tight_layout()
+        fig.tight_layout(rect=[0, 0.06, 1, 0.96])
         png = src.with_name(src.stem + "_情感弧線.png")
         fig.savefig(png, dpi=120)
         print(f"\n弧線圖: {png}")

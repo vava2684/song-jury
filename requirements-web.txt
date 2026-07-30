@@ -1,0 +1,5 @@
+# 地端 Gradio 網頁版(app.py)專用依賴
+# 安裝: uv venv --python 3.11 .venv-web && uv pip install --python .venv-web/... -r requirements-web.txt
+# 註:app.py 只負責網頁與串接,實際評分呼叫 .venv / .venv-ml(需先跑 install)
+gradio==6.20.0
+requests>=2.31

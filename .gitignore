@@ -1,9 +1,82 @@
-.venv/
-.venv-ml/
-SongEval/
-lexicon/nrc-vad/
-lexicon/*.zip
-下載/
-__pycache__/
-*.zip
-lexicon/*.tsv
+# ══════════════════════════════════════════════════════════════
+#  song-jury .gitignore —— ⚠️ 白名單制(2026-07-29 改)
+#
+#  為什麼改成白名單:舊版是黑名單,結果 _C層得獎歌/(54 首金曲/葛萊美得獎歌 mp3)、
+#  _stems/(7.4GB Demucs 分軌)、10 個內部實驗資料夾全都沒被擋 —— 一 push 就是版權事故。
+#  黑名單「忘了寫就外洩」,白名單「忘了寫就不外洩」—— 公開 repo 只能用後者。
+#
+#  規則:先全部忽略,再逐項放行(!)。新增檔案要進 repo → 自己在下面補一行 !。
+# ══════════════════════════════════════════════════════════════
+
+# ── 第一步:全部忽略 ──
+/*
+/*/
+
+# ── 第二步:放行「說明與設定」──
+!.gitignore
+!README.md
+!LICENSE
+!SKILL.md
+!.env.example
+!requirements.txt
+!requirements-ml.txt
+!requirements-audition.txt
+!requirements-web.txt
+
+# ── 放行「程式」──
+!評審團.py
+!song_scorer.py
+!和聲分析.py
+!編曲層次.py
+!Gemini曲評.py
+!演唱聽感.py
+!真實距離.py
+!情感弧線.py
+!顯示規則.py
+!批次評測.py
+!曲評測清單.py
+!報告轉PDF.py
+!轉PNG.py
+!brand_logo.py
+!setup_nrcvad.py
+!make_demo_song.py
+!install.ps1
+!install.sh
+!app.py
+!run_web.ps1
+!run_web.sh
+
+# ── 放行「規則與尺」(系統的靈魂,必須隨包)──
+!評詞標準.md
+!得獎精神綱要.md
+!全評測內容總清單.md
+!親聽檢查清單.md
+!rubrics/
+!rubrics/**
+!docs/
+!docs/**
+# 給打包者的內部文件,不進公開包(⚠ gitignore 不支援行內註解,註解要自成一行)
+docs/PACKAGING.md
+
+# ── 放行「錨參照」(衍生統計,不是音檔;別人靠它復現打分)──
+!_錨參照/
+!_錨參照/**
+
+# ── 放行「安裝驗證用 demo」(合成音,非真實作品)──
+!demo_mix.wav
+!demo_report.json
+
+# ── 放行 assets(logo 等品牌素材)──
+!assets/
+!assets/**
+
+# ══════════════════════════════════════════════════════════════
+#  以下永遠不進 repo(即使有人手滑加了 ! 也請刪掉)
+#  ⛔ 版權:_C層得獎歌/(得獎歌 mp3)、_stems/(分軌)、下載/(測試歌)
+#  ⛔ 內部實驗:_批次結果*/、_審核/、_效度測試*/、_Gemini54/、_試聽驗證/、
+#              _編碼實驗/、_得獎歌詞鑑別/、_網址*.txt、_歌單*.txt、_C層*.txt
+#  ⛔ 金鑰:.env、.gemini_key_state.json
+#  ⛔ 個人校準層:個人整理資料/、_個人*/(雙層架構鐵則:錨點判例出廠為空)
+#  ⛔ 授權不可再散布:SongEval/(CC BY-NC-SA)、lexicon/nrc-vad/(禁再散布)
+#  ⛔ 環境:.venv*/、__pycache__/
+# ══════════════════════════════════════════════════════════════

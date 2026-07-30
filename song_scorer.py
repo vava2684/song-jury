@@ -51,25 +51,36 @@ SR_MIX = 44100     # 混音品質分析用取樣率(響度、頻譜、立體聲)
 # ---------------------------------------------------------------------------
 # 權重設定(可用 --weights 覆寫)
 # ---------------------------------------------------------------------------
+# ⚖️ 2026-07-24 起為【十三家評審團辯論定版】(非手訂暫定值):
+#    全流程與 52+ 份答卷在 D:\Source\SUNO\多語詞評計畫\權重辯論_20260723\(全案總結.md)。
+#    - 混音:權重案 Q4(雙樣本)——三死項歸零(loudness/clipping 轉「異常時警報」,
+#      dynamic_range 已改 LRA 但凍結至過 A 層複驗+單格重開)。
+#    - 演唱:權重案 Q5 + H3 更正案(13:0)——rhythm 判「修-凍結」權重 0
+#      (修好節拍網格、過「人聲單獨錯位」A 層才復權),其餘六項按 Q5 比例攤回。
+#    ⛔ 改任何一格 = 推翻評審團裁決,須單格重開辯論,不准手改。
 DEFAULT_WEIGHTS = {
-    "overall": {"vocal": 0.55, "mix": 0.45},
+    "overall": {"vocal": 0.55, "mix": 0.45},   # (--blend-vocal 路徑用;新總分架構见 評審團.py)
     "vocal": {
-        "pitch": 0.30,        # 音準
-        "rhythm": 0.15,       # 節奏
-        "stability": 0.15,    # 長音穩定度
-        "vibrato": 0.10,      # 顫音
-        "dynamics": 0.10,     # 動態控制
-        "voice_quality": 0.10,  # 嗓音品質
-        "range": 0.10,        # 音域
+        "pitch": 0.3529,        # 音準(Q5 30 ÷ 0.85;曲線已依 V4 裁決重寫為逐幀 p70)
+        "rhythm": 0.0,          # ⛔ 凍結(H2 D1:修-凍結至復權;分數照算照顯示,標「凍結中」)
+        "stability": 0.1765,    # 長音穩定度(Q5 15 ÷ 0.85)
+        "vibrato": 0.1176,      # 顫音(Q5 10 ÷ 0.85)
+        "dynamics": 0.1176,     # 動態控制
+        "voice_quality": 0.1176,  # 嗓音品質
+        "range": 0.1176,        # 音域
     },
     "mix": {
-        "loudness": 0.15,         # 整體響度
-        "dynamic_range": 0.20,    # 動態範圍
-        "spectral_balance": 0.20, # 頻譜平衡
-        "stereo": 0.10,           # 立體聲寬度
-        "clipping": 0.10,         # 削波檢測
-        "structure": 0.15,        # 層次鋪陳
-        "harmony": 0.10,          # 和聲豐富度
+        # ⚖️ 2026-07-24 G 庭更新(13:0):dynamic_range(LRA)復權 ——
+        #    三證齊全:A 層過(20:1 壓縮 100→32)+ SUNO 鑑別力 0.278 + 真實得獎歌 0.618。
+        #    loudness/clipping 維持體檢角色(G3,13:0):真實音樂上它們量的是母帶美學
+        #    (54 首中 crest 最低=五座葛萊美的 Not Like Us),排名權重=曲風歧視。
+        "loudness": 0.0,          # 體檢警報(異常時顯示,見 顯示規則.py),不進排名
+        "dynamic_range": 0.15,    # ⭐ LRA 復權(G1 十三席中位配比)
+        "spectral_balance": 0.31, # 頻譜平衡
+        "stereo": 0.18,           # 立體聲寬度
+        "clipping": 0.0,          # 體檢警報,不進排名
+        "structure": 0.21,        # 層次鋪陳
+        "harmony": 0.15,          # 和聲豐富度
     },
 }
 
@@ -169,25 +180,38 @@ def segment_notes(f0, voiced, times, min_dur=0.10):
 
 
 def pitch_metrics(notes, scale_pcs):
-    """音準(無參考版):量測每顆音貼合半音格線的程度 + 落在調內的比例。"""
+    """音準(無參考版)。
+
+    ⚖️ 2026-07-24 依十三家評審團裁決重寫(如何評案 V4,13:0 修-立即):
+       舊版只看「每顆音的中位音高」貼不貼半音格 —— ±40 音分、5Hz 的嚴重抖動被中位數
+       整顆吸收,針對性 A 層實測只扣 2.6 分(97.3→94.7)。
+       新版改【逐幀偏差的時間加權分佈】:取全部有聲幀距最近半音的音分偏差,
+       以 p70(第 70 百分位)重罰持續性走音;驗收錨點=±40 音分抖動應落 60 分帶。
+       音符中心準度與調內率降為次要成分;自然顫音(深度 ≤25 音分)不會觸及重罰帶。"""
     if not notes:
         return None
-    chrom_dev, in_scale = [], []
+    frame_dev, chrom_dev, in_scale = [], [], []
     for nt in notes:
+        seg = np.asarray(nt["midi"], dtype=float)
+        frame_dev.extend(np.abs(seg - np.round(seg)) * 100)   # 逐幀:抖動藏不住
         m = nt["median"]
-        chrom_dev.append(abs(m - round(m)) * 100)  # 距最近半音幾音分
+        chrom_dev.append(abs(m - round(m)) * 100)
         pc = int(round(m)) % 12
         in_scale.append(1.0 if pc in scale_pcs else 0.0)
+    p70_cents = float(np.percentile(frame_dev, 70)) if frame_dev else 0.0
     mean_cents = float(np.mean(chrom_dev))
     in_scale_rate = float(np.mean(in_scale))
-    intonation = piecewise(mean_cents, [(5, 100), (15, 95), (25, 85), (35, 70), (50, 45)])
-    score = 0.8 * intonation + 0.2 * in_scale_rate * 100
+    inton_frame = piecewise(p70_cents, [(8, 100), (15, 92), (25, 78), (35, 62), (45, 45), (60, 28)])
+    inton_center = piecewise(mean_cents, [(5, 100), (15, 95), (25, 85), (35, 70), (50, 45)])
+    score = 0.6 * inton_frame + 0.2 * inton_center + 0.2 * in_scale_rate * 100
     return {
         "score": round(score, 1),
+        "p70_cents": round(p70_cents, 1),
         "mean_cents": round(mean_cents, 1),
         "in_scale_rate": round(in_scale_rate, 3),
         "n_notes": len(notes),
-        "comment": f"平均偏差 {mean_cents:.0f} 音分,{in_scale_rate * 100:.0f}% 落在調內",
+        "comment": f"逐幀偏差 p70={p70_cents:.0f} 音分・音符中心 {mean_cents:.0f} 音分,"
+                   f"{in_scale_rate * 100:.0f}% 落在調內",
     }
 
 
@@ -355,29 +379,102 @@ def loudness_metrics(y_stereo, sr):
         return None
     score = piecewise(lufs, [(-30, 40), (-22, 70), (-18, 90), (-16, 100),
                              (-9, 100), (-7, 85), (-4, 60)])
+    if lufs > -13.5:
+        note = "建議發行前正規化到串流標準 -14 LUFS"
+    elif lufs >= -14.6:
+        note = "已在串流標準 -14 附近,發行就緒"
+    else:
+        note = "略低於串流標準 -14"
     return {"score": round(score, 1), "lufs": round(float(lufs), 1),
-            "comment": f"整體響度 {lufs:.1f} LUFS(串流平台常見目標約 -14)"}
+            "comment": f"整體響度 {lufs:.1f} LUFS——{note}"}
 
 
-def dynamic_range_metrics(y_mono):
+def dynamic_range_metrics(y_mono, y_stereo=None, sr=None):
+    """動態範圍。
+
+    ⚖️ 2026-07-24 依十三家評審團裁決重寫(如何評案 V5,13:0 採納 LRA):
+       舊版用峰值均方根比(crest),曲線 10~16dB 全給滿分 —— A 層 20:1 過度壓縮
+       實測 100→100 一分沒掉(現代母帶把峰值與 RMS 一起推高,比值不動)。
+       新版改 EBU R128 精神的 LRA(Loudness Range):3 秒短時響度、1 秒跳,
+       絕對閘 -70 LUFS + 相對閘(均值 -20 LU),LRA = p95 − p10。
+       壓縮壓的就是響度域的分佈寬度 —— 20:1 壓平必然重傷 LRA。
+    ⛔ 權重凍結為 0:須通過 A 層複驗(20:1 壓縮大幅掉分)後,由評審團單格重開才復權。
+       crest 保留當參考欄位,不再驅動分數。"""
     peak = float(np.max(np.abs(y_mono)) + 1e-12)
     rms = float(np.sqrt(np.mean(y_mono ** 2)) + 1e-12)
     crest = 20 * np.log10(peak / rms)
+    lra = None
+    if HAS_LOUDNORM and y_stereo is not None and sr:
+        try:
+            data = y_stereo.T if y_stereo.ndim == 2 else y_stereo
+            meter = pyln.Meter(sr, block_size=0.400)
+            win, hop = int(3.0 * sr), int(1.0 * sr)
+            st = []
+            for i in range(0, max(1, len(data) - win), hop):
+                v = meter.integrated_loudness(data[i:i + win])
+                if np.isfinite(v) and v > -70.0:           # 絕對閘
+                    st.append(float(v))
+            if len(st) >= 8:
+                gate = float(np.mean(st)) - 20.0            # 相對閘
+                st = [v for v in st if v >= gate] or st
+                lra = float(np.percentile(st, 95) - np.percentile(st, 10))
+        except Exception:
+            lra = None
+    if lra is not None:
+        score = piecewise(lra, [(1.0, 25), (2.5, 50), (4.0, 75), (6.0, 92),
+                                (8.0, 100), (13.0, 100), (18.0, 88), (25.0, 70)])
+        cm = f"LRA {lra:.1f} LU(短時響度 p95−p10)・crest {crest:.1f} dB(參考)"
+        if lra < 3.0:
+            cm += ",動態被壓得很緊"
+        return {"score": round(score, 1), "lra_lu": round(lra, 1),
+                "crest_db": round(crest, 1), "comment": cm}
+    # 退路:無 pyloudnorm/立體聲資料 → 沿用舊 crest 曲線,並明白標示
     score = piecewise(crest, [(4, 40), (6, 65), (8, 85), (10, 100),
                               (16, 100), (20, 85), (26, 65)])
     return {"score": round(score, 1), "crest_db": round(crest, 1),
-            "comment": f"峰值均方根比 {crest:.1f} dB" + (",壓縮偏重" if crest < 7 else "")}
+            "comment": f"峰值均方根比 {crest:.1f} dB(LRA 不可用,退回舊法)"}
+
+
+# ⚖️ 頻譜健康帶 —— 依 profile 分套(2026-07-24 J 庭 J1,11:2「成品側以 54 首得獎分佈重錨」):
+#   SUNO 帶  = 原流行常模(SUNO profile 沿用,29 首實測全在帶內,行為不變)
+#   成品帶   = 54 首葛萊美/金曲/KMA 得獎歌實測 p5–p95(數據驅動零手訂)。
+#             實證病灶:真實母帶過半落在舊帶外(low 中位 .391 貼上限 .40、highmid 中位 .043
+#             低於下限 .08、air 中位 .016 低於 .02)→ 金曲獎作品被扣到 36.9,
+#             且「砍低頻」兩曲風都反而加分(+27.8/+23.6)。
+#   ⚠️ air 上界例外:語料是 128k MP3(16kHz 以上被低通),air 分佈被壓抑 →
+#      上界不可用此數據錨(會冤枉真無損母帶),沿用舊值 0.20;下界取數據 p5。
+#   切換:環境變數 SONG_JURY_PROFILE=release → 成品帶;預設/其他 → SUNO 帶。
+_BANDS_SUNO = {
+    "low":     (60, 250,   0.12, 0.40),
+    "lowmid":  (250, 2000, 0.30, 0.60),
+    "highmid": (2000, 6000, 0.08, 0.35),
+    "air":     (6000, 20000, 0.02, 0.20),
+}
+_BANDS_RELEASE = {
+    # 2026-07-24 AAC256 試聽語料複驗(43 首指紋確證,_試聽驗證/重錨報告.md):
+    #   low/lowmid/highmid 同曲相關 r=.84-.88、偏差≤.012 → 低/中頻錨「已複驗成立」。
+    #   air:真實母帶 p5-p95=0.003-0.030(全頻寬量測),遠低於現行上界 0.20(沿用 SUNO 的權宜值);
+    #       數據支持收緊上界至 ~0.05,惟改格=單格重開辯論,未裁決前維持 0.20。
+    #   語料=AAC 256k 非無損;無損母帶到手前為最高可得證據等級。
+    "low":     (60, 250,   0.17, 0.60),
+    "lowmid":  (250, 2000, 0.13, 0.60),
+    "highmid": (2000, 6000, 0.01, 0.12),
+    "air":     (6000, 20000, 0.004, 0.20),
+}
 
 
 def spectral_balance_metrics(y_mono, sr):
+    import os as _os
+    _profile = (_os.environ.get("SONG_JURY_PROFILE") or "suno").lower()
+    _b = _BANDS_RELEASE if _profile == "release" else _BANDS_SUNO
     S = np.abs(librosa.stft(y_mono, n_fft=4096)) ** 2
     freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
     total = float(S.sum()) + 1e-12
     bands = {
-        "low":     (60, 250,   0.12, 0.40),
-        "lowmid":  (250, 2000, 0.30, 0.60),
-        "highmid": (2000, 6000, 0.08, 0.35),
-        "air":     (6000, 20000, 0.02, 0.20),
+        "low":     (60, 250,   _b["low"][2], _b["low"][3]),
+        "lowmid":  (250, 2000, _b["lowmid"][2], _b["lowmid"][3]),
+        "highmid": (2000, 6000, _b["highmid"][2], _b["highmid"][3]),
+        "air":     (6000, 20000, _b["air"][2], _b["air"][3]),
     }
     fracs, penalty = {}, 0.0
     for name, (f1, f2, lo, hi) in bands.items():
@@ -471,7 +568,7 @@ def analyze_mix(mix_path, beat_times_ref=None):
     beats = estimate_beats(y22, SR_MUSIC) if beat_times_ref is None else beat_times_ref
     return {
         "loudness": loudness_metrics(y_st, sr),
-        "dynamic_range": dynamic_range_metrics(y_mono),
+        "dynamic_range": dynamic_range_metrics(y_mono, y_stereo=y_st, sr=sr),
         "spectral_balance": spectral_balance_metrics(y_mono, sr),
         "stereo": stereo_metrics(y_st),
         "clipping": clipping_metrics(y_st),
@@ -564,7 +661,12 @@ def main():
     ap = argparse.ArgumentParser(description="原創歌曲自動評分系統(無參考基準)")
     ap.add_argument("mix", help="完整混音檔(wav/mp3/flac...)")
     ap.add_argument("--vocal", help="人聲軌檔案(提供才會評演唱表現)")
+    ap.add_argument("--accomp", help="伴奏節奏軌(鼓+貝斯混音檔)。⚖️ rhythm 修復案(H2 D1):"
+                                     "提供時人聲節奏網格改建於它,不再用全混音(人聲會污染自己的參照系)")
     ap.add_argument("--demucs", action="store_true", help="用 demucs 自動分離人聲")
+    ap.add_argument("--blend-vocal", action="store_true",
+                    help="舊行為:把演唱分依 55/45 併進總分。預設關閉——演唱各項照樣列分,"
+                         "但它在總分裡的權重待八家對決裁定(不開就不會改變 total 的既有語義)")
     ap.add_argument("--json", dest="json_out", help="輸出 JSON 報告路徑")
     ap.add_argument("--weights", help="自訂權重 JSON 檔")
     args = ap.parse_args()
@@ -588,16 +690,41 @@ def main():
     vocal_res = None
     if vocal_path:
         print("分析演唱表現中(音高追蹤較花時間)...")
-        vocal_res = analyze_vocal(vocal_path, key_info, beats["beat_times"])
+        # ⚖️ rhythm 修復(2026-07-24 H2 D1 裁決「網格改建於鼓+貝斯」):
+        #    舊法拿「全混音」抓拍 —— 人聲自己就在混音裡,等於拿自己當自己的節奏參照,
+        #    加上追蹤雜訊,乾淨歌只得 55.6、同內容能盪 28 分。
+        #    有 --accomp(鼓+貝斯)時改用它建網格;沒有則沿用舊法(分數仍凍結不進總分)。
+        vocal_grid = beats["beat_times"]
+        if getattr(args, "accomp", None):
+            try:
+                y_acc, sr_acc = librosa.load(args.accomp, sr=SR_MUSIC, mono=True)
+                vocal_grid = estimate_beats(y_acc, SR_MUSIC)["beat_times"]
+                print("  (節奏網格:鼓+貝斯伴奏軌)")
+            except Exception as e:
+                print(f"  (伴奏軌讀取失敗,退回全混音網格:{type(e).__name__})")
+        vocal_res = analyze_vocal(vocal_path, key_info, vocal_grid)
 
     vocal_score = weighted_category(vocal_res, weights["vocal"]) if vocal_res else None
     mix_score = weighted_category(mix_res, weights["mix"])
-    if vocal_score is not None and mix_score is not None:
+
+    # ⭐ 演唱分要不要併進總分,由 --blend-vocal 決定(預設【不併】)。
+    #
+    # 為什麼預設不併:在接上 Demucs 之前,從來沒有人傳 --vocal,所以 scores.total 一直等於混音分,
+    # 而那個數字正是報告上「物理技術 X/100」以及 web 總分裡物理 10% 的來源。一旦開始餵人聲軌,
+    # 若照舊自動套 55/45,total 會【無聲改變語義】,新舊報告與排行榜就再也對不起來。
+    # 演唱各項照樣完整列分(見 vocal_detail 與報告的【演唱表現】段),只是先不進這個 total;
+    # 它在總分裡佔多少,跟其他新元件一起等八家對決裁定。
+    #
+    # ⚠️ else 分支的順序是【混音優先】,不可寫回舊的 vocal 優先:舊順序在兩者都有值時本來不可達,
+    #    加了開關之後會踩到,寫錯就會讓沒開 blend 的情況變成「總分=演唱分」。
+    if args.blend_vocal and vocal_score is not None and mix_score is not None:
         ow = weights["overall"]
         total = round((vocal_score * ow["vocal"] + mix_score * ow["mix"])
                       / (ow["vocal"] + ow["mix"]), 1)
+        blended = True
     else:
-        total = vocal_score if vocal_score is not None else mix_score
+        total = mix_score if mix_score is not None else vocal_score
+        blended = False
 
     meta = {"file": Path(args.mix).name, "key": key_info["name"],
             "key_conf": key_info["confidence"], "bpm": beats["bpm"],
@@ -608,6 +735,11 @@ def main():
     if args.json_out:
         payload = {"meta": meta, "scores": {"vocal": vocal_score, "mix": mix_score,
                                             "total": total, "grade": grade(total)},
+                   # 讓讀 JSON 的人一眼看出這個 total 是不是含演唱,免得跨版本比較時被誤導
+                   "weighting": {"vocal_blended_into_total": blended,
+                                 "overall_weights_applied": weights["overall"] if blended else None,
+                                 "note": "各項均已列分;演唱在總分中的權重待八家對決裁定,"
+                                         "未 blend 時 total = 混音分(與歷來報告同義)"},
                    "vocal_detail": vocal_res, "mix_detail": mix_res}
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2, default=str)

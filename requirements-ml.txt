@@ -1,0 +1,18 @@
+# 第二關(美學模型)+ YouTube 輸入 —— 裝進 .venv-ml(較重,獨立環境)
+#   uv venv .venv-ml
+#
+# 1) torch 依你的 CUDA 版本另裝(這幾個必須一組同版;範例 cu124):
+#    uv pip install -p .venv-ml torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+#        --index-url https://download.pytorch.org/whl/cu124
+#    (無 NVIDIA GPU 用 CPU 版:把 --index-url 改成 https://download.pytorch.org/whl/cpu,會很慢)
+#
+# 2) 再裝以下:
+#    uv pip install -p .venv-ml -r requirements-ml.txt
+muq==0.1.0                  # SongEval 核心模型(第二關 A);會帶入 nnAudio/einops/hydra/transformers 等
+audiobox_aesthetics==0.0.4  # Meta Audiobox Aesthetics(第二關 B)
+yt-dlp                      # YouTube 連結輸入(另需系統 ffmpeg)
+
+# 3) SongEval 程式本體(eval.py)另需 clone 進 SongEval/:
+#      git clone https://github.com/ASLP-lab/SongEval.git SongEval
+#    授權 CC BY-NC-SA(非商用),不隨本 repo 散布。
+# 4) NRC-VAD 情緒詞典(情感弧線.py)禁再散布,自取後放 lexicon/。

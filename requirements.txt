@@ -1,0 +1,13 @@
+# 第一關(物理)+ 報告工具 —— 裝進 .venv
+#   uv venv .venv && uv pip install -p .venv -r requirements.txt
+librosa
+numpy
+soundfile
+pyloudnorm
+matplotlib          # 情感弧線.py 畫弧線圖
+praat-parselmouth   # 選用:song_scorer --vocal 的嗓音品質(jitter/shimmer/HNR)
+reportlab           # 報告轉PDF
+pypdfium2           # 轉PNG(PDF→影像)
+Pillow              # 轉PNG(多頁拼長圖)
+
+# 第二關(美學 ML)+ YouTube 輸入 —— 裝進 .venv-ml(見 requirements-ml.txt)
