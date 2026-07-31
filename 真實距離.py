@@ -38,7 +38,8 @@ def main():
         y, _ = librosa.load(a.audio, sr=24000, mono=True)
         WIN = 240000
         es = []
-        for s in range(0, max(1, len(y) - WIN), WIN):
+        # ⚠️ 上界要 len(y)-WIN+1:寫成 len(y)-WIN 會漏掉最後一個完整窗
+        for s in range(0, max(1, len(y) - WIN + 1), WIN):
             w = y[s:s + WIN]
             if len(w) < 24000:
                 continue

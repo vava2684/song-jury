@@ -144,16 +144,42 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     if not src:
         return [], None, "", "⚠️ 請給 SUNO/YouTube 連結,或上傳音檔。"
 
-    progress(0.1, desc="物理 + SongEval + Audiobox 評分中(第一次會下載模型)…")
-    r = _run([_venv_py(".venv-ml"), str(BASE / "評審團.py"), str(src)])
+    progress(0.1, desc="曲側八柱評分中(第一次會下載模型)…")
+    # ⛔ 一定要用 .venv 跑 評審團.py:它自己的相依(含 yt-dlp)裝在 .venv,
+    #    而且它會用 sys.executable 去呼叫 yt-dlp。用 .venv-ml 跑會找不到已裝好的 yt-dlp。
+    r = _run([_venv_py(".venv"), str(BASE / "評審團.py"), str(src)])
     if r.returncode != 0:
         return [], None, "", f"❌ 音訊評分失敗:\n```\n{(r.stderr or r.stdout)[-1000:]}\n```"
     jpath = _jpath_from_stdout(r.stdout)
     if not jpath or not jpath.exists():
         return [], None, "", f"❌ 找不到結果 JSON。\n```\n{r.stdout[-600:]}\n```"
-    table = _score_table(json.loads(jpath.read_text(encoding="utf-8")))
+    _data = json.loads(jpath.read_text(encoding="utf-8"))
+    table = _score_table(_data)
+
+    # ⛔ 完整性警語一定要在網頁版也顯示出來 —— CLI 印得很大聲,網頁版原本整段吃掉,
+    #    使用者只會看到「✅ 完成」跟一個看似正常的分數。缺柱=無效評測,不可以藏。
+    _pt = _data.get("pillar_totals") or {}
+    incomplete_md = ""
+    if _pt and not _pt.get("完整評測", True):
+        _lost = "、".join(_pt.get("缺柱") or [])
+        incomplete_md = (f"\n\n---\n### ⛔ 這不是一份完整評測\n"
+                         f"缺了 **{len(_pt.get('缺柱') or [])} 根柱**、合計 "
+                         f"**{_pt.get('缺柱權重合計')}%** 權重(缺:{_lost})。\n\n"
+                         f"分數是用剩下的柱重新歸一化算的,**不可與完整評測互比、不可拿去排行、"
+                         f"不可當作品的評測結果**。請把安裝補齊後重評。\n")
+    # 未跑到的項目也一併攤開(原本只有 CLI 看得到);鍵名以 評審團.py 實際寫出的為準
+    _notes = _data.get("stage_notes") or []
+    if _notes:
+        incomplete_md += "\n<details><summary>本次未完全跑到的項目</summary>\n\n" + \
+                         "\n".join(f"- {n}" for n in _notes) + "\n\n</details>\n"
 
     arc_img = None
+    # ⭐ SUNO 連結會自動抓到歌詞(評審團.py 存在 fetched_lyrics)—— 原本只看文字框,
+    #    導致「只貼連結」時明明抓到詞卻說「沒給歌詞」,白白跳過詞評與情感弧線。
+    if not (lyrics or "").strip():
+        _fl = _data.get("fetched_lyrics")          # 評審團.py 寫在 JSON 頂層
+        if _fl and str(_fl).strip():
+            lyrics = str(_fl)
     has_lyrics = bool((lyrics or "").strip())
     if has_lyrics:
         progress(0.6, desc="情感弧線分析中…")
@@ -178,6 +204,8 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
                     f"⚠️ **{model}** 詞評回傳空白——換個模型再試(建議 qwen3 系列)。")
         except Exception as e:
             note = f"⚠️ 本機詞評失敗({e})。確認 Ollama 有在跑、模型已 `ollama pull`。"
+    if incomplete_md:
+        note = "⛔ **評測不完整**(詳見下方)——" + note.lstrip("✅⚠️ ") + incomplete_md
     return table, arc_img, lyric_eval, note
 
 

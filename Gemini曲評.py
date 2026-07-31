@@ -256,14 +256,30 @@ def parse_review(txt: str) -> dict:
             if "曲總分" in ln:
                 line = ln
 
+    def _clamp10(v):
+        """M1~M6 與曲總分都是 0-10 制。⛔ 一定要夾範圍:模型偶爾會吐百分制(M1:99),
+        下游 評審團.py 會再 ×10 換成 0-100 → 直接變成 990/100。
+        超出範圍不是「高分」是「格式錯了」,判成 None(該項缺席)比讓它污染柱分安全。"""
+        if v is None:
+            return None
+        return v if 0.0 <= v <= 10.0 else None
+
     scores = {}
+    _oor = []
     for n in range(1, 7):
         mm = re.search(rf"M{n}\s*[:：]\s*(\d+(?:\.\d+)?)", line)
-        scores[f"M{n}"] = _num(mm.group(1)) if mm else None
+        raw = _num(mm.group(1)) if mm else None
+        val = _clamp10(raw)
+        if raw is not None and val is None:
+            _oor.append(f"M{n}={raw}")
+        scores[f"M{n}"] = val
 
     mt = re.search(r"曲總分\s*[:：]\s*(\d+(?:\.\d+)?)", line) or \
          re.search(r"曲總分[^\d]{0,8}(\d+(?:\.\d+)?)", txt)
-    total = _num(mt.group(1)) if mt else None
+    _traw = _num(mt.group(1)) if mt else None
+    total = _clamp10(_traw)
+    if _traw is not None and total is None:
+        _oor.append(f"曲總分={_traw}")
     total_source = "model" if total is not None else None
     if total is None:
         # 保底:機器行沒給總分 → 用有分的維度平均(明確標成 mean_of_dims,下游要不要信自己決定)
@@ -292,8 +308,14 @@ def parse_review(txt: str) -> dict:
         if scores[f"M{n}"] is None and re.search(rf"M{n}\s*[:：]\s*NA", line, re.I):
             na_dims.append(f"M{n}")
 
-    return {"scores": scores, "notes": notes, "header": header,
-            "reported_total": total, "total_source": total_source, "na_dims": na_dims}
+    out = {"scores": scores, "notes": notes, "header": header,
+           "reported_total": total, "total_source": total_source, "na_dims": na_dims}
+    if _oor:
+        # 超範圍要留痕,不能靜靜吞掉 —— 它代表模型沒照 0-10 制回答,重評才是正解
+        out["out_of_range"] = _oor
+        out["out_of_range_note"] = ("模型回了不在 0-10 範圍的分數,已判成缺席("
+                                    + "、".join(_oor) + ");建議重跑這一關")
+    return out
 
 
 def build_dimensions(parsed: dict) -> dict:

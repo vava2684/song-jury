@@ -7,5 +7,5 @@ if "%~1"=="" (
   pause
   exit /b
 )
-.venv-ml\Scripts\python.exe 評審團.py %1
+.venv\Scripts\python.exe 評審團.py %1
 pause

@@ -26,6 +26,8 @@
 評審團.py 的 _find_demucs_py() 是唯一真理來源(環境變數 SONG_JURY_DEMUCS_PY
 → .venv-demucs → .venv-ml → 家目錄的 anaconda/miniconda/miniforge)。
 """
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -37,6 +39,25 @@ except Exception:
     pass
 
 import numpy as np
+
+
+def _source_ident(p: Path) -> dict:
+    """算音檔身分指紋 —— 給分軌快取驗「這份快取真的是這首歌的嗎」。
+
+    用「檔案大小 + 頭尾各 1MB 的 sha256」而不是整檔雜湊:整檔對幾百 MB 的歌太慢,
+    頭尾+大小已足以擋掉「同名不同曲」與「同名檔被換成新版」這兩種真實情境。
+    ⛔ 不用 mtime:複製/下載會讓它改變,會無謂地讓正確的快取失效。
+    """
+    st = p.stat()
+    h = hashlib.sha256()
+    h.update(str(st.st_size).encode())
+    CHUNK = 1024 * 1024
+    with open(p, "rb") as f:
+        h.update(f.read(CHUNK))
+        if st.st_size > CHUNK * 2:
+            f.seek(-CHUNK, os.SEEK_END)
+            h.update(f.read(CHUNK))
+    return {"name": p.name, "size": st.st_size, "fingerprint": h.hexdigest()}
 
 
 def separate(audio_path: Path, stems_dir: Path, model_name: str):
@@ -55,8 +76,34 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
     sources = list(model.sources)          # ⚠️ 動態讀,絕不寫死(6s 是 drums,bass,other,vocals,guitar,piano)
     sr = model.samplerate
 
+    # ⛔ 快取鍵不可以只有「檔名+模型名」:不同資料夾的兩首 song.mp3、或同名檔被換成新版,
+    #    會直接讀到另一首歌的分軌 —— 人聲/和聲/編曲全部算錯而且不會報錯。
+    #    這裡在資料夾旁放一份 _source.json 記下來源身分,命中時先驗身分。
+    ident = _source_ident(audio_path)
     cache = stems_dir / f"{audio_path.stem}__{model_name}"
+    side = cache / "_source.json"
     have_all = cache.is_dir() and all((cache / f"{s}.flac").exists() for s in sources)
+
+    if have_all:
+        if side.exists():
+            try:
+                rec = json.loads(side.read_text(encoding="utf-8"))
+            except Exception:
+                rec = {}
+            if rec.get("fingerprint") != ident["fingerprint"]:
+                # 撞名了 → 這份快取不是這首歌的。改用帶指紋的資料夾,兩首各自有快取。
+                cache = stems_dir / f"{audio_path.stem}__{model_name}__{ident['fingerprint'][:8]}"
+                side = cache / "_source.json"
+                have_all = cache.is_dir() and all((cache / f"{s}.flac").exists() for s in sources)
+        else:
+            # 舊版留下來的快取沒有身分紀錄。沿用(不強迫使用者重跑數小時的 Demucs),
+            # 但補寫身分並提醒一次 —— 之後再撞名就驗得出來了。
+            print(f"      ⚠ 舊版快取沒有來源紀錄,已補寫身分:{cache.name}", flush=True)
+            try:
+                side.write_text(json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception:
+                pass
+
     if have_all:
         stems = {}
         for s in sources:
@@ -74,6 +121,8 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
     est = est * ref.std() + ref.mean()
 
     cache.mkdir(parents=True, exist_ok=True)
+    cache.joinpath("_source.json").write_text(
+        json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
     stems = {}
     for i, s in enumerate(sources):
         arr = est[i].cpu()

@@ -195,9 +195,17 @@ fi   # ← CHECK_ONLY 結束:上面全是「安裝」,以下是「檢查」
 # ── [9] 自我檢查:哪幾根柱子真的能用 ────────────────────────────────
 step "自我檢查 —— 實際確認九根柱子哪些可用"
 HAS_ENV=0;  [ -x .venv/bin/python ] && HAS_ENV=1
-HAS_ML=0;   [ -x .venv-ml/bin/python ] && HAS_ML=1
+# ⛔ 不能只看 python 在不在:`uv venv` 建完就有直譯器,套件裝失敗時環境是空的,
+#    照樣會被判「完整」。一定要實際 import 關鍵套件才算數。
+test_import() {   # $1=venv $2...=模組名
+  local py="$1/bin/python"; shift
+  [ -x "$py" ] || return 1
+  for m in "$@"; do "$py" -c "import $m" >/dev/null 2>&1 || return 1; done
+  return 0
+}
+HAS_ML=0;   test_import .venv-ml torch muq audiobox_aesthetics && HAS_ML=1
 HAS_SE=0;   [ -f SongEval/eval.py ] && [ "$HAS_ML" = 1 ] && HAS_SE=1
-HAS_AUD=0;  [ -x .venv-audition/bin/python ] && HAS_AUD=1
+HAS_AUD=0;  test_import .venv-audition torch s3prl muq && HAS_AUD=1
 # ⛔ 錨在行首(排除註解行),並排除 .env.example 的佔位字串
 HAS_KEY=0
 if [ -f .env ] && grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*[^[:space:]]' .env \

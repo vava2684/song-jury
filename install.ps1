@@ -198,7 +198,20 @@ if ($hasEnv) {
 }
 $hasMl      = Test-Path ".venv-ml\Scripts\python.exe"
 $hasSongEval= Test-Path "SongEval\eval.py"
-$hasAud     = Test-Path ".venv-audition\Scripts\python.exe"
+
+# ⛔ 不能只看 python.exe 在不在:`uv venv` 建完就有 python.exe,套件裝失敗時環境是空的,
+#    照樣會被判「完整」。一定要實際 import 關鍵套件才算數。
+function Test-Import($venv, $mods) {
+    $py = "$venv\Scripts\python.exe"
+    if (-not (Test-Path $py)) { return $false }
+    foreach ($m in $mods) {
+        & $py -c "import $m" 2>$null
+        if ($LASTEXITCODE -ne 0) { return $false }
+    }
+    return $true
+}
+$hasMl  = $hasMl  -and (Test-Import ".venv-ml"       @("torch", "muq", "audiobox_aesthetics"))
+$hasAud = Test-Import ".venv-audition" @("torch", "s3prl", "muq")
 # ⛔ 正則要錨在行首(多行模式),否則 `# GEMINI_API_KEY=...` 這種註解行也會被當成有金鑰;
 #    也要排除 .env.example 的佔位字串。
 $hasKey = $false

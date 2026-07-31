@@ -73,12 +73,23 @@ def run_one(song: Path, timeout=3600):
     env = {**os.environ, "PYTHONUTF8": "1"}
     if os.environ.get("SONG_JURY_BATCH_GEMINI") != "1":
         env["SONG_JURY_SKIP_GEMINI"] = "1"
+    # ⛔ 先刪掉上一輪的產物:留著它,這輪失敗時會被當成「成功」讀進來,
+    #    批次表格拿到的是上次的舊分數,而且錯誤字串是空的 —— 完全看不出來。
+    if out_json.exists():
+        out_json.unlink()
     r = subprocess.run([str(VENV_PY), str(BASE / "評審團.py"), str(song)],
                        cwd=str(BASE), capture_output=True, text=True, env=env,
                        encoding="utf-8", errors="replace", timeout=timeout, **_NO_WINDOW)
+    # ⛔ 也要看 returncode:程式中途炸掉但檔案已寫出時,光看檔案在不在會誤判成功
+    if r.returncode != 0:
+        return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]
     if not out_json.exists():
         return None, (r.stderr or r.stdout or "")[-300:]
     d = json.loads(out_json.read_text(encoding="utf-8"))
+    # ⛔ 缺柱的結果不可以進批次表 —— 那是另一把尺,拿去算鑑別力會得到假結論
+    _pt = d.get("pillar_totals") or {}
+    if _pt and not _pt.get("完整評測", True):
+        return None, f"不完整評測,缺柱:{'、'.join(_pt.get('缺柱') or [])}(補齊安裝後重跑)"
     return d, ""
 
 

@@ -499,12 +499,17 @@ def main():
                               "--json", str(arr_json), "--stems", str(STEMS_DIR)],
                              "編曲層次", env=dem_env)
     arrangement, vocal_stem = None, None
+    degraded_raw = {}          # 降級但不計分的原始資料,只寫進 JSON 供除錯
     if err:
         notes.append(err)
     else:
         arrangement, err2 = _load_stage_json(arr_json, "編曲層次")
         if err2:
             notes.append(err2)
+            # ⛔ 降級結果不計分(理由同和聲那段:那是另一套量測,不可與正常模式互比)
+            degraded_raw["編曲層次"] = arrangement
+            arrangement = None
+            notes.append("編曲層次:降級結果不計分(相關細項視為缺席)")
         if arrangement:
             vs = arrangement.get("vocal_stem")
             if vs and Path(vs).exists():
@@ -548,6 +553,13 @@ def main():
             harmony, err2 = _load_stage_json(hjson, "和聲分析")
             if err2:
                 notes.append(err2)
+                # ⛔ 降級結果不可以計分:分軌失敗時 和聲分析.py 會退回 HPSS,
+                #    那是另一套量測,數值與正常模式不可互比。照九柱制的完整性原則,
+                #    這種情況要當成「和聲柱缺席」而不是「和聲柱有分」。
+                #    原始數值仍寫進 JSON 供除錯,只是不入分。
+                degraded_raw["和聲分析"] = harmony
+                harmony = None
+                notes.append("和聲分析:降級結果不計分(和聲柱視為缺席)")
             hjson.unlink(missing_ok=True)
     else:
         notes.append("和聲分析:跳過(分軌未成功)")
@@ -694,6 +706,8 @@ def main():
         "layer2_flamingo": flamingo,            # 新:段落地圖/樂器/製作質感
         "layer2_singmos": singmos,              # 重構庭:演唱聽感(人聲柱 12%)
         "layer2_realdist": realdist,            # 重構庭:真實距離(真實柱 60%)+SONICS 顯示軸
+        # 降級但「不計分」的原始資料放這裡:留著給除錯,⛔ 絕不可以拿去算分或排行
+        "degraded_not_scored": degraded_raw or None,
         "layer3_lyrics": "由 Claude 依 rubrics\\ 四把尺評(八家五輪對抗定版,非即興判斷)",
         "fetched_lyrics": _fetched,
         "vocal_stem_used": vocal_stem,          # 有值 = 演唱各項有列分(見 layer1_physical.vocal_detail)

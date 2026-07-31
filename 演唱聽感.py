@@ -33,7 +33,9 @@ def main():
         y, _ = librosa.load(a.vocal, sr=16000, mono=True)
         WIN = 16000 * 20
         scores = []
-        for s in range(0, max(1, len(y) - WIN), WIN):
+        # ⚠️ 上界要 len(y)-WIN+1:寫成 len(y)-WIN 會漏掉最後一個完整窗
+        #    (實測 40 秒音檔只分析 1 個 20 秒窗、240 秒只分析 11 個而不是 12 個)
+        for s in range(0, max(1, len(y) - WIN + 1), WIN):
             w = y[s:s + WIN]
             if float(np.sqrt(np.mean(w ** 2))) < 0.01:
                 continue
