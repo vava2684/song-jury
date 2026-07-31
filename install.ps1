@@ -244,11 +244,18 @@ foreach ($p in $pillars) {
 }
 
 Write-Host ""
+# ⚠️ 外層與內層 Where-Object 都會佔用 $_ → 外層先接成 $p,不然 $_.part[$_] 會取錯東西
+$partial = @($pillars | Where-Object { $p = $_; @($p.part.Keys | Where-Object { -not $p.part[$_] }).Count -gt 0 })
 if ($lost -gt 0) {
-    Write-Host "      ⚠️ 有 $lost% 的權重整根缺席 —— 總分會在剩下的柱子間重新歸一化," -ForegroundColor Yellow
-    Write-Host "         分數仍會出來,但與完整安裝的結果不可互比。" -ForegroundColor Yellow
+    Write-Host "      ⛔ 安裝不完整 —— 有 $lost% 的權重整根缺席,這台機器目前【評不出有效分數】。" -ForegroundColor Red
+    Write-Host "         九柱制的滿分定義是九根柱子都在;少一根就是換了一把尺," -ForegroundColor Red
+    Write-Host "         算出來的分數不可與別人互比、不可拿去排行。" -ForegroundColor Red
+    Write-Host "         → 把上面紅字的部分補起來再評(多半是網路問題,重跑這個安裝檔就會補上)。" -ForegroundColor Yellow
+} elseif ($partial.Count -gt 0) {
+    Write-Host "      ⚠️ 九根柱子都算得出分,但有柱子缺細項(上面黃字)——" -ForegroundColor Yellow
+    Write-Host "         柱內會重新歸一化,分數出得來但與完整安裝的結果有落差,建議補齊。" -ForegroundColor Yellow
 } else {
-    Write-Host "      九根柱子都有東西可算。" -ForegroundColor Green
+    Write-Host "      ✅ 九柱齊全、細項無缺 —— 這才是可以拿來評分的完整安裝。" -ForegroundColor Green
 }
 
 # ── 冒煙測試 ────────────────────────────────────────────────────────

@@ -214,6 +214,7 @@ if [ "$HAS_ENV" = 1 ]; then
 fi
 
 LOST=0
+PARTIAL=0
 echo
 printf "      ${C_DIM}柱             權重    狀態${C_OFF}\n"
 printf "      ${C_DIM}────────────────────────────────────────────────────────${C_OFF}\n"
@@ -226,7 +227,7 @@ row() {
     if [ "${p##*:}" = 0 ]; then missing="${missing}${missing:+、}${p%%:*}"; fi
   done
   if [ "$okp" = 1 ] && [ -z "$missing" ]; then mark="完整"; col="$C_GREEN"
-  elif [ "$okp" = 1 ];                   then mark="部分 —— 缺 $missing"; col="$C_YEL"
+  elif [ "$okp" = 1 ];                   then mark="部分 —— 缺 $missing"; col="$C_YEL"; PARTIAL=1
   else mark="缺項(整柱不計)"; col="$C_RED"; LOST=$(awk "BEGIN{print $LOST+$w}"); fi
   # ⚠️ 柱名的空白是「呼叫時就補好的」:${#字串} 在不同 locale 下有時數位元組、
   #    有時數字元,拿它算中文字寬會歪掉(git-bash 實測)。不猜,直接給對齊好的字串。
@@ -249,10 +250,15 @@ row "律動          " 4.0  "$HAS_KEY" "Gemini 節奏(唯一來源):$HAS_KEY"
 
 echo
 if [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ]; then
-  printf "      ${C_YEL}⚠️ 有 %s%% 的權重整根缺席 —— 總分會在剩下的柱子間重新歸一化,${C_OFF}\n" "$LOST"
-  printf "      ${C_YEL}   分數仍會出來,但與完整安裝的結果不可互比。${C_OFF}\n"
+  printf "      ${C_RED}⛔ 安裝不完整 —— 有 %s%% 的權重整根缺席,這台機器目前【評不出有效分數】。${C_OFF}\n" "$LOST"
+  printf "      ${C_RED}   九柱制的滿分定義是九根柱子都在;少一根就是換了一把尺,${C_OFF}\n"
+  printf "      ${C_RED}   算出來的分數不可與別人互比、不可拿去排行。${C_OFF}\n"
+  printf "      ${C_YEL}   → 把上面紅字的部分補起來再評(多半是網路問題,重跑這個安裝檔就會補上)。${C_OFF}\n"
+elif [ "$PARTIAL" = 1 ]; then
+  printf "      ${C_YEL}⚠️ 九根柱子都算得出分,但有柱子缺細項(上面黃字)——${C_OFF}\n"
+  printf "      ${C_YEL}   柱內會重新歸一化,分數出得來但與完整安裝的結果有落差,建議補齊。${C_OFF}\n"
 else
-  printf "      ${C_GREEN}九根柱子都有東西可算。${C_OFF}\n"
+  printf "      ${C_GREEN}✅ 九柱齊全、細項無缺 —— 這才是可以拿來評分的完整安裝。${C_OFF}\n"
 fi
 
 # ── 冒煙測試 ────────────────────────────────────────────────────────

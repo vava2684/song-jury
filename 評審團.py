@@ -780,7 +780,17 @@ def main():
     _wsum_song = sum(PILLAR_W[p] for p in _have_p)
     _song_side = round(sum(PILLAR_W[p] * s for p, s in _have_p.items()) / _wsum_song, 1) if _have_p else None
 
+    # ⛔ 完整性旗標一定要寫進 JSON:別人(或後續程式/排行榜)拿到這份檔案時,
+    #    必須一眼看得出它是不是完整評測 —— 只印在主控台是不夠的。
+    _lost_pillars = [p for p in PILLAR_W if p != "詞" and p not in pillar_scores]
     merged["pillar_totals"] = {
+        "完整評測": not _lost_pillars,
+        "缺柱": _lost_pillars,
+        "缺柱權重合計": round(sum(PILLAR_W[p] for p in _lost_pillars), 1),
+        "完整性警語": ("九柱齊全,可與其他完整評測互比"
+                       if not _lost_pillars else
+                       "⛔ 不完整評測:曲側合成是用剩下的柱重新歸一化算的,"
+                       "不可與完整評測互比、不可排行、不可當評測結果。請補齊安裝後重評。"),
         "柱分": pillar_detail,
         "柱權重": PILLAR_W,
         "曲側合成": _song_side,
@@ -804,8 +814,23 @@ def main():
         sc = pd.get("score")
         tail = f"(缺:{'/'.join(pd['missing'])})" if pd.get("missing") else ""
         print(f"【{pname}柱 {PILLAR_W[pname]:>4.1f}%】 {sc if sc is not None else '—'} / 100 {tail}")
-    if _song_side is not None:
+    # ⛔ 缺柱時**不可以把合成分印得像一個正常分數**。
+    #    九柱制的滿分定義是「九根柱子都在」;少一根就是換了一把尺,那個數字不能拿去跟別人比,
+    #    也不能拿去排行。這裡把「不完整」講在分數同一行,而不是塞在下面的小字裡。
+    _lost_p = [p for p in PILLAR_W if p != "詞" and p not in _have_p]
+    _lost_w = round(sum(PILLAR_W[p] for p in _lost_p), 1)
+    if _song_side is not None and not _lost_p:
         print(f"【曲側合成】 {_song_side} / 100(八柱加權;詞柱 25.3% 由報告階段依四把尺合成)")
+    elif _song_side is not None:
+        print()
+        print("!" * 54)
+        print(f"  ⛔ 這不是一份完整評測 —— 缺了 {len(_lost_p)} 根柱、合計 {_lost_w}% 權重")
+        print(f"     缺柱:{'、'.join(_lost_p)}")
+        print(f"     下面這個 {_song_side} 是「只用剩下幾根柱重新歸一化」算出來的,")
+        print("     ⛔ 不可與完整評測互比、不可拿去排行、不可當作品的評測結果。")
+        print("     → 把安裝補齊(重跑安裝檔或 install 腳本 -CheckOnly 看缺什麼)再評一次。")
+        print("!" * 54)
+        print(f"【曲側合成(不完整・僅供除錯)】 {_song_side} / 100")
     _pai = _g(realdist, "sonics_p_ai")
     if _pai is not None:
         print(f"【AI 感(顯示軸,不入分)】 P(AI)={_pai:.2f}(新版 SUNO 漏抓~31%,判「真」不保證非 AI)")
