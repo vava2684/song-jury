@@ -1,0 +1,8 @@
+# 跑測試用(裝進 .venv 就好):
+#   uv pip install --python .venv/Scripts/python.exe -r requirements-dev.txt
+#   python -m pytest tests -q
+#
+# ⚠️ 測試刻意**不需要**那四個重量級 venv(torch / demucs / SongEval 合計十幾 GB)。
+#    它測的是接線與邏輯 —— 這個專案出過的 bug 幾乎全部都在那裡。
+pytest
+numpy

@@ -17,6 +17,8 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 BASE = Path(__file__).parent
+sys.path.insert(0, str(BASE.resolve()))
+from 評審團 import iter_windows  # noqa: E402  (評審團.py 頂層只用標準庫,跨 venv import 安全)
 
 
 def main():
@@ -38,8 +40,8 @@ def main():
         y, _ = librosa.load(a.audio, sr=24000, mono=True)
         WIN = 240000
         es = []
-        # ⚠️ 上界要 len(y)-WIN+1:寫成 len(y)-WIN 會漏掉最後一個完整窗
-        for s in range(0, max(1, len(y) - WIN + 1), WIN):
+        # 切窗用共用函式(見 評審團.py 的 iter_windows)
+        for s in iter_windows(len(y), WIN):
             w = y[s:s + WIN]
             if len(w) < 24000:
                 continue

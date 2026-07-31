@@ -78,6 +78,14 @@ docs/PACKAGING.md
 !assets/
 !assets/**
 
+# ── 放行測試與 CI(⛔ 少了它們,改壞了不會有人知道)──
+!tests/
+!tests/**
+!.github/
+!.github/**
+!requirements-dev.txt
+!pytest.ini
+
 # ══════════════════════════════════════════════════════════════
 #  以下永遠不進 repo(即使有人手滑加了 ! 也請刪掉)
 #  ⛔ 版權:_C層得獎歌/(得獎歌 mp3)、_stems/(分軌)、下載/(測試歌)

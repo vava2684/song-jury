@@ -115,6 +115,135 @@ def _optional_stage(cmd, label, env=None, timeout=1800, cwd=None):
     return r, ""
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  ⚖️ 九柱組裝(重構庭 2026-07-25 定版,T1-T4 完整程序)
+#
+#  總分(滿分100)= 詞 25.3 + 曲側八柱 74.7(缺項柱內/柱間自動重正規化並留痕)。
+#  ⛔ 凍結:演唱.rhythm(T2b 10:3)、和聲.non_diatonic(9:4);SONICS=顯示軸不入分(19:7)。
+#
+#  ⚠️ 這九個數字加起來是 100.1 不是 100 —— 是合議庭各柱四捨五入到小數一位的結果,
+#     **不是 bug,也不影響任何分數**:曲側合成是「除以在場柱的權重和」自我歸一化,
+#     總分公式 0.253×詞 + 0.747×曲側 兩係數本身正好合 1。
+#     ⛔ 不可以為了湊 100 私自改任何一格 —— 權重是十三席合議庭定的,改一格要單格重開辯論。
+#
+#  ⚠️ 這段刻意放在模組層級(不是埋在 main 裡)—— 這樣測試才測得到。
+#     tests/test_pillars.py 會驗權重表、缺項歸一化、全缺不除零、缺柱完整性旗標。
+# ══════════════════════════════════════════════════════════════════════
+PILLAR_W = {"詞": 25.3, "人聲": 15.2, "和聲": 13.6, "結構編曲": 12.6, "聲學": 12.1,
+            "旋律記憶": 6.1, "真實風格": 6.1, "整體": 5.1, "律動": 4.0}
+
+
+def _g(d, *ks):
+    """安全取巢狀鍵,拿不到或不是數字就回 None(絕不亂猜補值)。"""
+    for k in ks:
+        d = (d or {}).get(k) if isinstance(d, dict) else None
+    return float(d) if isinstance(d, (int, float)) else None
+
+
+def _vnum(x):
+    """vocal_detail 的值可能是 dict{score} 或直接是數字。"""
+    return _g(x, "score") if isinstance(x, dict) else (float(x) if isinstance(x, (int, float)) else None)
+
+
+def build_pillar_items(physical, harmony, arrangement, gemini, songeval, audiobox, singmos, realdist):
+    """把各引擎的產出攤成「柱 → [(細項名, 柱內權重, 值 or None)]」。
+
+    ⚠️ 取值鍵名必須跟各引擎實際寫出的 JSON 一致。這個 repo 有前科:
+       舊版取 gemini["total"] 但實際鍵是 gemini_reported_total → Gemini 整關被靜默丟掉,
+       還被重正規化蓋掉看不出來。tests/test_pillars.py 有一條專門守這件事。
+    """
+    _md = ((physical or {}).get("mix_detail") or {})
+    _vd = ((physical or {}).get("vocal_detail") or {})
+    _hm = ((harmony or {}).get("metrics") or {})
+    _gd = ((gemini or {}).get("dimensions") or {})
+    _gt = _g(gemini, "gemini_reported_total", "raw_0to10")
+    _se = {k: (v * 20.0) for k, v in (songeval or {}).items()}   # 1-5 → 0-100
+    _pq = _g(audiobox, "PQ")
+
+    return {
+        "聲學": [("頻譜平衡", 26, _g(_md, "spectral_balance", "score")),
+                 ("混音結構", 18, _g(_md, "structure", "score")),
+                 ("結構清晰(SongEval)", 18, _se.get("Clarity")),
+                 ("立體聲", 10, _g(_md, "stereo", "score")),
+                 ("諧波", 10, _g(_md, "harmony", "score")),
+                 ("動態LRA", 10, _g(_md, "dynamic_range", "score")),
+                 ("製作品質(Audiobox)", 8, (_pq * 10) if _pq is not None else None)],
+        "人聲": [("嗓音品質", 23, _vnum(_vd.get("voice_quality"))),
+                 ("演唱聽感(SingMOS)", 12, _g(singmos, "score")),
+                 ("動態控制", 11, _vnum(_vd.get("dynamics"))),
+                 ("音準", 10, _vnum(_vd.get("pitch"))),
+                 ("顫音", 10, _vnum(_vd.get("vibrato"))),
+                 ("音域", 10, _vnum(_vd.get("range"))),
+                 ("人聲表現(Gemini M5)", 10, _g(_gd, "M5", "score")),
+                 ("人聲自然(SongEval)", 8, _se.get("Naturalness")),
+                 ("長音穩定", 6, _vnum(_vd.get("stability")))],
+        "和聲": [("終止式", 20, _g(_hm, "cadence", "score")),
+                 ("和弦詞彙(過濾版·復權)", 19, _g(_hm, "chord_vocabulary", "score")),
+                 ("調性穩定", 18, _g(_hm, "key_stability", "score")),
+                 ("五度動線", 16, _g(_hm, "fifth_motion", "score")),
+                 ("和聲節奏", 15, _g(_hm, "harmonic_rhythm", "score")),
+                 ("延伸和弦", 12, _g(_hm, "extended_chords", "score"))],
+        "結構編曲": [("能量成長", 32, _g(arrangement, "score_growth")),
+                     ("編制變化", 18, _g(arrangement, "score_delta")),
+                     ("結構弧線(Gemini M1)", 18, _g(_gd, "M1", "score")),
+                     ("連貫(SongEval)", 18, _se.get("Coherence")),
+                     ("配器音色(Gemini M4)", 14, _g(_gd, "M4", "score"))],
+        "旋律記憶": [("旋律記憶(Gemini M2)", 52, _g(_gd, "M2", "score")),
+                     ("記憶點(SongEval)", 48, _se.get("Memorability"))],
+        "律動": [("節奏律動(Gemini M3)", 100, _g(_gd, "M3", "score"))],
+        "整體": [("Gemini 總分", 51, (_gt * 10) if _gt is not None else None),
+                 ("音樂性(SongEval)", 49, _se.get("Musicality"))],
+        "真實風格": [("真實距離(馬氏)", 60, _g(realdist, "score")),
+                     ("曲風創新(Gemini M6)", 40, _g(_gd, "M6", "score"))],
+    }
+
+
+def build_pillar_totals(pillar_items):
+    """柱內缺項重正規化 → 柱分;柱間缺柱重正規化 → 曲側合成;並算完整性旗標。
+
+    回 dict,結構與寫進 _評審團.json 的 pillar_totals 相同。
+    ⛔ 缺柱時「完整評測」必為 False —— 那是換了一把尺,不可與完整評測互比或排行。
+    """
+    pillar_scores, pillar_detail = {}, {}
+    for pname, items in pillar_items.items():
+        have = [(n, w, v) for n, w, v in items if v is not None]
+        miss = [n for n, w, v in items if v is None]
+        if have:
+            wsum = sum(w for _, w, _ in have)
+            pillar_scores[pname] = round(sum(w * v for _, w, v in have) / wsum, 1)
+        pillar_detail[pname] = {"score": pillar_scores.get(pname),
+                                "items": {n: round(v, 1) for n, w, v in have},
+                                "missing": miss}
+
+    wsum_song = sum(PILLAR_W[p] for p in pillar_scores)
+    song_side = (round(sum(PILLAR_W[p] * s for p, s in pillar_scores.items()) / wsum_song, 1)
+                 if pillar_scores else None)          # ⛔ 全缺時不可除零
+
+    lost = [p for p in PILLAR_W if p != "詞" and p not in pillar_scores]
+    return {
+        "完整評測": not lost,
+        "缺柱": lost,
+        "缺柱權重合計": round(sum(PILLAR_W[p] for p in lost), 1),
+        "完整性警語": ("九柱齊全,可與其他完整評測互比" if not lost else
+                       "⛔ 不完整評測:曲側合成是用剩下的柱重新歸一化算的,"
+                       "不可與完整評測互比、不可排行、不可當評測結果。請補齊安裝後重評。"),
+        "柱分": pillar_detail,
+        "柱權重": PILLAR_W,
+        "曲側合成": song_side,
+        "曲側含柱": sorted(pillar_scores),
+    }
+
+
+def iter_windows(n_samples, win):
+    """把長度 n_samples 的訊號切成不重疊的完整窗,回每個窗的起點。
+
+    ⚠️ 上界必須是 n-win+1。寫成 range(0, n-win, win) 會漏掉最後一個完整窗
+       —— 實測 40 秒音檔只分析 1 個 20 秒窗、240 秒只分析 11 個而不是 12 個。
+       演唱聽感.py 與 真實距離.py 共用這個函式,免得同一個 off-by-one 犯兩次。
+    """
+    return range(0, max(1, n_samples - win + 1), win)
+
+
 def _load_stage_json(path, label):
     """讀元件產出的 JSON,順便把它自己標的 degraded 帶出來。"""
     try:
@@ -714,101 +843,19 @@ def main():
         "stage_notes": notes,                   # 哪些新元件失敗/降級/跳過,誠實留痕
     }
 
-    # ── ⚖️ 九柱組裝(重構庭 2026-07-25 定版,T1-T4 完整程序;機讀定版:權重辯論_20260723\T_定版權重.json)──
-    # 總分(滿分100)= 詞 25.3 + 曲側八柱 74.7(缺項柱內/柱間自動重正規化並留痕)。
-    # ⛔ 凍結:演唱.rhythm(T2b 10:3)、和聲.non_diatonic(9:4);SONICS=顯示軸不入分(19:7)。
-    # 🔧 順帶修復:舊 _model_total 取 gemini["total"] 但實際鍵是 gemini_reported_total
-    #    → Gemini 曾被靜默漏出模型關;九柱版改取正確鍵。
-    # ⚠️ 這九個數字加起來是 100.1 不是 100 —— 是合議庭各柱四捨五入到小數一位的結果,
-    #    **不是 bug,也不影響任何分數**:下面 _song_side 是「除以在場柱的權重和」自我歸一化,
-    #    總分公式 0.253×詞 + 0.747×曲側 兩係數本身正好合 1。
-    #    ⛔ 不可以為了湊 100 私自改任何一格 —— 權重是十三席合議庭定的,改一格要單格重開辯論。
-    PILLAR_W = {"詞": 25.3, "人聲": 15.2, "和聲": 13.6, "結構編曲": 12.6, "聲學": 12.1,
-                "旋律記憶": 6.1, "真實風格": 6.1, "整體": 5.1, "律動": 4.0}
-
-    def _g(d, *ks):
-        for k in ks:
-            d = (d or {}).get(k) if isinstance(d, dict) else None
-        return float(d) if isinstance(d, (int, float)) else None
-
-    _md = (physical.get("mix_detail") or {})
-    _vd = (physical.get("vocal_detail") or {})
-    _hm = ((harmony or {}).get("metrics") or {})
-    _gd = ((gemini or {}).get("dimensions") or {})
-    _gt = _g(gemini, "gemini_reported_total", "raw_0to10")
-    _se = {k: (v * 20.0) for k, v in (songeval or {}).items()}   # 1-5 → 0-100
-
-    def _vnum(x):   # vocal_detail 的值可能是 dict{score} 或數字
-        return _g(x, "score") if isinstance(x, dict) else (float(x) if isinstance(x, (int, float)) else None)
-
-    PILLAR_ITEMS = {
-        "聲學": [("頻譜平衡", 26, _g(_md, "spectral_balance", "score")),
-                 ("混音結構", 18, _g(_md, "structure", "score")),
-                 ("結構清晰(SongEval)", 18, _se.get("Clarity")),
-                 ("立體聲", 10, _g(_md, "stereo", "score")),
-                 ("諧波", 10, _g(_md, "harmony", "score")),
-                 ("動態LRA", 10, _g(_md, "dynamic_range", "score")),
-                 ("製作品質(Audiobox)", 8, (_g(audiobox, "PQ") or 0) * 10 if _g(audiobox, "PQ") is not None else None)],
-        "人聲": [("嗓音品質", 23, _vnum(_vd.get("voice_quality"))),
-                 ("演唱聽感(SingMOS)", 12, _g(singmos, "score")),
-                 ("動態控制", 11, _vnum(_vd.get("dynamics"))),
-                 ("音準", 10, _vnum(_vd.get("pitch"))),
-                 ("顫音", 10, _vnum(_vd.get("vibrato"))),
-                 ("音域", 10, _vnum(_vd.get("range"))),
-                 ("人聲表現(Gemini M5)", 10, _g(_gd, "M5", "score")),
-                 ("人聲自然(SongEval)", 8, _se.get("Naturalness")),
-                 ("長音穩定", 6, _vnum(_vd.get("stability")))],
-        "和聲": [("終止式", 20, _g(_hm, "cadence", "score")),
-                 ("和弦詞彙(過濾版·復權)", 19, _g(_hm, "chord_vocabulary", "score")),
-                 ("調性穩定", 18, _g(_hm, "key_stability", "score")),
-                 ("五度動線", 16, _g(_hm, "fifth_motion", "score")),
-                 ("和聲節奏", 15, _g(_hm, "harmonic_rhythm", "score")),
-                 ("延伸和弦", 12, _g(_hm, "extended_chords", "score"))],
-        "結構編曲": [("能量成長", 32, _g(arrangement, "score_growth")),
-                     ("編制變化", 18, _g(arrangement, "score_delta")),
-                     ("結構弧線(Gemini M1)", 18, _g(_gd, "M1", "score")),
-                     ("連貫(SongEval)", 18, _se.get("Coherence")),
-                     ("配器音色(Gemini M4)", 14, _g(_gd, "M4", "score"))],
-        "旋律記憶": [("旋律記憶(Gemini M2)", 52, _g(_gd, "M2", "score")),
-                     ("記憶點(SongEval)", 48, _se.get("Memorability"))],
-        "律動": [("節奏律動(Gemini M3)", 100, _g(_gd, "M3", "score"))],
-        "整體": [("Gemini 總分", 51, (_gt * 10) if _gt is not None else None),
-                 ("音樂性(SongEval)", 49, _se.get("Musicality"))],
-        "真實風格": [("真實距離(馬氏)", 60, _g(realdist, "score")),
-                     ("曲風創新(Gemini M6)", 40, _g(_gd, "M6", "score"))],
-    }
-
-    pillar_scores = {}
-    pillar_detail = {}
-    for pname, items in PILLAR_ITEMS.items():
-        have = [(n, w, v) for n, w, v in items if v is not None]
-        miss = [n for n, w, v in items if v is None]
-        if have:
-            wsum = sum(w for _, w, _ in have)
-            pillar_scores[pname] = round(sum(w * v for _, w, v in have) / wsum, 1)
-        pillar_detail[pname] = {"score": pillar_scores.get(pname),
-                                "items": {n: round(v, 1) for n, w, v in have},
-                                "missing": miss}
-
-    _have_p = {p: s for p, s in pillar_scores.items()}
-    _wsum_song = sum(PILLAR_W[p] for p in _have_p)
-    _song_side = round(sum(PILLAR_W[p] * s for p, s in _have_p.items()) / _wsum_song, 1) if _have_p else None
+    # ── ⚖️ 九柱組裝 —— 實作在模組層級的 build_pillar_items / build_pillar_totals(見檔案上方)
+    _items = build_pillar_items(physical, harmony, arrangement, gemini,
+                                songeval, audiobox, singmos, realdist)
+    _pt = build_pillar_totals(_items)
+    pillar_detail = _pt["柱分"]
+    pillar_scores = {p: d["score"] for p, d in pillar_detail.items() if d["score"] is not None}
+    _have_p = pillar_scores
+    _song_side = _pt["曲側合成"]
 
     # ⛔ 完整性旗標一定要寫進 JSON:別人(或後續程式/排行榜)拿到這份檔案時,
     #    必須一眼看得出它是不是完整評測 —— 只印在主控台是不夠的。
-    _lost_pillars = [p for p in PILLAR_W if p != "詞" and p not in pillar_scores]
     merged["pillar_totals"] = {
-        "完整評測": not _lost_pillars,
-        "缺柱": _lost_pillars,
-        "缺柱權重合計": round(sum(PILLAR_W[p] for p in _lost_pillars), 1),
-        "完整性警語": ("九柱齊全,可與其他完整評測互比"
-                       if not _lost_pillars else
-                       "⛔ 不完整評測:曲側合成是用剩下的柱重新歸一化算的,"
-                       "不可與完整評測互比、不可排行、不可當評測結果。請補齊安裝後重評。"),
-        "柱分": pillar_detail,
-        "柱權重": PILLAR_W,
-        "曲側合成": _song_side,
-        "曲側含柱": sorted(_have_p),
+        **_pt,
         "公式": "總分 = 25.3%×詞(報告階段依四把尺合成)+ 74.7%×曲側八柱加權(缺柱重正規化)",
         "凍結中": ["演唱.rhythm(T2b 10:3)", "和聲.non_diatonic(9:4)"],
         "顯示軸": {"AI感 SONICS P(AI)": _g(realdist, "sonics_p_ai"),
@@ -831,8 +878,8 @@ def main():
     # ⛔ 缺柱時**不可以把合成分印得像一個正常分數**。
     #    九柱制的滿分定義是「九根柱子都在」;少一根就是換了一把尺,那個數字不能拿去跟別人比,
     #    也不能拿去排行。這裡把「不完整」講在分數同一行,而不是塞在下面的小字裡。
-    _lost_p = [p for p in PILLAR_W if p != "詞" and p not in _have_p]
-    _lost_w = round(sum(PILLAR_W[p] for p in _lost_p), 1)
+    _lost_p = _pt["缺柱"]
+    _lost_w = _pt["缺柱權重合計"]
     if _song_side is not None and not _lost_p:
         print(f"【曲側合成】 {_song_side} / 100(八柱加權;詞柱 25.3% 由報告階段依四把尺合成)")
     elif _song_side is not None:
