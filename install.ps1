@@ -126,7 +126,11 @@ if (-not $SkipML) {
         Ok "你已用 SONG_JURY_DEMUCS_PY 指定現成的 demucs,跳過"
     } else {
         $okDe = Try-Step ".venv-demucs 建立" { uv venv --python 3.11 .venv-demucs }
-        if ($okDe) { $okDe = Try-Step "demucs 安裝" { uv pip install --python $pyDe -r requirements-demucs.txt } }
+        # ⛔ 索引由這裡傳,不寫死在 requirements(寫死會讓 Mac 直接失敗、沒 GPU 的人白載 2.5GB)。
+        #    torch 先用 --index-url 明確裝一次(確保拿到對的 CUDA/CPU 版),再裝其餘;
+        #    第二道用 unsafe-best-match,否則 numpy 這類套件會卡在 uv 的 first-index 策略上。
+        if ($okDe) { $okDe = Try-Step "demucs 的 torch" { uv pip install --python $pyDe torch==2.6.0 torchaudio==2.6.0 --index-url $torchIdx } }
+        if ($okDe) { $okDe = Try-Step "demucs 安裝" { uv pip install --python $pyDe -r requirements-demucs.txt --extra-index-url $torchIdx --index-strategy unsafe-best-match } }
         if ($okDe) { Ok "Demucs 六軌分離就緒(模型權重首次分離時自動下載,約 300MB)" }
         else { Bad "Demucs 安裝失敗" "結構編曲柱與和聲柱會缺項,總分失真" }
     }
@@ -135,7 +139,10 @@ if (-not $SkipML) {
     Step "建立新耳朵環境 .venv-audition(SingMOS 演唱聽感 + MuQ 真實距離 + SONICS AI 感)"
     $pyA = ".venv-audition\Scripts\python.exe"
     $okA = Try-Step ".venv-audition 建立" { uv venv --python 3.11 .venv-audition }
-    if ($okA) { $okA = Try-Step ".venv-audition 套件安裝" { uv pip install --python $pyA -r requirements-audition.txt } }
+    # ⛔ 同上:索引由這裡傳,並用 unsafe-best-match 讓 numpy 這類套件能退回 PyPI
+    #    (uv 預設 first-index:套件名在 pytorch 索引找得到但版本不在 → 整份解析失敗)
+    if ($okA) { $okA = Try-Step "新耳朵的 torch" { uv pip install --python $pyA torch==2.6.0 torchaudio==2.6.0 --index-url $torchIdx } }
+    if ($okA) { $okA = Try-Step ".venv-audition 套件安裝" { uv pip install --python $pyA -r requirements-audition.txt --extra-index-url $torchIdx --index-strategy unsafe-best-match } }
     if ($okA) {
         if (-not (Try-Step "SONICS 安裝" { uv pip install --python $pyA "git+https://github.com/awsaf49/sonics.git" })) {
             Warn "SONICS 裝不起來 → AI 感只是顯示軸,不影響計分"
@@ -166,8 +173,9 @@ if (-not (Test-Path ".env")) {
         "GEMINI_API_KEYS=$($key.Trim())" | Out-File -FilePath ".env" -Encoding utf8 -NoNewline
         Ok "金鑰已寫入 .env(這個檔被 .gitignore 擋著,不會被上傳)"
     } else {
-        Copy-Item ".env.example" ".env" -ErrorAction SilentlyContinue
-        Warn "跳過金鑰 → 之後編輯 .env 填入 GEMINI_API_KEYS 即可"
+        # ⛔ 不複製 .env.example:那裡面的「你的第一把金鑰」是佔位字串,複製過去會被程式
+        #    當成真金鑰拿去打 Google API,錯誤訊息還很難懂。乾脆不要有 .env。
+        Warn "跳過金鑰 → 之後把 .env.example 複製成 .env 並填入 GEMINI_API_KEYS 即可"
     }
 } else { Ok ".env 已存在,保留你原本的金鑰設定" }
 }   # ← if (-not $CheckOnly) 結束:上面全是「安裝」,以下是「檢查」,-CheckOnly 直接跳到這
@@ -191,16 +199,29 @@ if ($hasEnv) {
 $hasMl      = Test-Path ".venv-ml\Scripts\python.exe"
 $hasSongEval= Test-Path "SongEval\eval.py"
 $hasAud     = Test-Path ".venv-audition\Scripts\python.exe"
-$hasKey     = (Test-Path ".env") -and ((Get-Content ".env" -Raw -ErrorAction SilentlyContinue) -match "GEMINI_API_KEYS?=\s*\S" ) -and
-              ((Get-Content ".env" -Raw) -notmatch "你的第一把金鑰")
+# ⛔ 正則要錨在行首(多行模式),否則 `# GEMINI_API_KEY=...` 這種註解行也會被當成有金鑰;
+#    也要排除 .env.example 的佔位字串。
+$hasKey = $false
+if (Test-Path ".env") {
+    foreach ($line in (Get-Content ".env" -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*GEMINI_API_KEYS?\s*=\s*(\S.*)$') {
+            $v = $Matches[1].Trim().Trim('"').Trim("'")
+            if ($v -and $v -notmatch '你的.*金鑰' -and $v -notmatch '^(your|xxx|todo)') { $hasKey = $true }
+        }
+    }
+}
 
 # 每根柱子:名稱 / 權重 / 完整需要什麼 / 缺了會怎樣
 $sev = ($hasMl -and $hasSongEval)
+# ⚠️ 這張表必須跟 評審團.py 的 PILLAR_ITEMS 實際行為對得起來(已用乾淨 clone 實跑對照):
+#    · 人聲柱的量測項(音準/顫音/音域/長音/嗓音/動態)吃 Demucs 分出來的人聲軌 → 缺 demucs 就缺一大半
+#    · 結構編曲柱缺 demucs 時**不是整柱不計** —— Gemini M1/M4 與 SongEval 連貫還在(柱內 50%)
+#    · 和聲柱六項全部來自和弦辨識(吃分軌)→ 缺 demucs 才是真的整柱消失
 $pillars = @(
   @{n="詞";         w=25.3; ok=$true;                     part=@{} }
-  @{n="人聲演唱";   w=15.2; ok=$hasEnv;                   part=@{ "SingMOS 聽感"=$hasAud; "SongEval 自然度"=$sev; "Gemini 人聲表現"=$hasKey } }
+  @{n="人聲演唱";   w=15.2; ok=$hasEnv;                   part=@{ "演唱量測(需分軌)"=$hasDemucs; "SingMOS 聽感"=$hasAud; "SongEval 自然度"=$sev; "Gemini 人聲表現"=$hasKey } }
   @{n="和聲";       w=13.6; ok=($hasEnv -and $hasDemucs); part=@{} }
-  @{n="結構與編曲"; w=12.6; ok=$hasDemucs;                part=@{ "SongEval 連貫"=$sev; "Gemini 結構/配器"=$hasKey } }
+  @{n="結構與編曲"; w=12.6; ok=($hasDemucs -or $sev -or $hasKey); part=@{ "編曲量測(需分軌)"=$hasDemucs; "SongEval 連貫"=$sev; "Gemini 結構/配器"=$hasKey } }
   @{n="聲學製作";   w=12.1; ok=$hasEnv;                   part=@{ "SongEval 清晰"=$sev; "Audiobox PQ"=$hasMl } }
   @{n="旋律與記憶"; w=6.1;  ok=($hasKey -or $sev);        part=@{ "Gemini 旋律"=$hasKey; "SongEval 記憶點"=$sev } }
   @{n="真實性與風格";w=6.1; ok=($hasAud -or $hasKey);     part=@{ "MuQ 真實距離"=$hasAud; "Gemini 曲風"=$hasKey } }

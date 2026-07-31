@@ -30,6 +30,11 @@
 !song_scorer.py
 !和聲分析.py
 !編曲層次.py
+# ⚠️ 下面兩支是 編曲層次/和聲分析/評審團 共用的底層,漏放行 = 別人 clone 下來
+#    頂層 import 就 ModuleNotFoundError,和聲柱+結構編曲柱+人聲柱大半細項一起死。
+#    新增任何 .py 前先問:有沒有別的檔 import 它 / subprocess 呼叫它?
+!分軌快取.py
+!伴奏混音.py
 !Gemini曲評.py
 !演唱聽感.py
 !真實距離.py

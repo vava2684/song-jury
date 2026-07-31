@@ -58,14 +58,32 @@ def _find_demucs_py():
     if env_py:
         return env_py
     win = os.name == "nt"
-    cands = []
-    # 常見的 anaconda/miniconda 位置(很多人的 demucs 裝在那);用家目錄推,不寫死使用者名稱
+    base = Path(__file__).resolve().parent
+
+    def _has_demucs(py: Path) -> bool:
+        """這個 python 真的裝了 demucs 嗎 —— 看 site-packages 有沒有 demucs 套件目錄。
+        ⛔ 不能只看 python.exe 在不在:很多人裝了 anaconda 但裡面沒有 demucs,
+           只驗檔案存在就會挑中一個跑不動的直譯器,26.2% 權重靜靜消失。"""
+        if not py.exists():
+            return False
+        root = py.parent if win else py.parent.parent
+        pats = ["Lib/site-packages/demucs"] if win else ["lib/python*/site-packages/demucs"]
+        # ⚠️ 一定要 next(..., None) 或 list() 把產生器取值 —— Path.glob() 回的是**產生器,
+        #    永遠是 truthy**,直接丟進 any() 會讓任何存在的 python 都被判成「有 demucs」。
+        return any(next(root.glob(p), None) is not None for p in pats)
+
+    # ⚠️ 順序:安裝腳本自己建的 .venv-demucs 要排在 conda 前面 —— 那是「這個專案裝的」,
+    #    最可信;conda 只是向下相容既有使用者的退路。
+    cands = [base / v / ("Scripts/python.exe" if win else "bin/python")
+             for v in (".venv-demucs", ".venv-ml")]
     home = Path.home()
     for d in ("anaconda3", "miniconda3", "miniforge3"):
         cands.append(home / d / ("python.exe" if win else "bin/python"))
-    for v in (".venv-demucs", ".venv-ml"):
-        cands.append(Path(__file__).resolve().parent / v / ("Scripts/python.exe" if win else "bin/python"))
-    for p in cands:
+
+    for p in cands:                      # 第一輪:真的有 demucs 的才算
+        if _has_demucs(p):
+            return str(p)
+    for p in cands:                      # 第二輪:退而求其次,至少是個存在的直譯器(錯誤訊息會更清楚)
         if p.exists():
             return str(p)
     return sys.executable   # 最後退路:當前直譯器(HF Space 這類單一環境)
@@ -77,12 +95,14 @@ DEMUCS_NEED_MIB = 4000    # htdemucs_6s 用量遠小於 SongEval,不必套 21000
 STEMS_DIR = BASE / "_stems"   # 編曲層次與和聲分析共用同一份分軌快取 → Demucs 全程只跑一次
 
 # 新元件全部是「可選」:任何一個失敗都只記 error,不影響原本三關的結果產出。
-def _optional_stage(cmd, label, env=None, timeout=1800):
-    """跑一個新元件,回 (資料 dict 或 None, 說明)。絕不讓它中斷主流程。
+def _optional_stage(cmd, label, env=None, timeout=1800, cwd=None):
+    """跑一個新元件,回 (完成的 process 或 None, 說明)。絕不讓它中斷主流程。
     ⚠️ 不能只看 returncode:這些工具把例外包起來後照樣寫 JSON 並回 0
-       (和聲分析.py 就是這樣),所以要檢查 degraded 與有沒有實際內容。"""
+       (和聲分析.py 就是這樣),所以要檢查 degraded 與有沒有實際內容。
+    ⚠️ cwd 不存在時 subprocess 在 Windows 丟 NotADirectoryError、POSIX 丟 FileNotFoundError,
+       兩者都由下面那個 except Exception 接住 → 回 (None, 說明),不會炸掉主流程。"""
     try:
-        r = subprocess.run(cmd, cwd=str(BASE), env=env or ENV, capture_output=True,
+        r = subprocess.run(cmd, cwd=str(cwd or BASE), env=env or ENV, capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=timeout, **_NO_WINDOW)
     except subprocess.TimeoutExpired:
@@ -535,24 +555,44 @@ def main():
     # ── 第二層 A: SongEval 五維美學(唯一暫存夾,並行安全、崩潰自清)──
     # 這兩顆是唯一會吃 GPU 的階段 → 開跑前依當下 VRAM 決定走 GPU 還是退 CPU(見檔頭 _pick_device_env)
     dev_env, dev_why = _pick_device_env()
+    # ⚠️ 這兩關**不可以用 _run_stage**(那會 sys.exit 掉整份報告)。
+    #    README 明列 --skip-ml 是支援的安裝方式,安裝腳本也承諾「SongEval 沒裝好,分數仍會出來、
+    #    只是缺細項」。用致命版的話,--skip-ml 的人與 clone 失敗的人會直接吃到一段 traceback,
+    #    一份報告都拿不到 —— 跟文件承諾相反。缺了就給空 dict,走 PILLAR_ITEMS 既有的缺項歸一化。
     print(f"[4/6] SongEval 美學評分(音樂人訓練模型)… 裝置:{dev_why}")
-    tmp_out = Path(tempfile.mkdtemp(prefix="_songeval_", dir=BASE))
-    try:
-        _run_stage([_venv_py(".venv-ml"), "eval.py", "-i", str(song), "-o", str(tmp_out)],
-                   cwd=BASE / "SongEval", label="SongEval 美學", env=dev_env)
-        se_raw = json.loads((tmp_out / "result.json").read_text(encoding="utf-8"))
-    finally:
-        shutil.rmtree(tmp_out, ignore_errors=True)
-    songeval = list(se_raw.values())[0]
+    songeval = {}
+    _se_dir = BASE / "SongEval"
+    if not (_se_dir / "eval.py").exists():
+        print("      ↳ 跳過:SongEval 沒安裝(五個模型聽感細項會缺,不影響其餘柱)")
+        notes.append("SongEval:跳過(SongEval/eval.py 不存在;跑 install 腳本或手動 clone 可補齊)")
+    else:
+        tmp_out = Path(tempfile.mkdtemp(prefix="_songeval_", dir=BASE))
+        try:
+            _, _se_err = _optional_stage([_venv_py(".venv-ml"), "eval.py", "-i", str(song), "-o", str(tmp_out)],
+                                         "SongEval 美學", env=dev_env, cwd=_se_dir)
+            if _se_err:
+                notes.append(f"SongEval:{_se_err}")
+            else:
+                se_raw = json.loads((tmp_out / "result.json").read_text(encoding="utf-8"))
+                songeval = list(se_raw.values())[0] if se_raw else {}
+        except Exception as e:
+            notes.append(f"SongEval:讀取結果失敗({e})")
+        finally:
+            shutil.rmtree(tmp_out, ignore_errors=True)
 
     # ── 第二層 B: Audiobox 四軸 ──
     print("[5/6] Audiobox 美學評分(Meta 模型)...")
+    audiobox = {}
     tmp_lst = BASE / f"_tmp_audiobox_{os.getpid()}.jsonl"
     tmp_lst.write_text(json.dumps({"path": str(song)}) + "\n", encoding="utf-8")
     try:
-        p = _run_stage([_venv_exe(".venv-ml", "audio-aes"), str(tmp_lst), "--batch-size", "1"],
-                       cwd=BASE, label="Audiobox 美學", env=dev_env)   # 跟 SongEval 同一個裝置決策
-        audiobox = _last_json(p.stdout)
+        p, _ab_err = _optional_stage([_venv_exe(".venv-ml", "audio-aes"), str(tmp_lst), "--batch-size", "1"],
+                                     "Audiobox 美學", env=dev_env)   # 跟 SongEval 同一個裝置決策
+        if _ab_err:
+            print("      ↳ 跳過:Audiobox 沒安裝或執行失敗(製作品質等細項會缺)")
+            notes.append(f"Audiobox:{_ab_err}")
+        else:
+            audiobox = _last_json(p.stdout) or {}
     finally:
         tmp_lst.unlink(missing_ok=True)
 
@@ -607,7 +647,9 @@ def main():
     # 跑在 .venv-audition;venv 或權重不在就 degraded 留痕,不炸產線。
     singmos = None
     realdist = None
-    _aud_py = BASE / ".venv-audition/Scripts/python.exe"
+    # ⛔ 不可以寫死 Scripts/python.exe:POSIX 上 uv 建的是 bin/python,
+    #    寫死 Windows 路徑會讓 Linux/macOS 使用者「明明裝好了卻永遠被判不存在」。
+    _aud_py = BASE / ".venv-audition" / ("Scripts/python.exe" if _WIN else "bin/python")
     if not _aud_py.exists():
         notes.append("新柱管線:跳過(.venv-audition 不存在,SingMOS/馬氏/SONICS 缺席)")
     else:
@@ -663,6 +705,10 @@ def main():
     # ⛔ 凍結:演唱.rhythm(T2b 10:3)、和聲.non_diatonic(9:4);SONICS=顯示軸不入分(19:7)。
     # 🔧 順帶修復:舊 _model_total 取 gemini["total"] 但實際鍵是 gemini_reported_total
     #    → Gemini 曾被靜默漏出模型關;九柱版改取正確鍵。
+    # ⚠️ 這九個數字加起來是 100.1 不是 100 —— 是合議庭各柱四捨五入到小數一位的結果,
+    #    **不是 bug,也不影響任何分數**:下面 _song_side 是「除以在場柱的權重和」自我歸一化,
+    #    總分公式 0.253×詞 + 0.747×曲側 兩係數本身正好合 1。
+    #    ⛔ 不可以為了湊 100 私自改任何一格 —— 權重是十三席合議庭定的,改一格要單格重開辯論。
     PILLAR_W = {"詞": 25.3, "人聲": 15.2, "和聲": 13.6, "結構編曲": 12.6, "聲學": 12.1,
                 "旋律記憶": 6.1, "真實風格": 6.1, "整體": 5.1, "律動": 4.0}
 
@@ -748,7 +794,7 @@ def main():
     out_path = song.with_name(song.stem + "_評審團.json")
     out_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    se_avg = sum(songeval.values()) / len(songeval)
+    se_avg = (sum(songeval.values()) / len(songeval)) if songeval else None   # SongEval 沒裝時為 None
     print()
     print("=" * 54)
     print("  評審團總表(九柱制,重構庭 2026-07-25 定版)")
@@ -792,13 +838,19 @@ def main():
             if isinstance(v, dict) and v.get("score") is not None:
                 print(f"  ・{HARMONY_LABELS.get(k, k)}:{v['score']:.1f}")
 
-    print(f"【美學-SongEval】 平均 {se_avg:.2f} / 5")
-    for k, v in songeval.items():
-        print(f"  ・{SONGEVAL_LABELS.get(k, k)}:{v:.2f}")
-    print("【美學-Audiobox】(1–10)")
-    for k in ("PQ", "CE", "CU", "PC"):
-        if k in audiobox:
-            print(f"  ・{AUDIOBOX_LABELS[k]}:{audiobox[k]:.2f}")
+    if se_avg is None:
+        print("【美學-SongEval】 缺席(沒安裝 SongEval;相關細項不計分,見文末未跑到清單)")
+    else:
+        print(f"【美學-SongEval】 平均 {se_avg:.2f} / 5")
+        for k, v in songeval.items():
+            print(f"  ・{SONGEVAL_LABELS.get(k, k)}:{v:.2f}")
+    if not audiobox:
+        print("【美學-Audiobox】 缺席(沒安裝 Audiobox;相關細項不計分)")
+    else:
+        print("【美學-Audiobox】(1–10)")
+        for k in ("PQ", "CE", "CU", "PC"):
+            if k in audiobox:
+                print(f"  ・{AUDIOBOX_LABELS[k]}:{audiobox[k]:.2f}")
 
     if gemini and not gemini.get("degraded"):
         dims = gemini.get("dimensions") or {}

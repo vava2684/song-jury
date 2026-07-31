@@ -11,6 +11,7 @@
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -55,9 +56,16 @@ def main():
         del enc
         torch.cuda.empty_cache()
 
+        # SONICS(AI 感,顯示軸不入分)—— checkpoint 要自己下載,本專案不隨包。
+        #   預設找 ckpt/sonics-alpha-120s/,也可用環境變數 SONG_JURY_SONICS_CKPT 指到別處;
+        #   兩者都沒有就直接寫一行說明,不去 HuggingFace 撞一次沒必要的網路錯誤。
+        #   取得方式見 README「要自行取得」那節。缺它完全不影響任何一柱的分數。
+        _ck = os.environ.get("SONG_JURY_SONICS_CKPT") or str(BASE / "ckpt/sonics-alpha-120s")
         try:
+            if not Path(_ck).is_dir():
+                raise FileNotFoundError(f"SONICS checkpoint 不在 {_ck}(顯示軸,不影響計分)")
             from sonics import HFAudioClassifier
-            m = HFAudioClassifier.from_pretrained(str(BASE / "_審核/ckpt/sonics-alpha-120s")).to(dev).eval()
+            m = HFAudioClassifier.from_pretrained(_ck).to(dev).eval()
             y16, _ = librosa.load(a.audio, sr=16000, mono=True)
             MAXLEN = 1920000
             if len(y16) > MAXLEN:

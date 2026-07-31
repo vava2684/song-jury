@@ -1,4 +1,4 @@
-# 第二關(美學模型)+ YouTube 輸入 —— 裝進 .venv-ml(較重,獨立環境)
+# 第二關(美學模型)—— 裝進 .venv-ml(較重,獨立環境)
 #   uv venv .venv-ml
 #
 # 1) torch 依你的 CUDA 版本另裝(這幾個必須一組同版;範例 cu124):
@@ -10,7 +10,8 @@
 #    uv pip install -p .venv-ml -r requirements-ml.txt
 muq==0.1.0                  # SongEval 核心模型(第二關 A);會帶入 nnAudio/einops/hydra/transformers 等
 audiobox_aesthetics==0.0.4  # Meta Audiobox Aesthetics(第二關 B)
-yt-dlp                      # YouTube 連結輸入(另需系統 ffmpeg)
+# ⛔ yt-dlp 已移到 requirements.txt(.venv):評審團.py 用 sys.executable -m yt_dlp 呼叫,
+#    而它自己跑在 .venv —— 裝在這個環境等於沒裝,YouTube 輸入會一直失敗。
 
 # 3) SongEval 程式本體(eval.py)另需 clone 進 SongEval/:
 #      git clone https://github.com/ASLP-lab/SongEval.git SongEval

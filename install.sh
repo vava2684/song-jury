@@ -97,12 +97,19 @@ fi
 
 if [ "$SKIP_ML" = 0 ]; then
   # GPU 偵測(決定 torch 版本)
+  # TORCH_IDX  = 裝 torch 本體時用(--index-url,獨佔那個索引,確保拿到對的 CUDA/CPU 版)
+  # TORCH_XIDX = 裝整份 requirements 時用(--extra-index-url,PyPI 仍可用,numpy 之類才找得到)
   if have nvidia-smi; then
-    TORCH_IDX=(--index-url https://download.pytorch.org/whl/cu124); ok "偵測到 NVIDIA GPU → 裝 CUDA 12.4 版 torch"
+    TORCH_IDX=(--index-url https://download.pytorch.org/whl/cu124)
+    TORCH_XIDX=(--extra-index-url https://download.pytorch.org/whl/cu124)
+    ok "偵測到 NVIDIA GPU → 裝 CUDA 12.4 版 torch"
   elif [ "$(uname)" = "Darwin" ]; then
-    TORCH_IDX=(); ok "macOS → 用官方預設 wheel(Apple Silicon 走 MPS)"
+    TORCH_IDX=(); TORCH_XIDX=()
+    ok "macOS → 用官方預設 wheel(Apple Silicon 走 MPS)"
   else
-    TORCH_IDX=(--index-url https://download.pytorch.org/whl/cpu); warn "沒偵測到 NVIDIA GPU → 裝 CPU 版 torch(能跑,但每首會慢很多)"
+    TORCH_IDX=(--index-url https://download.pytorch.org/whl/cpu)
+    TORCH_XIDX=(--extra-index-url https://download.pytorch.org/whl/cpu)
+    warn "沒偵測到 NVIDIA GPU → 裝 CPU 版 torch(能跑,但每首會慢很多)"
   fi
 
   # ── [3] 模型環境 ────────────────────────────────────────────────
@@ -130,8 +137,12 @@ if [ "$SKIP_ML" = 0 ]; then
   step "建立分軌環境 .venv-demucs(結構編曲柱 + 和聲柱都吃它,合計 26.2% 權重)"
   if [ -n "${SONG_JURY_DEMUCS_PY:-}" ] && [ -x "${SONG_JURY_DEMUCS_PY}" ]; then
     ok "你已用 SONG_JURY_DEMUCS_PY 指定現成的 demucs,跳過"
+  # ⛔ 索引由這裡傳(macOS 時 TORCH_IDX 是空陣列 → 走官方 PyPI):requirements 檔裡寫死 cu124
+  #    會讓 Mac 必失敗、沒 GPU 的人白載 2.5GB。torch 先明確裝一次拿到對的版本,再裝其餘;
+  #    第二道用 unsafe-best-match,否則 numpy 這類套件會卡在 uv 的 first-index 策略上。
   elif try_step ".venv-demucs 建立" uv venv --python 3.11 .venv-demucs \
-       && try_step "demucs 安裝" uv pip install --python .venv-demucs/bin/python -r requirements-demucs.txt; then
+       && try_step "demucs 的 torch" uv pip install --python .venv-demucs/bin/python torch==2.6.0 torchaudio==2.6.0 "${TORCH_IDX[@]}" \
+       && try_step "demucs 安裝" uv pip install --python .venv-demucs/bin/python -r requirements-demucs.txt "${TORCH_XIDX[@]}" --index-strategy unsafe-best-match; then
     ok "Demucs 六軌分離就緒(模型權重首次分離時自動下載,約 300MB)"
   else
     bad "Demucs 安裝失敗" "結構編曲柱與和聲柱會缺項,總分失真"
@@ -141,7 +152,8 @@ if [ "$SKIP_ML" = 0 ]; then
   step "建立新耳朵環境 .venv-audition(SingMOS 演唱聽感 + MuQ 真實距離 + SONICS AI 感)"
   PY_A=".venv-audition/bin/python"
   if try_step ".venv-audition 建立" uv venv --python 3.11 .venv-audition \
-     && try_step ".venv-audition 套件安裝" uv pip install --python "$PY_A" -r requirements-audition.txt; then
+     && try_step "新耳朵的 torch" uv pip install --python "$PY_A" torch==2.6.0 torchaudio==2.6.0 "${TORCH_IDX[@]}" \
+     && try_step ".venv-audition 套件安裝" uv pip install --python "$PY_A" -r requirements-audition.txt "${TORCH_XIDX[@]}" --index-strategy unsafe-best-match; then
     try_step "SONICS 安裝" uv pip install --python "$PY_A" "git+https://github.com/awsaf49/sonics.git" \
       || warn "SONICS 裝不起來 → AI 感只是顯示軸,不影響計分"
     ok ".venv-audition 完成(模型權重首次執行時下載,約 3GB)"
@@ -186,7 +198,12 @@ HAS_ENV=0;  [ -x .venv/bin/python ] && HAS_ENV=1
 HAS_ML=0;   [ -x .venv-ml/bin/python ] && HAS_ML=1
 HAS_SE=0;   [ -f SongEval/eval.py ] && [ "$HAS_ML" = 1 ] && HAS_SE=1
 HAS_AUD=0;  [ -x .venv-audition/bin/python ] && HAS_AUD=1
-HAS_KEY=0;  [ -f .env ] && grep -qE '^GEMINI_API_KEYS?=[^[:space:]]' .env && ! grep -q '你的第一把金鑰' .env && HAS_KEY=1
+# ⛔ 錨在行首(排除註解行),並排除 .env.example 的佔位字串
+HAS_KEY=0
+if [ -f .env ] && grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*[^[:space:]]' .env \
+   && ! grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*.*(你的.*金鑰|^your|xxx)' .env; then
+  HAS_KEY=1
+fi
 
 # ⛔ 不自己猜 demucs 在哪 —— 問評審團.py 自己解析出來的那條路徑(唯一真理來源),
 #    再實際 import 一次確認那個 python 真的有 demucs。
@@ -218,9 +235,12 @@ row() {
 or1() { [ "$1" = 1 ] || [ "$2" = 1 ] && echo 1 || echo 0; }
 and1() { [ "$1" = 1 ] && [ "$2" = 1 ] && echo 1 || echo 0; }
 row "詞            " 25.3 1 ""
-row "人聲演唱      " 15.2 "$HAS_ENV" "SingMOS 聽感:$HAS_AUD,SongEval 自然度:$HAS_SE,Gemini 人聲表現:$HAS_KEY"
+# ⚠️ 這張表必須跟 評審團.py 的 PILLAR_ITEMS 實際行為對得起來(已用乾淨 clone 實跑對照):
+#    人聲柱的量測項吃 Demucs 人聲軌;結構編曲柱缺 demucs 只是少一半、不是整柱不計;
+#    和聲柱六項全靠和弦辨識(吃分軌),缺 demucs 才真的整根消失。
+row "人聲演唱      " 15.2 "$HAS_ENV" "演唱量測(需分軌):$HAS_DEMUCS,SingMOS 聽感:$HAS_AUD,SongEval 自然度:$HAS_SE,Gemini 人聲表現:$HAS_KEY"
 row "和聲          " 13.6 "$(and1 "$HAS_ENV" "$HAS_DEMUCS")" ""
-row "結構與編曲    " 12.6 "$HAS_DEMUCS" "SongEval 連貫:$HAS_SE,Gemini 結構/配器:$HAS_KEY"
+row "結構與編曲    " 12.6 "$(or1 "$HAS_DEMUCS" "$(or1 "$HAS_SE" "$HAS_KEY")")" "編曲量測(需分軌):$HAS_DEMUCS,SongEval 連貫:$HAS_SE,Gemini 結構/配器:$HAS_KEY"
 row "聲學製作      " 12.1 "$HAS_ENV" "SongEval 清晰:$HAS_SE,Audiobox PQ:$HAS_ML"
 row "旋律與記憶    " 6.1  "$(or1 "$HAS_KEY" "$HAS_SE")" "Gemini 旋律:$HAS_KEY,SongEval 記憶點:$HAS_SE"
 row "真實性與風格  " 6.1  "$(or1 "$HAS_AUD" "$HAS_KEY")" "MuQ 真實距離:$HAS_AUD,Gemini 曲風:$HAS_KEY"

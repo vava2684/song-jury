@@ -9,5 +9,8 @@ praat-parselmouth   # 選用:song_scorer --vocal 的嗓音品質(jitter/shimmer/
 reportlab           # 報告轉PDF
 pypdfium2           # 轉PNG(PDF→影像)
 Pillow              # 轉PNG(多頁拼長圖)
+yt-dlp              # YouTube 連結輸入(另需系統 ffmpeg)
+                    # ⚠️ 必須裝在 .venv:評審團.py 是用「跑自己的那個直譯器」呼叫
+                    #    sys.executable -m yt_dlp,裝到別的 venv 等於沒裝。
 
-# 第二關(美學 ML)+ YouTube 輸入 —— 裝進 .venv-ml(見 requirements-ml.txt)
+# 第二關(美學 ML)—— 裝進 .venv-ml(見 requirements-ml.txt)

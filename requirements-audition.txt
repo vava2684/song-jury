@@ -8,13 +8,17 @@
 #   .\.venv-audition\Scripts\pip install -r requirements-audition.txt
 #   .\.venv-audition\Scripts\pip install "git+https://github.com/awsaf49/sonics.git"
 #
-# ⚠️ torch 這行是 CUDA 12.4 版(NVIDIA GPU)。純 CPU 或其他 CUDA 版本請改用官方選擇器:
-#    https://pytorch.org/get-started/locally/  —— 沒有 GPU 也能跑,只是慢。
+# ⚠️ 這裡**刻意不寫 --extra-index-url**。torch 要用哪個索引(cu124 / cpu / macOS 官方)
+#    由安裝腳本偵測 GPU 後用 --index-url 傳進來。
+#    ⛔ 曾經在這裡寫死 cu124,結果:
+#       (a) uv 預設 first-index 策略 → numpy 在 cu124 索引上「有套件、沒這個版本」,
+#           整份 requirements 直接 No solution found,全平台裝不起來;
+#       (b) macOS 根本沒有 cu124 wheel,Mac 使用者必失敗;
+#       (c) 沒有 NVIDIA 卡的人被硬灌 CUDA 版 torch,白下載 2.5GB。
+#    自己手動裝的話請照 https://pytorch.org/get-started/locally/ 選對索引。
 #
-# 權重會在第一次執行時自動下載(SingMOS 走 torch.hub、MuQ/SONICS 走 HuggingFace),
-# 合計約 3 GB。SONICS 的 checkpoint 需放在 _審核/ckpt/sonics-alpha-120s(見 真實距離.py)。
-
---extra-index-url https://download.pytorch.org/whl/cu124
+# 權重會在第一次執行時自動下載(SingMOS 走 torch.hub、MuQ 走 HuggingFace),合計約 3 GB。
+# SONICS(AI 感顯示軸)另需自行下載 checkpoint,見 真實距離.py 的說明;沒有它不影響計分。
 
 torch==2.6.0
 torchaudio==2.6.0

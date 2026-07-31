@@ -114,6 +114,10 @@
 - **Meta Audiobox Aesthetics** → 腳本自動裝
 - **NRC-VAD 情緒詞典**(禁再散布)→ 腳本自官方源代取
 - **Gemini API 金鑰** → 安裝時直接問你,或事後填 `.env`([免費申請](https://aistudio.google.com/apikey))
+- **SONICS checkpoint**(可選,只影響「AI 感」這條**不計分**的顯示軸)→
+  自 [awsaf49/sonics](https://github.com/awsaf49/sonics) 取 `sonics-alpha-120s`,
+  放到 `ckpt/sonics-alpha-120s/`(或設環境變數 `SONG_JURY_SONICS_CKPT` 指過去)。
+  沒有它一切照常,報告只是不顯示 AI 感那一列。
 
 > ⛔ **品質至上・排隊不降級**:Gemini 曲評固定用最好的模型;它故障時報告誠實標「缺席待補」,
 > **不換次級模型頂替** —— 儀器版本混用會破壞可比性。等它恢復後重評即可補齊。
@@ -122,19 +126,27 @@
 
 ## 用法
 
+> ⚠️ **一定要用 `.venv` 裡的 python**,不能打裸 `python` —— 所有相依都裝在 `.venv`,
+> 用系統 python 會 `ModuleNotFoundError`。下面每一行都已經寫成正確形式。
+
 ```bash
-# 九柱音訊評測(吃 SUNO/YouTube 連結 或 本機檔),產 歌名_評審團.json
-python 評審團.py "<連結或檔案路徑>"
-
-# 歌詞情感弧線儀,產 _情感弧線.png
-python 情感弧線.py 歌詞.txt
-
-# 詞柱:把歌詞交給對話中的 AI,說「依評詞標準評詞」—— AI 讀 評詞標準.md 照辦
-
-# 報告 md 寫好後 → PDF → 長圖
-python 報告轉PDF.py 報告.md
-python 轉PNG.py    報告.pdf
+# Windows(PowerShell)
+.venv\Scripts\python.exe 評審團.py "<SUNO/YouTube 連結 或 音檔路徑>"   # 九柱音訊評測 → 歌名_評審團.json
+.venv\Scripts\python.exe 情感弧線.py 歌詞.txt                          # 情感弧線圖 → _情感弧線.png
+.venv\Scripts\python.exe 報告轉PDF.py 報告.md                          # 報告 md → PDF
+.venv\Scripts\python.exe 轉PNG.py    報告.pdf                          # PDF → 全長 PNG
 ```
+
+```bash
+# Linux / macOS
+.venv/bin/python 評審團.py "<SUNO/YouTube 連結 或 音檔路徑>"
+.venv/bin/python 情感弧線.py 歌詞.txt
+.venv/bin/python 報告轉PDF.py 報告.md
+.venv/bin/python 轉PNG.py    報告.pdf
+```
+
+**詞柱**不是程式跑的:把歌詞交給對話中的 AI,說「依評詞標準評詞」—— AI 讀 `評詞標準.md` 與
+`rubrics/` 底下對應語言的尺照辦。
 
 `評審團.py` 負責「評一首歌的曲側八柱」;PK / 抽卡比較由 AI 編排(跑多首 + 綜合),不是程式職責。
 

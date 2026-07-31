@@ -10,14 +10,17 @@
 # 已裝過 demucs 的人(例如 anaconda 裡有):設環境變數 SONG_JURY_DEMUCS_PY 指過去即可,
 # 這個 venv 就不必建 —— 評審團.py 會優先採用那個路徑。
 #
-# 安裝:
+# ⚠️ 這裡**刻意不寫 --extra-index-url**:torch 要用哪個索引(cu124 / cpu / macOS 官方)
+#    由安裝腳本偵測 GPU 後用 --index-url 傳進來。寫死 cu124 會讓 Mac 必失敗、
+#    也會讓沒有 NVIDIA 卡的人被硬灌 CUDA 版 torch。
+#
+# 安裝(索引請照自己的機器選,見 https://pytorch.org/get-started/locally/):
 #   uv venv --python 3.11 .venv-demucs
-#   uv pip install --python .venv-demucs/Scripts/python.exe -r requirements-demucs.txt
-#   (Linux/macOS 把 Scripts 換成 bin)
+#   uv pip install --python .venv-demucs/Scripts/python.exe -r requirements-demucs.txt \
+#       --index-url https://download.pytorch.org/whl/cu124
+#   (Linux/macOS 把 Scripts 換成 bin;macOS 不要加 --index-url,用官方預設)
 #
 # 模型權重(htdemucs_6s,約 300MB)在第一次分離時自動下載。
-
---extra-index-url https://download.pytorch.org/whl/cu124
 
 torch==2.6.0
 torchaudio==2.6.0

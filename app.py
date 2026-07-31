@@ -96,11 +96,37 @@ def _score_table(merged):
     return rows
 
 
+def _pick_rubric(lyrics):
+    """依歌詞語言挑那把尺。判定順序固定 韓 → 日 → 中 → 英
+    (日文含漢字,所以必須排在中文前面,否則日文歌會被中文尺攔截)。
+    回 (尺檔路徑, 語言名, 維度數)。⛔ 四把尺絕不混讀 —— 它們的軸互斥。"""
+    t = lyrics or ""
+    if re.search(r"[가-힯]", t):                       # 韓文字母
+        return BASE / "rubrics/KO_lyric_rubric_v4.md", "韓文", 7
+    if re.search(r"[぀-ゟ゠-ヿ]", t):           # 平假名/片假名
+        return BASE / "rubrics/JA_lyric_rubric_v3.md", "日文", 6
+    if re.search(r"[一-鿿]", t):                        # 漢字
+        return BASE / "rubrics/ZH_lyric_rubric_v5.md", "中文", 7
+    return BASE / "rubrics/EN_lyric_rubric_v2.md", "英文", 6
+
+
 def _lyric_prompt(lyrics):
+    """⛔ 這裡一定要把「對應語言的那把尺」也餵進去。
+    評詞標準.md 規範的是報告格式與情感框架,**維度定義在 rubrics/ 那四把尺裡**。
+    只餵評詞標準等於沒有評分依據,模型會自己編維度(舊版就是這樣,還寫死「七維度」——
+    英文/日文尺只有 6 維,一律要七維會逼模型硬湊一個出來)。"""
     std = (BASE / "評詞標準.md").read_text(encoding="utf-8")
-    return ("你是專業歌曲評審。請【嚴格依照】以下《評詞標準》評這首歌的「詞」(第三關)。"
-            "給七維度雙分數(作品分/爆款分,每分引原句)、情感三支柱、句級修法。只評詞。\n\n"
-            f"===== 評詞標準 =====\n{std}\n\n===== 待評歌詞 =====\n{lyrics}\n")
+    rp, lang, ndim = _pick_rubric(lyrics)
+    try:
+        rubric = rp.read_text(encoding="utf-8")
+    except Exception:
+        rubric, ndim = "(找不到對應語言的尺,請確認 rubrics/ 是否完整)", "N"
+    return (f"你是專業歌曲評審。這首歌詞判定為【{lang}】,請【嚴格依照】下面那把{lang}尺評詞。\n"
+            f"給 {ndim} 個維度的雙分數(作品分 Craft / 爆款分 Reach,每分引原句)、"
+            "情感三支柱、句級修法。⛔ 兩個分數禁止平均。只評詞,不要評曲。\n\n"
+            f"===== {lang}尺({rp.name})=====\n{rubric}\n\n"
+            f"===== 報告格式與情感框架(評詞標準)=====\n{std}\n\n"
+            f"===== 待評歌詞 =====\n{lyrics}\n")
 
 
 def _jpath_from_stdout(stdout):
