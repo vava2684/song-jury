@@ -21,6 +21,7 @@
 !requirements.txt
 !requirements-ml.txt
 !requirements-audition.txt
+!requirements-demucs.txt
 !requirements-web.txt
 
 # ── 放行「程式」──
@@ -42,6 +43,7 @@
 !make_demo_song.py
 !install.ps1
 !install.sh
+!一鍵安裝.bat
 !app.py
 !run_web.ps1
 !run_web.sh

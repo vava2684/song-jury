@@ -50,7 +50,28 @@ CPU_THREADS = "12"        # CPU 模式執行緒上限(13900KS 24 核 → 約 50%
 #
 # ⚠️ demucs 只裝在 anaconda,不在 .venv/.venv-ml → 分軌類元件必須用它跑。
 #    ⛔ 但 song_scorer 不能改用 anaconda:那裡沒有 parselmouth,jitter/shimmer/HNR 會靜靜變 None。
-DEMUCS_PY = os.environ.get("SONG_JURY_DEMUCS_PY") or r"C:\Users\VAVA\anaconda3\python.exe"
+def _find_demucs_py():
+    """找一個裝了 demucs 的 python。順序:環境變數 → 既有 anaconda(向下相容,存在才用)
+    → 安裝腳本建的 .venv-demucs → .venv-ml。⚠️ 這條線斷掉 = 結構編曲柱 + 和聲柱一起缺
+    (合計 26.2% 權重),所以 install 腳本一定要把 .venv-demucs 建起來。"""
+    env_py = os.environ.get("SONG_JURY_DEMUCS_PY")
+    if env_py:
+        return env_py
+    win = os.name == "nt"
+    cands = []
+    # 常見的 anaconda/miniconda 位置(很多人的 demucs 裝在那);用家目錄推,不寫死使用者名稱
+    home = Path.home()
+    for d in ("anaconda3", "miniconda3", "miniforge3"):
+        cands.append(home / d / ("python.exe" if win else "bin/python"))
+    for v in (".venv-demucs", ".venv-ml"):
+        cands.append(Path(__file__).resolve().parent / v / ("Scripts/python.exe" if win else "bin/python"))
+    for p in cands:
+        if p.exists():
+            return str(p)
+    return sys.executable   # 最後退路:當前直譯器(HF Space 這類單一環境)
+
+
+DEMUCS_PY = _find_demucs_py()
 DEMUCS_NEED_MIB = 4000    # htdemucs_6s 用量遠小於 SongEval,不必套 21000 那個門檻
 # ⛔ FLAMINGO_NEED_MIB 已移除(Music Flamingo 2026-07-20 判死拆線)
 STEMS_DIR = BASE / "_stems"   # 編曲層次與和聲分析共用同一份分軌快取 → Demucs 全程只跑一次

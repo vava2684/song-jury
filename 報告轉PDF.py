@@ -66,7 +66,14 @@ _register_cjk_fonts()
 S_TITLE = ParagraphStyle("t", fontName="JhengHeiBd", fontSize=16, leading=22, spaceAfter=4, alignment=1)
 S_SUB = ParagraphStyle("sub", fontName="JhengHeiBd", fontSize=10, leading=15, spaceBefore=2, spaceAfter=8, alignment=1)
 S_META = ParagraphStyle("m", fontName="JhengHei", fontSize=8.5, leading=13, textColor=colors.HexColor("#555555"))
-S_HEAD = ParagraphStyle("h", fontName="JhengHeiBd", fontSize=10, leading=15, spaceBefore=8, spaceAfter=2)
+S_HEAD = ParagraphStyle("h", fontName="JhengHeiBd", fontSize=11.5, leading=17, spaceBefore=10, spaceAfter=3,
+                        textColor=colors.HexColor("#1b3a63"))
+# 三級標題(九柱制報告的逐柱小節靠這個;沒有它 ### 會原字印出來)
+S_HEAD3 = ParagraphStyle("h3", fontName="JhengHeiBd", fontSize=10, leading=15, spaceBefore=8, spaceAfter=2,
+                         textColor=colors.HexColor("#33506e"))
+# 引言(> 開頭的前言列;沒有它 > 會原字印出來)
+S_QUOTE = ParagraphStyle("q", fontName="JhengHei", fontSize=8.5, leading=13, leftIndent=6,
+                         textColor=colors.HexColor("#555555"))
 S_BODY = ParagraphStyle("b", fontName="JhengHei", fontSize=9.5, leading=14.5)
 S_CELL = ParagraphStyle("c", fontName="JhengHei", fontSize=8.8, leading=12.5)
 S_CELL_B = ParagraphStyle("cb", fontName="JhengHeiBd", fontSize=8.8, leading=12.5)
@@ -190,7 +197,11 @@ def main():
         flush_table()
         if not line.strip() or line.strip() == "---":
             continue
-        if line.startswith("## "):
+        if line.startswith("### "):
+            story.append(Paragraph(md_inline(line[4:]), S_HEAD3))
+        elif line.startswith("> "):
+            story.append(Paragraph(md_inline(line[2:]), S_QUOTE))
+        elif line.startswith("## "):
             # 第一個 ## = 副標(置中,跟標題湊招牌);其後 ## = section 標題(靠左)
             if not seen_sub:
                 story.append(Paragraph(md_inline(line[3:]), S_SUB))

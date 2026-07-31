@@ -1,0 +1,26 @@
+# 第四個環境 .venv-demucs —— 音軌分離(Demucs htdemucs_6s)
+#
+# ⚠️ 為什麼非裝不可:結構與編曲柱(12.6%)與和聲柱(13.6%)都吃 Demucs 六軌分離,
+#    合計 26.2% 的權重。這條線斷掉,兩根柱子會一起缺項,總分會被重新歸一化而失真。
+#
+# 為什麼又要獨立一個 venv:demucs 會把 torchaudio/numpy 往它自己要的版本拉,
+# 裝進 .venv-ml 會踩死 SongEval、裝進 .venv-audition 會踩死 SingMOS/MuQ(2026-07 實測)。
+# 好消息是 uv 會從快取硬連結同版 torch,所以第四個環境幾乎不佔額外下載與硬碟。
+#
+# 已裝過 demucs 的人(例如 anaconda 裡有):設環境變數 SONG_JURY_DEMUCS_PY 指過去即可,
+# 這個 venv 就不必建 —— 評審團.py 會優先採用那個路徑。
+#
+# 安裝:
+#   uv venv --python 3.11 .venv-demucs
+#   uv pip install --python .venv-demucs/Scripts/python.exe -r requirements-demucs.txt
+#   (Linux/macOS 把 Scripts 換成 bin)
+#
+# 模型權重(htdemucs_6s,約 300MB)在第一次分離時自動下載。
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0
+torchaudio==2.6.0
+
+demucs==4.0.1
+soundfile==0.14.0

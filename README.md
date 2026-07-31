@@ -56,28 +56,64 @@
 
 ## 安裝
 
-需要 **Python 3.11**、**ffmpeg**;GPU 建議 ≥16GB VRAM(可退 CPU,較慢)。
+### 完全不懂電腦的話:雙擊一個檔就好
 
-```bash
-# Windows(PowerShell)
-./install.ps1            # 或 -SkipML 只裝量測+報告(輕量)
-# Linux / macOS
-bash install.sh          # 或 --skip-ml
+**Windows** —— 下載本專案後,雙擊 **`一鍵安裝.bat`**。
+**Linux / macOS** —— 開終端機,`bash install.sh`。
+
+它會自己做完這些,**中間任何一步失敗都不會中斷**,最後一次告訴你哪裡沒成功:
+
+```
+[1/9] 檢查並補齊基本工具(uv / git / ffmpeg)   ← 沒有就用 winget / brew / apt 幫你裝
+[2/9] 建立量測環境 .venv
+[3/9] 建立模型環境 .venv-ml(SongEval + Audiobox)
+[4/9] 取得 SongEval 原始碼
+[5/9] 鎖回 torch 版本
+[6/9] 建立分軌環境 .venv-demucs
+[7/9] 建立新耳朵環境 .venv-audition
+[8/9] 情緒詞典 + Gemini 金鑰      ← 會問你要不要現在貼金鑰(可跳過)
+[9/9] 自我檢查 —— 實際確認九根柱子哪些可用
 ```
 
-**三個環境各司其職**(版本互相衝突,不能合併 —— 這是實測結論):
+最後印出來的長這樣 —— **它不會只說「安裝成功」,而是告訴你哪根柱子真的能算分**:
 
-| 環境 | 裝什麼 | requirements |
+```
+      柱             權重    狀態
+      ────────────────────────────────────────────────────────
+      詞            25.3%   完整
+      人聲演唱      15.2%   部分 —— 缺 SingMOS 聽感
+      和聲          13.6%   完整
+      結構與編曲    12.6%   缺項(整柱不計)
+      ...
+      ⚠️ 有 12.6% 的權重整根缺席 —— 總分會在剩下的柱子間重新歸一化,
+         分數仍會出來,但與完整安裝的結果不可互比。
+```
+
+裝到一半斷線很正常(要下載好幾 GB)。**直接重跑同一個安裝檔**,已經裝好的不會重裝。
+事後想再看一次自己缺什麼:`./install.ps1 -CheckOnly` 或 `bash install.sh --check-only`(什麼都不會裝)。
+
+其他開關:`-SkipML` / `--skip-ml` 只裝量測+報告(輕量)、`-NoAutoTools` / `--no-auto-tools` 不要自動幫你裝系統工具。
+
+### 裡面到底裝了什麼
+
+需要 **Python 3.11**;GPU 建議 ≥16GB VRAM(沒有 GPU 也能跑,只是慢)。
+**四個環境各司其職**(版本互相衝突,不能合併 —— 這是實測結論;uv 會從快取硬連結同版 torch,不會真的下載四次):
+
+| 環境 | 裝什麼 | 沒有它會缺 |
 |---|---|---|
-| `.venv` | 量測(librosa / pyloudnorm / parselmouth)+ 報告 | `requirements.txt` |
-| `.venv-ml` | SongEval + Audiobox | `requirements-ml.txt` |
-| `.venv-audition` | SingMOS + MuQ + SONICS | `requirements-audition.txt` |
+| `.venv` | 量測(librosa / pyloudnorm / parselmouth)+ 報告 | 幾乎全部 |
+| `.venv-ml` | SongEval + Audiobox | 五個模型聽感細項 |
+| `.venv-demucs` | Demucs 六軌分離 | **結構編曲柱 + 和聲柱(合計 26.2%)** |
+| `.venv-audition` | SingMOS + MuQ + SONICS | 人聲柱的 SingMOS、真實風格柱 |
+
+> 已經有 demucs 的人(例如裝在 anaconda 裡),設環境變數 `SONG_JURY_DEMUCS_PY` 指過去,
+> 安裝腳本就會跳過 `.venv-demucs`。
 
 **要自行取得**(授權因素不隨本 repo 散布,安裝腳本會處理或提示):
 - **SongEval**(CC BY-NC-SA,非商用)→ 腳本自動 clone
 - **Meta Audiobox Aesthetics** → 腳本自動裝
-- **NRC-VAD 情緒詞典**(禁再散布)→ 自取放 `lexicon/nrc-vad/`
-- **Gemini API 金鑰** → 複製 `.env.example` 成 `.env` 填入
+- **NRC-VAD 情緒詞典**(禁再散布)→ 腳本自官方源代取
+- **Gemini API 金鑰** → 安裝時直接問你,或事後填 `.env`([免費申請](https://aistudio.google.com/apikey))
 
 > ⛔ **品質至上・排隊不降級**:Gemini 曲評固定用最好的模型;它故障時報告誠實標「缺席待補」,
 > **不換次級模型頂替** —— 儀器版本混用會破壞可比性。等它恢復後重評即可補齊。
@@ -114,14 +150,25 @@ bash run_web.sh      # Linux / macOS
 
 ---
 
-## 範例報告
+## 範例報告(真的跑出來的,不是示意圖)
 
-《**八隻耳語 & Eight Whispers**》— VAVA_Ai_Artist
+《**八隻耳語 & Eight Whispers**》— VAVA_Ai_Artist ·
 🎧 **[聽這首歌](https://song.link/s/03EG6lXqCYzVR5WPSUfLdF)**(Spotify / Tidal / Pandora 等)
 
-報告長這樣:先一張**九柱總覽**(每柱評什麼、占多少、拿幾分、一句話),
-再**逐柱攤開細項**(細項 | 占柱內 | 分數 | 解讀),每個分數旁都有一句人話 ——
-⛔ 沒有解讀的分數=黑盒,不准出報告。最後附**名詞小註**給第一次讀的人。
+<img src="assets/範例報告_九柱總覽.png" alt="九柱總覽與詞柱、人聲柱、和聲柱、結構編曲柱" width="100%">
+
+📄 **[看完整報告(五頁全長圖)](assets/範例報告_八隻耳語.png)**
+
+報告的骨架是**兩層**:先一張**九柱總覽**(每柱評什麼、占多少、拿幾分、一句話),
+再**逐柱攤開細項**(細項 | 占柱內 % | 分數 | 解讀)。三條硬規矩:
+
+- ⛔ **沒有解讀的分數 = 黑盒,不准出報告** —— 每個數字右邊都要有一句人話。
+- ⛔ **解讀主文寫這首歌這一項的具體狀態**(帶實測值),定義與免責放括號擺句尾;
+  「色彩多元」這種放到別首歌也成立的話 = 不合格。
+- ⛔ **不腦補因果** —— 沒有數據支持的「因為…所以…」一律刪掉。
+
+報告最後還有**名詞小註**(給第一次讀的人)、**親聽檢查清單**(人耳要去確認什麼)、
+**合議庭裁決**(把量測與模型吵架的地方攤開,裁量權留給人)。
 
 ---
 
@@ -203,6 +250,33 @@ bash run_web.sh      # Linux / macOS
 | `親聽檢查清單.md` | 人耳終檢功課單 |
 | `_錨參照/` | 距離錨與 MOS 基準(衍生統計,非音檔) |
 | `docs/權重沿革.md` | 九柱制怎麼辯出來的(對外版) |
+
+---
+
+## 🙏 特別感謝 —— 最初一起參與測試的創作者
+
+這套系統的雛形,是靠這幾位朋友無私提供作品、陪著一首首打磨出來的。也邀你逛逛他們的頻道 🎵
+
+| 創作者 | 頻道 |
+|---|---|
+| Xiaoloulou | https://www.youtube.com/channel/UCtL7XFPgWzknUlW38ilBrQg |
+| 渡紅塵 | https://www.youtube.com/channel/UCJ1ZgAzaMJkOYL84-XRBHhg |
+| 兔子揚 | https://www.youtube.com/@yankey8440/videos |
+| 九黎月 | https://www.youtube.com/@Jiuliyue |
+| 墨韻音穀 | https://www.youtube.com/@%E5%A2%A8%E9%9F%BB%E9%9F%B3%E7%A9%80 |
+| 苏砚Suyan | https://www.youtube.com/@suyan_66 |
+| 迷路的宇宙人 | https://www.youtube.com/channel/UCdgoj5KsyZVDQt0Z1_ONz-g |
+| 璃煙 | https://www.youtube.com/@LiYan_Studio |
+
+**同時感謝這些開源專案**,沒有它們就沒有這套系統:
+[SongEval](https://github.com/ASLP-lab/SongEval)(西工大 ASLP 實驗室)·
+[Audiobox Aesthetics](https://github.com/facebookresearch/audiobox-aesthetics)(Meta)·
+[Demucs](https://github.com/adefossez/demucs)(Meta)·
+[SingMOS](https://github.com/South-Twilight/SingMOS)·
+[MuQ](https://github.com/tencent-ailab/MuQ)(騰訊 AI Lab)·
+[SONICS](https://github.com/awsaf49/sonics)·
+[NRC-VAD](https://saifmohammad.com/WebPages/nrc-vad.html)(加拿大國家研究院)·
+[librosa](https://librosa.org) · [pyloudnorm](https://github.com/csteinmetz1/pyloudnorm) · [parselmouth](https://parselmouth.readthedocs.io)
 
 ---
 
