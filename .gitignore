@@ -81,6 +81,10 @@ docs/PACKAGING.md
 # ── 放行測試與 CI(⛔ 少了它們,改壞了不會有人知道)──
 !tests/
 !tests/**
+# 放行 tests/** 之後要把編譯快取排回去(它是每次跑測試都會變的垃圾)
+tests/__pycache__/
+tests/**/__pycache__/
+*.pyc
 !.github/
 !.github/**
 !requirements-dev.txt
