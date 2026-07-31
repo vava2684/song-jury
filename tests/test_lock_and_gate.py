@@ -76,10 +76,14 @@ def test_持有程序被強制殺掉後立刻可以再拿鎖(tmp_path):
 
 def test_釋放鎖不刪鎖檔(tmp_path):
     """⛔ POSIX 上「unlink 再重建」會讓兩個工作鎖在不同 inode 上,互斥失效 ——
-    flock 的經典陷阱。鎖檔一律留著。"""
+    flock 的經典陷阱。鎖檔一律留著。
+    🔴 Codex R9:鎖檔改集中放 BASE/_locks/(不再放歌旁邊 —— 歌在唯讀資料夾/
+    網路磁碟時,開鎖檔就失敗)。"""
     song = tmp_path / "song.wav"
     song.write_bytes(b"x")
-    lockf = song.with_name(".song.evaluating.lock")
+    lockf = J._lock_path_for(song)
+    assert lockf.parent == J.BASE / "_locks", \
+        f"🔴 鎖檔要集中在 BASE/_locks,不是 {lockf.parent}"
     with J._job_lock(song):
         assert lockf.exists()
     assert lockf.exists(), "🔴 鎖檔被刪了 —— unlink+重建會破壞 flock 互斥"
@@ -223,20 +227,16 @@ def test_同一把金鑰同時只准一個工作在打(tmp_path, monkeypatch):
     (Codex 探針:同 key 在途=2)。租約要擋住第二個。"""
     monkeypatch.setattr(G, "STATE_FILE", tmp_path / "state.json")
     with G.key_lease("KEY-A", timeout=5.0) as l1:
-        assert l1 is True
+        assert l1 == "ok"
         with G.key_lease("KEY-A", timeout=0.3) as l2:
-            assert l2 is False, "🔴 同一把金鑰兩個工作同時在途"
+            assert l2 == "busy", "🔴 同一把金鑰兩個工作同時在途"
         with G.key_lease("KEY-B", timeout=0.5) as other:
-            assert other is True, "不同金鑰不應互相卡"
+            assert other == "ok", "不同金鑰不應互相卡"
 
 
-def test_鎖壞掉不可以被當成有人持有(tmp_path, monkeypatch):
-    """🔴 Codex:權限問題/ENOLCK/不支援鎖的網路 FS 若被當成 busy ——
-    Gemini 會把**所有** key 記成 busy_inflight 跳過(一次 API 都打不出去)、
-    工作鎖會用一個根本不存在的持有者把使用者擋住。
-    正確語義:租約壞掉 → 警告後放行;狀態鎖壞掉 → 拒寫(安全方向)。"""
+def _break_lock_backend(monkeypatch):
+    """把 OS 鎖後端弄壞(ENOLCK:網路 FS 不支援鎖的典型錯誤)。"""
     import errno as _e
-    monkeypatch.setattr(G, "STATE_FILE", tmp_path / "state.json")
     if sys.platform == "win32":
         import msvcrt
         monkeypatch.setattr(msvcrt, "locking",
@@ -245,10 +245,54 @@ def test_鎖壞掉不可以被當成有人持有(tmp_path, monkeypatch):
         import fcntl
         monkeypatch.setattr(fcntl, "flock",
                             lambda fd, fl: (_ for _ in ()).throw(OSError(_e.ENOLCK, "no locks")))
+
+
+def test_鎖壞掉不可以被當成有人持有(tmp_path, monkeypatch):
+    """🔴 Codex R9:鎖 backend 發生 error 時「照常放行」= fail-open,
+    互斥保證無聲蒸發(同 key 在途又回到 2)。正確語義三分:
+    error ≠ busy(不是有人持有)、error ≠ ok(fail-closed 不放行)、
+    狀態鎖壞掉 → 拒寫(不寫比亂寫安全)。"""
+    monkeypatch.setattr(G, "STATE_FILE", tmp_path / "state.json")
+    _break_lock_backend(monkeypatch)
     with G.key_lease("KEY-X", timeout=0.5) as leased:
-        assert leased is True, "🔴 鎖不可用被當成有人持有 → 所有 key 都會被跳過"
+        assert leased == "error", \
+            f"🔴 鎖壞掉要三態誠實回報 error(busy=誤當有人持有;ok=fail-open):{leased!r}"
     with G._state_lock(timeout=0.5) as acq:
         assert acq is False, "狀態鎖壞掉要拒寫(不寫比亂寫安全)"
+
+
+def test_鎖壞掉整條鏈fail_closed一次都不打(tmp_path, monkeypatch):
+    """🔴 Codex R9 端對端:租約鎖 error → 該把 key 不打(記 lease_error),
+    全部 key 都 error → 0 次 POST + degraded_reason 誠實說是租約鎖問題,
+    不可以推給冷卻。"""
+    monkeypatch.setattr(G, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(G, "load_keys", lambda: ["KEY-BROKEN-" + "x" * 20])
+    _break_lock_backend(monkeypatch)
+    posts = []
+    monkeypatch.setattr(G.requests, "post",
+                        lambda *a, **k: posts.append(1) or (_ for _ in ()).throw(RuntimeError("不該打到這")))
+    mp3 = tmp_path / "x.mp3"
+    mp3.write_bytes(b"\xff\xfb" + b"\x00" * 512)
+    _, meta = G.call_gemini(mp3, "zh", 5, ignore_cooldown=False, verbose=False)
+    assert posts == [], "🔴 租約鎖壞掉還是打了 API —— fail-open"
+    assert [a.get("result") for a in meta["attempts"]] == ["lease_error"], \
+        f"要留 lease_error 痕跡:{meta['attempts']}"
+    assert meta["keys_tried"] == 0, "沒真的打出去就不可以計入 keys_tried"
+    assert "租約鎖" in (meta["degraded_reason"] or ""), \
+        f"🔴 原因要誠實說是租約鎖,不可推給冷卻:{meta['degraded_reason']!r}"
+
+
+def test_工作鎖壞掉要硬擋不可裝沒事(tmp_path, monkeypatch):
+    """🔴 Codex R9:job lock backend error → 舊版照樣進評測(fail-open),
+    互斥保證直接取消。工作鎖跟金鑰租約方向不同:租約壞了可以換下一把 key,
+    工作鎖沒有替代品 —— 沒有互斥就評,兩個工作的中間檔互相覆寫,
+    分數錯得無聲無息。error 一律 SystemExit 硬擋。"""
+    _break_lock_backend(monkeypatch)
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    with pytest.raises(SystemExit):
+        with J._job_lock(song):
+            pass
 
 
 def test_拿到租約後要重讀冷卻不可沿用舊快照(tmp_path, monkeypatch):
@@ -299,6 +343,17 @@ def test_深層欄位格式化不可以炸掉():
     assert J._fmt(True) is None
     assert J._fmt(float("nan")) is None
     assert J._fmt(None) is None
+
+
+def test_留言欄位不是字串時要當空字串():
+    """🔴 Codex R9:Gemini dims 摘要對 comment 直接 .replace ——
+    引擎異常吐 dict/None 時 AttributeError,報告寫完了摘要卻炸掉
+    → 批次/網頁版拒收這次昂貴評測。非字串一律當空字串顯示。"""
+    assert J._text_or_empty("好") == "好"
+    assert J._text_or_empty(None) == ""
+    assert J._text_or_empty({"x": 1}) == ""
+    assert J._text_or_empty(3.5) == ""
+    assert J._text_or_empty(True) == ""
 
 
 def test_報告發布失敗要保住舊報告且不留暫存(tmp_path, monkeypatch):

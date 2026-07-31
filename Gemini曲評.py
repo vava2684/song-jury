@@ -279,15 +279,11 @@ def key_lease(key: str, timeout: float = 120.0):
     """
     lockf = STATE_FILE.with_name(f".gemini_key_{_fingerprint(key)}.inflight")
     with _os_file_lock(lockf, timeout) as status:
-        if status == "error":
-            # ⛔ 鎖壞掉(權限/ENOLCK/網路 FS)≠ 有人持有:此時若回 False,
-            #    所有 key 都會被記 busy_inflight 跳過 → 一次 API 都打不出去。
-            #    改成警告後照常放行(冷卻機制仍是兜底),互斥保證僅在鎖可用時成立。
-            print(f"⚠ 金鑰租約鎖不可用(檔案系統可能不支援鎖),本次不做同 key 互斥",
-                  file=sys.stderr)
-            yield True
-        else:
-            yield status == "ok"
+        # ⛔ fail-closed:鎖壞掉(權限/ENOLCK/網路 FS)一律**不放行**這把 key。
+        #    舊版 error→照常放行,互斥保證無聲蒸發(Codex R9:同 key 在途又回到 2)。
+        #    error≠有人持有,但也≠可以打:呼叫端把它記成 lease_error 換下一把;
+        #    全部 key 都 error 時 call_gemini 會誠實 degraded,不會裝沒事。
+        yield status          # "ok" / "busy" / "error"
 
 
 def _locked_update(mutator):
@@ -548,47 +544,71 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
         return None, meta
     meta["mime_type"] = mime
 
-    try:
-        raw = audio_path.read_bytes()
-    except Exception as e:
-        meta["degraded_reason"] = f"讀不到音檔:{type(e).__name__}: {e}"
-        return None, meta
-
-    b64 = base64.b64encode(raw).decode()
-    b64_mb = len(b64) / 1024 / 1024
-    meta["audio_mb"] = round(len(raw) / 1024 / 1024, 2)
-    meta["payload_b64_mb"] = round(b64_mb, 2)
-    if b64_mb > MAX_INLINE_B64_MB:
-        # ⚖️ 2026-07-25 修法:超大檔(如 WAV)自動轉 320k mp3 只給 Gemini 聽。
-        #    依據=編碼實驗定讞(同段 AAC256 vs 128k,模型耳朵 Δ≈0):高位元率轉檔
-        #    不影響內容判斷;量測各關仍吃原始檔,只有這一關的「耳朵」聽轉檔。誠實記錄於 meta。
+    # ⚖️ 2026-07-25 修法:超大檔(如 WAV)自動轉 320k mp3 只給 Gemini 聽。
+    #    依據=編碼實驗定讞(同段 AAC256 vs 128k,模型耳朵 Δ≈0):高位元率轉檔
+    #    不影響內容判斷;量測各關仍吃原始檔,只有這一關的「耳朵」聽轉檔。誠實記錄於 meta。
+    # ⛔ 2026-08-01 修法:超限判斷改在 base64「之前」用檔案大小預估。
+    #    舊順序是「整檔讀進來→base64→才發現超限→轉檔」:下載上限允許 500MB,
+    #    base64 後 667MB、原始+編碼峰值 ~1.2GB,還沒進 ffmpeg 就可能先把記憶體吃光。
+    #    base64 長度 = 4*ceil(n/3),用 n*4/3 預估誤差 ≤ 4 bytes,必超限的檔直接先轉。
+    def _ffmpeg_320k(src: Path) -> Path:
         import subprocess as _sp
         import tempfile as _tf
         _fd, _tmppath = _tf.mkstemp(suffix=".mp3")
         os.close(_fd)                      # ⚠ Windows:fd 不關,ffmpeg 會 WinError 32
         _tmp = Path(_tmppath)
         try:
-            _sp.run(["ffmpeg", "-y", "-v", "error", "-i", str(audio_path),
+            _sp.run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
                      "-b:a", "320k", str(_tmp)], check=True, timeout=300,
                     **({"creationflags": 0x08000000} if os.name == "nt" else {}))
-            raw = _tmp.read_bytes()
-            b64 = base64.b64encode(raw).decode()
-            b64_mb = len(b64) / 1024 / 1024
+        except BaseException:
+            _tmp.unlink(missing_ok=True)   # 失敗不留孤兒 tmp
+            raise
+        return _tmp
+
+    try:
+        src_size = audio_path.stat().st_size
+    except Exception as e:
+        meta["degraded_reason"] = f"讀不到音檔:{type(e).__name__}: {e}"
+        return None, meta
+    meta["audio_mb"] = round(src_size / 1024 / 1024, 2)
+    est_b64_mb = src_size * 4 / 3 / 1024 / 1024
+
+    _tmp_mp3 = None
+    try:
+        if est_b64_mb > MAX_INLINE_B64_MB:
+            try:
+                _tmp_mp3 = _ffmpeg_320k(audio_path)
+            except Exception as e:
+                meta["degraded_reason"] = (
+                    f"音檔太大(預估 base64 {est_b64_mb:.1f}MB > {MAX_INLINE_B64_MB}MB)"
+                    f"且自動轉檔失敗({type(e).__name__}: {str(e)[:80]});請確認 ffmpeg 可用。")
+                return None, meta
             mime = "audio/mpeg"
             meta["mime_type"] = mime
-            meta["transcoded_for_gemini"] = f"320k mp3(原檔 base64 {meta['payload_b64_mb']}MB 超上限)"
-            meta["payload_b64_mb"] = round(b64_mb, 2)
+            meta["transcoded_for_gemini"] = (
+                f"320k mp3(原檔預估 base64 {est_b64_mb:.1f}MB 超上限,先轉檔再讀)")
+            src_for_gemini = _tmp_mp3
+        else:
+            src_for_gemini = audio_path
+
+        try:
+            raw = src_for_gemini.read_bytes()
         except Exception as e:
-            meta["degraded_reason"] = (
-                f"音檔太大(base64 後 {meta['payload_b64_mb']:.1f}MB > {MAX_INLINE_B64_MB}MB)"
-                f"且自動轉檔失敗({type(e).__name__}: {str(e)[:80]});請確認 ffmpeg 可用。")
+            meta["degraded_reason"] = f"讀不到音檔:{type(e).__name__}: {e}"
             return None, meta
-        finally:
-            _tmp.unlink(missing_ok=True)
+        b64 = base64.b64encode(raw).decode()
+        b64_mb = len(b64) / 1024 / 1024
+        meta["payload_b64_mb"] = round(b64_mb, 2)
         if b64_mb > MAX_INLINE_B64_MB:
             meta["degraded_reason"] = (
-                f"轉 320k 後仍超上限({b64_mb:.1f}MB)——歌太長,需 Files API(未實作)。")
+                f"轉 320k 後仍超上限({b64_mb:.1f}MB)——歌太長,需 Files API(未實作)。"
+                if _tmp_mp3 is not None else
+                f"base64 後 {b64_mb:.1f}MB 超上限(預估 {est_b64_mb:.1f}MB 未超,不應發生)。")
             return None, meta
+    finally:
+        if _tmp_mp3 is not None:
+            _tmp_mp3.unlink(missing_ok=True)
 
     body = {"contents": [{"parts": [
         {"text": gemini_music_prompt(out_lang)},
@@ -616,13 +636,19 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
         #    ⛔ 冷卻只在收到 429 之後才生效 —— 兩個合法並行的工作(不同 take)
         #       仍會同時轟同一把 key,把 429 撞得更兇(Codex 探針:同 key 在途=2)。
         #    租約是 OS 鎖,程序死亡自動釋放;拿不到就換下一把 key,不硬等。
-        with key_lease(key, timeout=5.0) as leased:
-            if not leased:
+        with key_lease(key, timeout=5.0) as lease_status:
+            if lease_status != "ok":
                 # ⛔ 這裡**沒有**呼叫 API,所以不可以加 keys_tried ——
                 #    否則「忙碌、根本沒打」也被記成呼叫失敗,統計會說謊。
-                meta["attempts"].append({"key": fp, "result": "busy_inflight"})
+                # busy=別的工作正拿這把在打;error=租約鎖壞掉(權限/檔案系統)。
+                # ⛔ 兩種都不打這把(fail-closed):舊版 error 照樣放行,
+                #    同 key 在途又回到 2,互斥保證無聲蒸發(Codex R9)。
+                result = "busy_inflight" if lease_status == "busy" else "lease_error"
+                meta["attempts"].append({"key": fp, "result": result})
                 if verbose:
-                    print(f"  ⏭ 金鑰 {fp} 另一個工作使用中 → 換下一把", flush=True)
+                    why = ("另一個工作使用中" if lease_status == "busy"
+                           else "租約鎖在此檔案系統不可用")
+                    print(f"  ⏭ 金鑰 {fp} {why} → 換下一把", flush=True)
                 continue
             # ⭐ 等租約的期間,前一個持有者可能剛收到 429 寫入冷卻 ——
             #    ⛔ 沿用等待前的舊快照會直接對著剛被限流的 key 再打一發(Codex 探針
@@ -732,10 +758,20 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
     # 全部金鑰都走完還是沒結果 → ⛔ 絕不沉默,把原因寫死在 JSON 裡讓成績單可以誠實標示
     if meta["degraded_reason"] is None:
         if meta["keys_tried"] == 0:
-            nxt = min((state.get(_fingerprint(k), {}).get("cooldown_until", 0) for k in keys), default=0)
-            when = time.strftime("%H:%M:%S", time.localtime(nxt)) if nxt else "未知"
-            meta["degraded_reason"] = (f"全部 {len(keys)} 把金鑰都在冷卻中(最早約 {when} 解封);"
-                                       "要強制重試請加 --ignore-cooldown。")
+            # ⛔ 一把都沒打出去的原因不只冷卻:busy_inflight / lease_error 也會走到這,
+            #    照舊全推給冷卻會說謊 —— 按 attempts 實際結果分開講。
+            results = {a.get("result") for a in meta["attempts"]}
+            if results and results <= {"busy_inflight", "lease_error"}:
+                meta["degraded_reason"] = (
+                    f"全部 {len(keys)} 把金鑰都沒打出去:"
+                    + ("金鑰租約鎖在此檔案系統不可用(fail-closed 不放行);請把工具移到本機磁碟再跑。"
+                       if results == {"lease_error"} else
+                       "都被其他評測工作占用中(in-flight 租約)或租約鎖不可用;稍後再跑。"))
+            else:
+                nxt = min((state.get(_fingerprint(k), {}).get("cooldown_until", 0) for k in keys), default=0)
+                when = time.strftime("%H:%M:%S", time.localtime(nxt)) if nxt else "未知"
+                meta["degraded_reason"] = (f"全部 {len(keys)} 把金鑰都在冷卻中(最早約 {when} 解封);"
+                                           "要強制重試請加 --ignore-cooldown。")
         else:
             meta["degraded_reason"] = (f"{meta['keys_tried']}/{len(keys)} 把金鑰全部呼叫失敗;"
                                        "細節見 attempts(多為 429 額度用盡或金鑰失效)。")

@@ -95,6 +95,19 @@ def test_Gemini總分取的是gemini_reported_total而不是total():
     assert dict((n, v) for n, w, v in items2["整體"])["Gemini 總分"] is None
 
 
+def test_Gemini總分是bool時不可以被洗成10分():
+    """🔴 Codex R9:整體柱那行舊寫法 `raw * 10.0` —— True*10 == 10.0,
+    bool 在 _ev/_evnum 防線之外的最後一條小路又被洗白一次。
+    合法數字才縮放;非法原值原樣進柱,由中央閘門記進 invalid_numeric。"""
+    gem = {"gemini_reported_total": {"raw_0to10": True}}
+    items = J.build_pillar_items({}, {}, {}, gem, {}, {}, {}, {})
+    v = dict((n, x) for n, w, x in items["整體"])["Gemini 總分"]
+    assert v is True, f"🔴 True 被轉成 {v!r}(True*10==10 = bool 又洗白一次)"
+    out = J.build_pillar_totals(items)
+    assert "Gemini 總分" in out["柱分"]["整體"].get("invalid_numeric", {}), \
+        "值不合法要留痕 invalid_numeric —— 不可以拿 10 分,也不可以裝成「沒跑到」"
+
+
 def test_SongEval是1到5制要換算成0到100():
     items = J.build_pillar_items({}, {}, {}, {}, {"Memorability": 4.7}, {}, {}, {})
     assert dict((n, v) for n, w, v in items["旋律記憶"])["記憶點(SongEval)"] == pytest.approx(94.0)

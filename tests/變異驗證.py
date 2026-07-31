@@ -44,8 +44,8 @@ MUTATIONS = [
 
     ("Gemini 總分取錯鍵名(整關被靜默丟掉)",
      "評審團.py",
-     '_gt = _g(gemini, "gemini_reported_total", "raw_0to10")',
-     '_gt = _g(gemini, "total")',
+     '_gt = _raw(gemini, "gemini_reported_total", "raw_0to10")',
+     '_gt = _raw(gemini, "total")',
      "tests/test_pillars.py::test_Gemini總分取的是gemini_reported_total而不是total"),
 
     ("快取夾名不帶指紋(同名不同曲會共用同一份分軌 → 分數全錯)",
@@ -92,10 +92,19 @@ MUTATIONS = [
      "tests/test_stem_cache.py::test_舊快取搬不動時解析路徑仍要對得上"),
 
     # ── Codex 第七輪:OS 鎖、bool 洗白、清洗共用、原子報告 ───────────────
+    # ⚠ R9 起 busy 與 error 都會 sys.exit(fail-closed),只把 if 換成 False 會
+    #   落到 error 分支照樣退出、測試照樣過 → 變異要把**兩個出口都拔掉**才算 fail-open。
     ("拿不到 OS 鎖卻照樣進入評測(互斥失效)",
      "評審團.py",
-     "            if e.errno in _BUSY:\n                sys.exit(",
-     "            if False:\n                sys.exit(",
+     "            if e.errno in _BUSY:\n"
+     "                sys.exit(f\"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\\n\"\n"
+     "                         f\"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\\n\"\n"
+     "                         f\"   → 等它跑完再試。持有工作若被強制終止,OS 會自動釋放這把鎖,不必手動清。\")\n"
+     "            sys.exit(f\"⛔ 工作鎖在此檔案系統不可用(errno={e.errno})。\\n\"\n"
+     "                     f\"   鎖檔位置:{lockf}\\n\"\n"
+     "                     f\"   → 請把本工具移到支援檔案鎖的本機磁碟再跑。\"\n"
+     "                     f\"(不放行:沒有互斥就評,兩個工作的中間檔會互相覆寫,分數會錯得無聲無息)\")",
+     "            pass  # 變異:兩個 sys.exit 都拔掉,拿不到鎖照樣進入評測",
      "tests/test_download_and_lock.py::test_同一個音檔不可以同時評兩次"),
 
     ("bool 在取值層被 float() 洗成 1.0(True 混進正式柱分)",
@@ -161,9 +170,49 @@ MUTATIONS = [
 
     ("金鑰租約形同虛設(同一把 key 同時被兩個工作轟)",
      "Gemini曲評.py",
-     "        else:\n            yield status == \"ok\"",
-     "        else:\n            yield True",
+     "        yield status          # \"ok\" / \"busy\" / \"error\"",
+     "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
+
+    # ── Codex 第九輪:鎖 fail-closed、bool 最後一條小路、酬載順序 ────────
+    ("工作鎖壞掉照樣放行(fail-open 取消互斥保證)",
+     "評審團.py",
+     "            sys.exit(f\"⛔ 工作鎖在此檔案系統不可用(errno={e.errno})。\\n\"\n"
+     "                     f\"   鎖檔位置:{lockf}\\n\"\n"
+     "                     f\"   → 請把本工具移到支援檔案鎖的本機磁碟再跑。\"\n"
+     "                     f\"(不放行:沒有互斥就評,兩個工作的中間檔會互相覆寫,分數會錯得無聲無息)\")",
+     "            pass  # 變異:鎖壞掉警告都不給,照樣放行",
+     "tests/test_lock_and_gate.py::test_工作鎖壞掉要硬擋不可裝沒事"),
+
+    ("租約壞掉呼叫端照樣打 API(同 key 在途回到 2)",
+     "Gemini曲評.py",
+     "            if lease_status != \"ok\":",
+     "            if lease_status == \"busy\":",
+     "tests/test_lock_and_gate.py::test_鎖壞掉整條鏈fail_closed一次都不打"),
+
+    ("0 呼叫的原因一律推給冷卻(租約鎖問題被說成額度問題)",
+     "Gemini曲評.py",
+     "            if results and results <= {\"busy_inflight\", \"lease_error\"}:",
+     "            if False:",
+     "tests/test_lock_and_gate.py::test_鎖壞掉整條鏈fail_closed一次都不打"),
+
+    ("Gemini 總分 bool 在縮放層被洗成 10 分(True*10==10)",
+     "評審團.py",
+     "        n = _num_or_none(v)\n        return n * k if n is not None else v",
+     "        return v * k  # 變異:原值直接乘",
+     "tests/test_pillars.py::test_Gemini總分是bool時不可以被洗成10分"),
+
+    ("留言欄位非字串直接透傳(dims 摘要 .replace 炸掉)",
+     "評審團.py",
+     "    return v if isinstance(v, str) else \"\"",
+     "    return v",
+     "tests/test_lock_and_gate.py::test_留言欄位不是字串時要當空字串"),
+
+    ("超限判斷回到 base64 之後(500MB 檔先吃 1.2GB 記憶體才轉檔)",
+     "Gemini曲評.py",
+     "        if est_b64_mb > MAX_INLINE_B64_MB:",
+     "        if False:",
+     "tests/test_gemini_payload.py::test_超大檔要先轉檔再讀不可先整檔base64"),
 
     # ── Codex 第六輪 ──────────────────────────────────────────────────
     ("數值閘門退回 is not None(NaN/∞/超範圍/bool 全部進分)",

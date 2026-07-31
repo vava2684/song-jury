@@ -11,6 +11,7 @@
 輸出: 歌名_評審團.json + 主控台摘要
 """
 import json
+import hashlib
 import math
 import os
 import re
@@ -171,7 +172,20 @@ def build_pillar_items(physical, harmony, arrangement, gemini, songeval, audiobo
     _vd = ((physical or {}).get("vocal_detail") or {})
     _hm = ((harmony or {}).get("metrics") or {})
     _gd = ((gemini or {}).get("dimensions") or {})
-    _gt = _g(gemini, "gemini_reported_total", "raw_0to10")
+    def _raw(d, *ks):
+        """取巢狀原值,不做任何轉換(給 evidence-aware 縮放用)。"""
+        for k in ks:
+            d = (d or {}).get(k) if isinstance(d, dict) else None
+        return d
+
+    def _scale(v, k):
+        """合法數字才縮放;非法原值**原樣**交給中央閘門留痕。
+        ⛔ 不可以直接把原值乘上去:True * 10 == 10,bool 又被洗白一次
+           (Codex 抓到 Gemini 總分漏接證據保留,並預先點名這個坑)。"""
+        n = _num_or_none(v)
+        return n * k if n is not None else v
+
+    _gt = _raw(gemini, "gemini_reported_total", "raw_0to10")
     # 1-5 → 0-100。⛔ 只換算真的數字:SongEval 版本異常吐出字串時 "abc"*20.0 會
     #    TypeError 炸掉整份組裝;非數字一律當缺席,交給數值閘門(_valid_score)留痕。
     _se = {k: (v * 20.0) for k, v in (songeval or {}).items()
@@ -229,7 +243,7 @@ def build_pillar_items(physical, harmony, arrangement, gemini, songeval, audiobo
         "旋律記憶": [("旋律記憶(Gemini M2)", 52, _ev(_gd, "M2", "score")),
                      ("記憶點(SongEval)", 48, _se.get("Memorability"))],
         "律動": [("節奏律動(Gemini M3)", 100, _ev(_gd, "M3", "score"))],
-        "整體": [("Gemini 總分", 51, (_gt * 10) if _gt is not None else None),
+        "整體": [("Gemini 總分", 51, _scale(_gt, 10.0) if _gt is not None else None),
                  ("音樂性(SongEval)", 49, _se.get("Musicality"))],
         "真實風格": [("真實距離(馬氏)", 60, _ev(realdist, "score")),
                      ("曲風創新(Gemini M6)", 40, _ev(_gd, "M6", "score"))],
@@ -301,6 +315,15 @@ def iter_windows(n_samples, win):
        演唱聽感.py 與 真實距離.py 共用這個函式,免得同一個 off-by-one 犯兩次。
     """
     return range(0, max(1, n_samples - win + 1), win)
+
+
+def _text_or_empty(v):
+    """只有 str 才拿去做文字處理;其他型別回空字串。
+
+    ⛔ Gemini 的 comment 欄位曾被直接 .replace():引擎異常吐 ["bad schema"] 時,
+       正式報告都發布完了,摘要在最後一刻 AttributeError('list' has no 'replace')
+       讓整個程序以失敗收場(Codex 完整 _evaluate 探針重現)。"""
+    return v if isinstance(v, str) else ""
 
 
 def _fmt(v, nd=1):
@@ -805,6 +828,18 @@ def resolve_input(arg):
     return dest
 
 
+def _lock_path_for(song: Path) -> Path:
+    """這首歌的工作鎖檔位置:BASE/_locks/job_<絕對路徑雜湊>.lock。
+
+    ⛔ 不放在歌曲旁邊:歌可能在不支援檔案鎖的網路磁碟(NFS/SMB)上,
+       鎖 backend 一壞就得在「fail-open(取消互斥)」與「擋住使用者」之間二選一。
+       放在工具自己的本機目錄,兩難消失。鎖檔 0 byte、永不刪(flock inode 陷阱)。"""
+    d = BASE / "_locks"
+    d.mkdir(exist_ok=True)
+    h = hashlib.sha256(str(song.resolve()).encode("utf-8")).hexdigest()[:16]
+    return d / f"job_{h}.lock"
+
+
 @contextlib.contextmanager
 def _job_lock(song: Path):
     """同一個音檔同時只准有一個評測工作 —— 用 **OS 原生諮詢鎖** 實作。
@@ -820,14 +855,20 @@ def _job_lock(song: Path):
        互斥失效 —— 這是 flock 的經典陷阱。留一個隱藏小檔是正確的代價。
     ⚠️ 這把鎖只擋「同一個音檔」,不同的歌(含 SUNO 抽卡的各個 take)照樣並行。
     """
-    lockf = song.with_name(f".{song.stem}.evaluating.lock")
+    # ⭐ 鎖檔放在**本機狀態目錄** BASE/_locks(以歌曲絕對路徑的雜湊命名),
+    #    不放在歌曲來源資料夾 —— 歌可能在 NFS/SMB 這種不支援鎖的網路磁碟上,
+    #    而工具目錄一定是使用者可寫的本機路徑,鎖 backend「壞掉」的情境幾乎消失,
+    #    剩下的極端錯誤就能安心 fail-closed(Codex 的建議,取代先前不安全的 fail-open)。
+    lockf = _lock_path_for(song)
     try:
         f = open(lockf, "a+", encoding="utf-8")
     except Exception as e:
-        # 連鎖檔都開不了 = 鎖不可用,不是有人持有 —— 警告後放行,別把使用者擋在門外
-        print(f"⚠ 無法建立工作鎖({type(e).__name__}),本次不做同檔互斥保護", file=sys.stderr)
-        yield
-        return
+        # ⛔ fail-closed:放行 = 取消互斥(Codex 注入 error 實測兩個工作雙雙進場,
+        #    中間檔互踩重演)。鎖建不起來就不評,講清楚原因與出路。
+        sys.exit(f"⛔ 無法建立工作鎖({type(e).__name__}: {e})。\n"
+                 f"   鎖檔位置:{lockf}\n"
+                 f"   → 請確認本工具所在資料夾可寫;若整個資料夾在網路磁碟上,"
+                 f"請把工具移到本機磁碟再跑。")
     import errno
     _BUSY = {errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
              getattr(errno, "EDEADLK", -1), getattr(errno, "EDEADLOCK", -1)}
@@ -841,15 +882,17 @@ def _job_lock(song: Path):
                 import fcntl
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
-            # ⛔「忙碌」與「壞掉」要分開(Codex 抓到):ENOLCK/不支援鎖的網路檔案系統
-            #    若被當成 busy,使用者會被一個**根本不存在的持有者**擋住。
-            #    只有真正的爭用 errno 算忙碌;其餘警告後放行(互斥保證僅在鎖可用時成立)。
+            # 「忙碌」與「壞掉」分開報,但**兩者都不放行**:
+            #   ⛔ 曾經 error 時警告後放行 —— Codex 注入 PermissionError 實測
+            #      兩個同步工作 maximum concurrent = 2,互斥保證直接歸零。
             if e.errno in _BUSY:
                 sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\n"
                          f"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\n"
                          f"   → 等它跑完再試。持有工作若被強制終止,OS 會自動釋放這把鎖,不必手動清。")
-            print(f"⚠ 工作鎖在此檔案系統不可用(errno={e.errno}),本次不做同檔互斥保護",
-                  file=sys.stderr)
+            sys.exit(f"⛔ 工作鎖在此檔案系統不可用(errno={e.errno})。\n"
+                     f"   鎖檔位置:{lockf}\n"
+                     f"   → 請把本工具移到支援檔案鎖的本機磁碟再跑。"
+                     f"(不放行:沒有互斥就評,兩個工作的中間檔會互相覆寫,分數會錯得無聲無息)")
         try:      # 持有者資訊只是給人看的診斷,不參與互斥
             f.seek(0)
             f.truncate()
@@ -1213,8 +1256,8 @@ def _evaluate(song: Path):
         print("【Gemini 曲評】(聽真音檔,每維引時間碼)")
         for k, v in dims.items():
             if isinstance(v, dict):
-                sc = v.get("score")
-                cm = (v.get("comment") or "").replace("\n", " ")
+                sc = _fmt(v.get("score"), 0)
+                cm = _text_or_empty(v.get("comment")).replace("\n", " ")
                 print(f"  ・{k}:{sc if sc is not None else '無法判'}　{cm[:52]}")
 
     # ⛔ Music Flamingo 成績單區塊已移除(見上方 flamingo = None 處的判死依據)
