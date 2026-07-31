@@ -300,7 +300,9 @@ if ($hasEnv) {
     # ⛔ 不可以只 grep 顯示文字:那樣既看不出程式是不是真的成功(退出碼),
     #    失敗時又完全查不到原因(Codex 實測遇過一次「冒煙測試沒過」但立刻重跑就過,
     #    因為沒印原始輸出,根本無從追查)。改成:看退出碼 + 解析 JSON + 失敗印輸出。
+    # ⛔ 同一個視窗重跑時 $PID 不變 → 一定要先刪,否則可能收到上一次的舊產物而誤判成功
     $smokeJson = Join-Path $env:TEMP "song_jury_smoke_$PID.json"
+    Remove-Item $smokeJson -EA SilentlyContinue
     $out = & .venv\Scripts\python.exe song_scorer.py demo_mix.wav --json $smokeJson 2>&1 | Out-String
     $rc = $LASTEXITCODE
     $script:SmokeOk = $false
@@ -313,9 +315,14 @@ if ($hasEnv) {
     } else {
         try {
             $j = Get-Content $smokeJson -Raw -Encoding UTF8 | ConvertFrom-Json
+            # ⛔ 不可以只檢查「非空」:字串 "N/A"、NaN、負數、超過 100 都代表產出不對
             $tot = $j.scores.total
-            if ($null -ne $tot) { Ok "冒煙測試通過:總分 $tot / 100"; $script:SmokeOk = $true }
-            else { Bad "冒煙測試的 JSON 沒有 scores.total" "產出格式不對" }
+            $isNum = ($tot -is [double] -or $tot -is [int] -or $tot -is [decimal])
+            if ($isNum -and [double]::IsFinite([double]$tot) -and [double]$tot -ge 0 -and [double]$tot -le 100) {
+                Ok "冒煙測試通過:總分 $tot / 100"; $script:SmokeOk = $true
+            } else {
+                Bad "冒煙測試的 scores.total 不是 0-100 的有限數字(拿到:$tot)" "產出格式不對"
+            }
         } catch {
             Bad "冒煙測試的 JSON 讀不了" $_.Exception.Message
         }

@@ -14,9 +14,11 @@ import json
 import os
 import re
 import shutil
+import contextlib
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -514,15 +516,42 @@ def _unique_stem(base):
     stem, k = base, 2
     while True:
         target = dl / f"{stem}.mp3"
-        try:
-            fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)                 # 佔位成功 → 這個名字歸我(下載會覆寫它)
-            return stem
-        except FileExistsError:
-            stem = f"{base} v{k}"
-            k += 1
-            if k > 999:                  # 保險:不讓它無限繞
-                raise RuntimeError(f"下載/ 裡 {base} 的版本號已超過 999")
+        lock = dl / f".{stem}.mp3.reserving"
+        if not target.exists():
+            try:
+                # ⛔ 佔位**不可以直接建立正式的 .mp3**:下載失敗時會留下一個 0 byte 的
+                #    幽靈 mp3,下一次跑會把它當成「這首已經下載過」,而 YouTube 那條路徑
+                #    只檢查「檔案存在」就印「已存」→ 拿 0 byte 檔去評分。
+                #    改用獨立的保留檔:它不是音檔,不會被誤認。
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return stem
+            except FileExistsError:
+                pass                      # 別人正在下載這個名字 → 換下一個編號
+        stem = f"{base} v{k}"
+        k += 1
+        if k > 999:                       # 保險:不讓它無限繞
+            raise RuntimeError(f"下載/ 裡 {base} 的版本號已超過 999")
+
+
+def _release_stem(stem):
+    """放掉 _unique_stem 佔下的名字(下載成功或失敗都要呼叫)。"""
+    try:
+        (BASE / "下載" / f".{stem}.mp3.reserving").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _check_audio_ok(p: Path, label=""):
+    """下載完的檔要能用:不可以是 0 byte,也不可以小到不像音檔。
+    ⛔ 只檢查 returncode 與「檔案存在」是不夠的 —— 佔位檔、被截斷的下載都會通過。"""
+    if not p.exists():
+        sys.exit(f"{label}下載失敗:檔案不存在({p.name})")
+    sz = p.stat().st_size
+    if sz < 4096:
+        p.unlink(missing_ok=True)
+        sys.exit(f"{label}下載失敗:檔案只有 {sz} bytes,不是有效音檔(已刪除)")
+    return p
 
 
 def _is_youtube(url):
@@ -547,12 +576,17 @@ def _download_youtube(url):
              if r.returncode == 0 and r.stdout.strip() else "youtube_audio")
     stem = _unique_stem(_safe_name(title))
     print(f"⬇ 從 YouTube 下載中: {title}")
-    r2 = _yt_run(["-x", "--audio-format", "mp3", "--audio-quality", "0",
-                  "-o", str(dl_dir / f"{stem}.%(ext)s"), url])
-    mp3 = dl_dir / f"{stem}.mp3"
-    if r2.returncode != 0 or not mp3.exists():
-        sys.exit(f"YT 下載失敗:{(r2.stderr or '')[-400:]}\n"
-                 f"(需 yt-dlp+ffmpeg;私人/受限影片抓不到,請改用方式 3:自行下載成檔再給)")
+    try:
+        r2 = _yt_run(["-x", "--audio-format", "mp3", "--audio-quality", "0",
+                      "-o", str(dl_dir / f"{stem}.%(ext)s"), url])
+        mp3 = dl_dir / f"{stem}.mp3"
+        if r2.returncode != 0:
+            mp3.unlink(missing_ok=True)          # 別留半截檔給下一次誤用
+            sys.exit(f"YT 下載失敗:{(r2.stderr or '')[-400:]}\n"
+                     f"(需 yt-dlp+ffmpeg;私人/受限影片抓不到,請改用方式 3:自行下載成檔再給)")
+        _check_audio_ok(mp3, "YT ")          # ⛔ 不可以只看 returncode 與檔案存在
+    finally:
+        _release_stem(stem)
     print(f"已存: {mp3}")
     print("📝 YouTube 無法自動抓歌詞——請另外提供歌詞(貼文字,或給 .txt 路徑)")
     return mp3
@@ -599,20 +633,32 @@ def resolve_input(arg):
     part = dest.with_name(dest.name + ".part")
     print(f"⬇ 從 SUNO 下載中: {url}")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    # ⛔ 不可以無上限 copyfileobj:對方若回一個持續串流(或超大檔),會把磁碟塞爆。
+    #    500MB 遠大於任何一首歌(4 分鐘 320kbps ≈ 10MB),超過就是不對勁。
+    MAX_BYTES = 500 * 1024 * 1024
     try:
         with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
-            shutil.copyfileobj(r, f)
+            got = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > MAX_BYTES:
+                    raise RuntimeError(f"下載超過上限 {MAX_BYTES // 1024 // 1024}MB,已中止")
+                f.write(chunk)
     except urllib.error.HTTPError as e:
-        part.unlink(missing_ok=True)
+        part.unlink(missing_ok=True); _release_stem(dest.stem)
         sys.exit(f"下載失敗(HTTP {e.code})。歌曲可能不是「公開」狀態——"
                  f"私人歌曲請先在 SUNO 網站下載,再用方式 3(直接給檔)評。")
     except Exception as e:
-        part.unlink(missing_ok=True)
+        part.unlink(missing_ok=True); _release_stem(dest.stem)
         sys.exit(f"下載失敗:{type(e).__name__}: {e}(網路問題或連結失效)")
     if part.stat().st_size < 10240:  # <10KB 幾乎必是錯誤頁/壞檔,不是音檔
-        part.unlink(missing_ok=True)
+        part.unlink(missing_ok=True); _release_stem(dest.stem)
         sys.exit("下載到的檔案過小,不像有效音檔(可能是私人歌、連結失效或被擋)。")
     part.replace(dest)  # 完整下載才 rename 成正式檔,中斷不留壞檔
+    _release_stem(dest.stem)
     if lyrics:  # 下載成功才寫歌詞,下載失敗不留孤兒歌詞檔
         res_dir = dl_dir / f"{dest.stem}_評分結果"
         res_dir.mkdir(parents=True, exist_ok=True)
@@ -622,12 +668,60 @@ def resolve_input(arg):
     return dest
 
 
+@contextlib.contextmanager
+def _job_lock(song: Path):
+    """同一個音檔同時只准有一個評測工作。
+
+    ⛔ 為什麼需要:所有中間檔都叫 `{音檔名}_編曲層次.json`、`_評分.json`、`_和聲分析.json`…
+       同一個檔被評兩次(批次在跑 + 手動再評、.bat 開兩次、CLI 與網頁同時評)時,
+       兩邊會共用這些檔 —— 一邊讀完 unlink() 之後另一邊就找不到檔案、
+       或讀到正在覆寫的半截 JSON。
+    ⚠️ 這把鎖只擋「同一個音檔」,不同的歌(含 SUNO 抽卡的各個 take,音檔不同)照樣可以並行。
+    """
+    lockf = song.with_name(f".{song.stem}.evaluating.lock")
+    fd = None
+    try:
+        try:
+            fd = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"pid={os.getpid()} at={time.strftime('%Y-%m-%d %H:%M:%S')}".encode())
+        except FileExistsError:
+            # 陳舊鎖(前一個程序被砍)超過 6 小時就搶過來,免得永久卡住
+            try:
+                stale = (time.time() - lockf.stat().st_mtime) > 6 * 3600
+            except Exception:
+                stale = False
+            if not stale:
+                sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\n"
+                         f"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\n"
+                         f"   → 等它跑完再試;確定沒有其他工作在跑的話,刪掉 {lockf.name} 即可。")
+            lockf.unlink(missing_ok=True)
+            fd = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        yield
+    finally:
+        # ⛔ 只有**真的拿到鎖**的人才可以刪鎖檔。
+        #    否則搶不到鎖的那一方在 finally 裡會把持有者的鎖檔刪掉(自己踩過),
+        #    等於鎖形同虛設,Windows 上還會因為持有者還開著檔案而 PermissionError。
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                lockf.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit("用法: python 評審團.py <歌曲檔路徑 或 SUNO/YouTube 連結>\n"
                  "  含空白的路徑請用引號括起。")
     song = resolve_input(sys.argv[1])
+    with _job_lock(song):
+        _evaluate(song)
 
+
+def _evaluate(song: Path):
     print(f"🎵 評審對象: {song.name}\n")
 
     notes = []          # 新元件若失敗/降級,理由收在這裡,最後誠實印出來

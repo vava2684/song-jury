@@ -114,6 +114,22 @@ def test_不同路徑的同名歌不可以共用結果鍵(tmp_path):
     assert "song.resolve()" in src, "結果鍵應該用正規化後的絕對路徑"
 
 
+def test_損壞主檔不可以覆蓋好備份(tmp_path):
+    """🔴 雙毀情境(Codex 第五輪):主檔壞了 → 從 .bak 救回來 →
+    存檔時又把「壞掉的主檔」複製成 .bak → 唯一一份好備份被毀,之後永遠救不回來。
+    只有確定解析得開的主檔才可以拿去當備份。"""
+    store = tmp_path / "批次結果.json"
+    bak = store.with_suffix(".json.bak")
+    store.write_text("{壞掉的半截", encoding="utf-8")          # 主檔損壞
+    bak.write_text(json.dumps({"好資料": 1}), encoding="utf-8")  # 備份是好的
+
+    B._save_store(store, {"新資料": 2})
+
+    assert json.loads(bak.read_text(encoding="utf-8")) == {"好資料": 1}, \
+        "🔴 好備份被損壞的主檔蓋掉了"
+    assert json.loads(store.read_text(encoding="utf-8")) == {"新資料": 2}
+
+
 def test_不完整評測不可以進批次表(monkeypatch, tmp_path):
     """⛔ 缺柱是另一把尺,拿去算鑑別力會得到假結論。"""
     song = tmp_path / "song.wav"; song.write_bytes(b"x")

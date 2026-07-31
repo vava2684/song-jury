@@ -74,11 +74,18 @@ def _save_store(store: Path, results: dict):
         json.dump(results, f, ensure_ascii=False, indent=1)
         f.flush()
         os.fsync(f.fileno())
+    # ⛔ 只有在主檔**確定解析得開**時才拿它去覆蓋備份。
+    #    否則會出現這種雙毀:主檔壞了 → 我們從 .bak 救回來 → 這裡又把壞主檔複製成 .bak
+    #    → 唯一一份好備份被毀掉。備份本身也要原子更新,免得複製到一半被中斷。
     if store.exists():
         try:
-            shutil.copy2(store, store.with_suffix(".json.bak"))
+            json.loads(store.read_text(encoding="utf-8"))     # 先確認舊主檔是好的
+            bak = store.with_suffix(".json.bak")
+            btmp = store.with_suffix(f".json.bak.tmp{os.getpid()}")
+            shutil.copy2(store, btmp)
+            os.replace(btmp, bak)
         except Exception:
-            pass
+            pass          # 舊主檔壞掉 → 保留現有備份不動(它才是好的那份)
     os.replace(tmp, store)
 
 

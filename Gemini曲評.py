@@ -34,6 +34,7 @@ import argparse
 import base64
 import hashlib
 import json
+import contextlib
 import os
 import re
 import sys
@@ -193,10 +194,65 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(state: dict):
-    """冷卻狀態寫本機小檔(已列入 .gitignore)。寫不進去不算致命 —— 大不了下次再撞一次死金鑰。"""
+@contextlib.contextmanager
+def _state_lock(timeout=10.0):
+    """跨程序檔案鎖(同一台機器上的多個評測工作共用冷卻狀態)。
+
+    ⛔ 只用原子寫入是不夠的:兩個工作各自「讀→改→寫」時會 lost update ——
+       A 寫下金鑰 A 的冷卻,B 用更早讀到的空狀態覆蓋回去,A 的冷卻就消失了,
+       **已經被限流或判死的金鑰會再被呼叫一次**。必須鎖起來、鎖內重讀再合併。
+    拿不到鎖也不阻斷評分(冷卻只是最佳化),但會退回不上鎖的舊行為。"""
+    lockf = STATE_FILE.with_suffix(".lock")
+    fd = None
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            fd = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:    # 陳舊鎖(前一個程序被砍)超過 60 秒就搶過來
+                if time.time() - lockf.stat().st_mtime > 60:
+                    lockf.unlink(missing_ok=True)
+                    continue
+            except Exception:
+                pass
+            time.sleep(0.05)
+        except Exception:
+            break
     try:
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        yield fd is not None
+    finally:
+        if fd is not None:
+            os.close(fd)
+            lockf.unlink(missing_ok=True)
+
+
+def save_state(state: dict):
+    """冷卻狀態寫本機小檔(已列入 .gitignore)。寫不進去不算致命 —— 大不了下次再撞一次死金鑰。
+
+    ⚠️ 一律「鎖內重讀 → 合併 → 原子換上」,不可以直接覆寫(見 _state_lock 的說明)。
+    合併規則:同一把金鑰取**較晚到期**的冷卻(比較保守,寧可多冷卻也不要誤放行)。
+    """
+    try:
+        with _state_lock():
+            cur = {}
+            try:
+                cur = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                cur = {}
+            merged = dict(cur)
+            for k, v in (state or {}).items():
+                old = merged.get(k)
+                if isinstance(old, dict) and isinstance(v, dict):
+                    # 欄位名以 cool_down() 實際寫的為準(cooldown_until,不是 until)
+                    _n = float(v.get("cooldown_until", 0) or 0)
+                    _o = float(old.get("cooldown_until", 0) or 0)
+                    merged[k] = v if _n >= _o else old
+                else:
+                    merged[k] = v
+            tmp = STATE_FILE.with_suffix(f".json.tmp{os.getpid()}")
+            tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, STATE_FILE)
     except Exception:
         pass
 

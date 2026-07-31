@@ -243,6 +243,34 @@ def test_舊快取搬不動時解析路徑仍要對得上(monkeypatch, tmp_path)
     assert (d / "vocals.flac").exists()
 
 
+def test_殘缺新快取不可以蓋過合法舊快取(monkeypatch, tmp_path):
+    """🔴 交叉狀態(Codex 第五輪):新 SHA 夾**存在但殘缺**、舊快取完整且身分正確。
+    separate() 會退去用舊的,cache_dir_of() 卻因為「新夾存在」就回傳那個空夾
+    → 下游拿不到 vocals.flac,人聲柱第三次靜默消失。
+    判斷必須看「有沒有內容」,不是只看 is_dir()。"""
+    _fake_torch(monkeypatch)
+    stems = tmp_path / "_stems"
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    fp = C._source_ident(a)["fingerprint"]
+    srcs = ["drums", "bass", "other", "vocals"]
+
+    # 新夾:存在但殘缺(只有 sidecar,沒有 flac)
+    newp = stems / C._cache_name(a, "htdemucs_6s", fp)
+    newp.mkdir(parents=True)
+    (newp / "_source.json").write_text(json.dumps({"fingerprint": fp}), encoding="utf-8")
+    # 舊夾:完整且身分正確
+    legacy = stems / "song__htdemucs_6s"
+    legacy.mkdir(parents=True)
+    for s in srcs:
+        (legacy / f"{s}.flac").write_bytes(b"x")
+    (legacy / "_source.json").write_text(json.dumps({"fingerprint": fp}), encoding="utf-8")
+
+    d = C.cache_dir_of(a, stems, "htdemucs_6s")
+    assert (d / "vocals.flac").exists(), \
+        f"🔴 cache_dir_of 指到殘缺的 {d.name}(沒有 vocals.flac)→ 人聲柱會消失"
+
+
 def test_同程序兩執行緒不會共用暫存夾(monkeypatch, tmp_path):
     """🔴 只用 PID 命名的話,同一個程序裡的兩個執行緒會共用同一個暫存夾互相覆寫。
 

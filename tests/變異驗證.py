@@ -9,10 +9,21 @@
 這支不是 pytest 測試(它會改動原始碼再還原),所以刻意不叫 test_*.py,
 CI 也另外獨立跑它 —— 讓「測試有沒有效」本身也被自動檢查。
 """
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+# ⛔ 這支會印 ✅⛔⏭ 等符號。繁體中文 Windows 的主控台預設是 cp950,
+#    不重設編碼的話印第一個符號就 UnicodeEncodeError 當掉(README 教的指令直接崩)。
+#    跟其他 CLI 一樣在開頭修好,使用者就不必自己記得設 PYTHONUTF8。
+os.environ.setdefault("PYTHONUTF8", "1")
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 REPO = Path(__file__).resolve().parent.parent
 PY = sys.executable
@@ -74,11 +85,42 @@ MUTATIONS = [
      "            if False:\n                raise",
      "tests/test_stem_cache.py::test_原子改名不可以吞掉非預期錯誤"),
 
-    ("合法舊快取沒搬到新路徑(cache_dir_of 指到不存在的位置 → 人聲柱又消失)",
+    ("合法舊快取不被 cache_dir_of 認可(搬不動時指到不存在的位置 → 人聲柱又消失)",
      "分軌快取.py",
-     "        if _sidecar_fp(legacy) == ident[\"fingerprint\"]:\n            return legacy",
-     "        if False:\n            return legacy",
+     '        if _sidecar_fp(legacy) == ident["fingerprint"] and any(legacy.glob("*.flac")):',
+     '        if False:',
      "tests/test_stem_cache.py::test_舊快取搬不動時解析路徑仍要對得上"),
+
+    # ── Codex 第五輪 ──────────────────────────────────────────────────
+    ("佔名直接建立正式 mp3(下載失敗留下 0 byte 幽靈檔)",
+     "評審團.py",
+     'lock = dl / f".{stem}.mp3.reserving"',
+     'lock = dl / f"{stem}.mp3"',
+     "tests/test_download_and_lock.py::test_佔名不可以建立正式mp3"),
+
+    ("同一個音檔可以同時評兩次(九個中間檔互相覆寫)",
+     "評審團.py",
+     "            if not stale:\n                sys.exit(",
+     "            if False:\n                sys.exit(",
+     "tests/test_download_and_lock.py::test_同一個音檔不可以同時評兩次"),
+
+    ("Gemini 冷卻狀態直接覆寫(lost update → 死金鑰又被呼叫)",
+     "Gemini曲評.py",
+     "            merged = dict(cur)",
+     "            merged = {}",
+     "tests/test_download_and_lock.py::test_冷卻狀態不可以lost_update"),
+
+    ("殘缺新快取蓋過合法舊快取(cache_dir_of 指到沒有 flac 的空夾)",
+     "分軌快取.py",
+     'if newp.is_dir() and _sidecar_fp(newp) == ident["fingerprint"] \\\n            and any(newp.glob("*.flac")):',
+     'if newp.is_dir():',
+     "tests/test_stem_cache.py::test_殘缺新快取不可以蓋過合法舊快取"),
+
+    ("批次把損壞主檔複製成備份(唯一好備份被毀)",
+     "批次評測.py",
+     'json.loads(store.read_text(encoding="utf-8"))     # 先確認舊主檔是好的',
+     'pass',
+     "tests/test_batch_and_windows.py::test_損壞主檔不可以覆蓋好備份"),
 
     ("批次不看 returncode(程式炸掉但檔案已寫出 → 誤判成功)",
      "批次評測.py",

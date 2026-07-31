@@ -116,15 +116,21 @@ def cache_dir_of(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
     """
     ident = _source_ident(audio_path)
     newp = stems_dir / _cache_name(audio_path, model_name, ident["fingerprint"])
-    if newp.is_dir():
-        return newp
     legacy = _legacy_dir(audio_path, stems_dir, model_name)
+
+    # ⛔ 不可以只看 newp.is_dir():新資料夾可能存在但**殘缺**(上一輪中途被砍),
+    #    這時 separate() 會退去用合法的舊快取,而這裡卻回傳那個殘缺的新路徑
+    #    → 下游拿不到 vocals.flac,人聲柱又一次靜默消失(這已經是第三次了)。
+    #    判斷順序必須跟 separate() 完全一致:新的「有內容」才算數,否則看舊的。
+    if newp.is_dir() and _sidecar_fp(newp) == ident["fingerprint"] \
+            and any(newp.glob("*.flac")):
+        return newp
     if legacy.is_dir():
-        if _sidecar_fp(legacy) == ident["fingerprint"]:
-            return legacy          # 身分相符 → 安全,跟 separate() 一致
+        if _sidecar_fp(legacy) == ident["fingerprint"] and any(legacy.glob("*.flac")):
+            return legacy          # 身分相符且有內容 → 跟 separate() 一致
         if _TRUST_LEGACY and _sidecar_fp(legacy) is None:
             return legacy          # 無身分但使用者明確授權沿用
-    return newp
+    return newp                    # 都沒有 → 回新路徑(等著被建立)
 
 
 def separate(audio_path: Path, stems_dir: Path, model_name: str):
@@ -165,6 +171,10 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
                 #    的判斷,兩份規則遲早漂移(已經漂過一次:vocal_stem 變 None)。
                 #    搬過去之後全系統只有一個位置,整類問題消失。改名是 metadata 操作,很快。
                 try:
+                    # ⛔ 搬之前要先處理掉「已存在但殘缺」的新目標,否則 os.replace 會失敗,
+                    #    退去用舊路徑,而 cache_dir_of() 又看到新資料夾在 → 兩邊指到不同地方。
+                    if cache.exists() and not _cache_is_valid(cache, sources, fp):
+                        shutil.rmtree(cache, ignore_errors=True)
                     os.replace(legacy, cache)
                     print(f"      ↳ 舊快取身分相符,已搬到帶指紋的新路徑:{cache.name}", flush=True)
                     have_all = True
