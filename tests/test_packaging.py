@@ -147,6 +147,27 @@ def test_每個環境的第三方相依都由該環境的requirements宣告(req_
     assert not missing, "\n".join(sorted(set(missing)))
 
 
+def test_不可洩漏作者本機路徑或指向沒進repo的內部檔案():
+    """公開 repo 裡不該出現 `D:\\Source\\...`、`C:\\Users\\某人\\...` 這種本機路徑,
+    也不該叫讀者去看一個不隨包散布的內部檔案 —— 對他們是死連結,對作者是資訊外洩。"""
+    tracked = _tracked()
+    # ⚠️ `_批次結果` 不列入:那是批次工具自己會建的輸出夾,不是作者的內部資料夾。
+    內部 = re.compile(r"[A-Za-z]:\\+(Users|Source)\\+[^\s\"']+|多語詞評計畫|權重辯論_\d+|_審核[\\/]")
+    白名單 = {"tests/test_packaging.py"}          # 這條規則自己會寫出範例字串
+    bad = []
+    for f in sorted(tracked):
+        if f in 白名單 or not f.endswith((".py", ".md", ".txt", ".ps1", ".sh", ".yml")):
+            continue
+        p = REPO / f
+        if not p.exists():
+            continue
+        for i, ln in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            m = 內部.search(ln)
+            if m:
+                bad.append(f"{f}:{i} 出現 {m.group(0)!r}")
+    assert not bad, "\n".join(bad)
+
+
 def test_評審團py頂層只用標準庫():
     """演唱聽感.py / 真實距離.py 跑在 .venv-audition,卻要 import 評審團 的 iter_windows。
     評審團.py 頂層一旦多一個重相依,那兩支就會在別的 venv 裡爆掉。"""

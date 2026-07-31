@@ -44,8 +44,8 @@ song_scorer.py 的 harmony_metrics() 原文是這樣:
     python 和聲分析.py <音檔> [--json 輸出.json] [--stems 分軌快取夾]
                        [--model htdemucs_6s] [--no-stems]
 
-必須用 anaconda python 跑(demucs/torch/librosa 都在那):
-    C:\\Users\\VAVA\\anaconda3\\python.exe 和聲分析.py "D:\\Source\\SUNO\\Storm and Stars.mp3"
+必須用「裝了 demucs 的那個 python」跑(解析順序見 評審團.py 的 _find_demucs_py):
+    <demucs 的 python> 和聲分析.py "你的歌.mp3"
 """
 import argparse
 import json

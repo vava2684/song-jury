@@ -16,8 +16,8 @@
 用法:
     python 編曲層次.py <音檔> [--json 輸出.json] [--stems 分軌快取夾] [--model htdemucs_6s]
 
-必須用 anaconda python 跑(demucs/torch 裝在那):
-    C:\\Users\\VAVA\\anaconda3\\python.exe 編曲層次.py song.mp3
+必須用「裝了 demucs 的那個 python」跑(解析順序見 評審團.py 的 _find_demucs_py):
+    <demucs 的 python> 編曲層次.py song.mp3
 """
 import argparse
 import json

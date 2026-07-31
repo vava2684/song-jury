@@ -22,7 +22,7 @@ Gemini 曲評(Evidence-based Music Review)— 滿血版第二關新增元件
     .venv\\Scripts\\python.exe Gemini曲評.py <音檔> [--lang zh|en|ja|ko] [--json 輸出.json]
                                               [--dry-run] [--ignore-cooldown] [--timeout 200]
 
-金鑰(放 D:\\Source\\SUNO\\評分\\.env,已被 .gitignore 擋住):
+金鑰(放專案根目錄的 .env,已被 .gitignore 擋住):
     GEMINI_API_KEYS=key1,key2,key3     ← 多把,會依錯誤類型輪替
     GEMINI_API_KEY=key1                ← 只有一把時的相容寫法
 沒有 .env 也能跑:直接吐 degraded:true + 明確原因,不會炸掉整條產線。

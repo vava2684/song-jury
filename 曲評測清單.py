@@ -140,7 +140,7 @@ def main():
           "| 復權:和弦詞彙(13:0,過濾版)、LRA;顯示軸:SONICS P(AI) 不入分(19:7) | - |",
           "| 已廢(零顯示):編曲.n_sections、編曲.spectral_coverage | - |",
           "",
-          "機讀定版:多語詞評計畫\\權重辯論_20260723\\T_定版權重.json;⛔ 改任何一格=單格重開辯論。", ""]
+          "權重沿革見 docs/權重沿革.md;⛔ 改任何一格=單格重開辯論。", ""]
 
     out = BASE / "_曲評測清單.md"
     out.write_text("\n".join(L), encoding="utf-8")

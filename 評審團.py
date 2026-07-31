@@ -860,7 +860,7 @@ def main():
         "凍結中": ["演唱.rhythm(T2b 10:3)", "和聲.non_diatonic(9:4)"],
         "顯示軸": {"AI感 SONICS P(AI)": _g(realdist, "sonics_p_ai"),
                    "註": "不入分(19:7);新版SUNO漏抓~31%"},
-        "出處": "重構庭 2026-07-25 定版(T1-T4;權重辯論_20260723\\T_定版權重.json)",
+        "出處": "重構庭 2026-07-25 定版(T1-T4;沿革見 docs/權重沿革.md)",
     }
     out_path = song.with_name(song.stem + "_評審團.json")
     out_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
