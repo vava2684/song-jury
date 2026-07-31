@@ -268,7 +268,15 @@ if ($lost -gt 0) {
     Write-Host "      ⛔ 安裝不完整 —— 有 $lost% 的權重整根缺席,這台機器目前【評不出有效分數】。" -ForegroundColor Red
     Write-Host "         九柱制的滿分定義是九根柱子都在;少一根就是換了一把尺," -ForegroundColor Red
     Write-Host "         算出來的分數不可與別人互比、不可拿去排行。" -ForegroundColor Red
-    Write-Host "         → 把上面紅字的部分補起來再評(多半是網路問題,重跑這個安裝檔就會補上)。" -ForegroundColor Yellow
+    # ⚠️ 要講出**這一台**缺的真正原因。舊版一律寫「多半是網路問題,重跑就會補上」——
+    #    但沒填金鑰的人重跑一百次也不會好,那句話會把人帶去錯的方向。
+    if (-not $hasKey) {
+        Write-Host "         → 你缺的是 Gemini 金鑰(律動柱 100% 靠它,其餘五柱各缺一項)。" -ForegroundColor Yellow
+        Write-Host "           ⛔ 重跑安裝檔沒有用 —— 去 https://aistudio.google.com/apikey 申請(免費)," -ForegroundColor Yellow
+        Write-Host "           把 .env.example 複製成 .env,填 GEMINI_API_KEYS=你的金鑰,再跑 -CheckOnly 確認。" -ForegroundColor Yellow
+    } else {
+        Write-Host "         → 把上面紅字的部分補起來再評(多半是網路問題,重跑這個安裝檔就會補上)。" -ForegroundColor Yellow
+    }
 } elseif ($partial.Count -gt 0) {
     Write-Host "      ⚠️ 九根柱子都算得出分,但有柱子缺細項(上面黃字)——" -ForegroundColor Yellow
     Write-Host "         柱內會重新歸一化,分數出得來但與完整安裝的結果有落差,建議補齊。" -ForegroundColor Yellow
@@ -290,12 +298,20 @@ if ($hasEnv) {
 
 # ── 總結 ────────────────────────────────────────────────────────────
 Write-Host "`n══════════════════════════════════════════════════" -ForegroundColor White
-if ($script:Problems.Count -eq 0) {
-    Write-Host "  安裝完成,沒有任何失敗項目。" -ForegroundColor Green
-} else {
-    Write-Host "  安裝完成,但有 $($script:Problems.Count) 項沒成功:" -ForegroundColor Yellow
+# ⚠️ 總結要跟上面的柱狀判定一致。舊版只看 Problems.Count,結果冷安裝實測出現
+#    「⛔ 安裝不完整,評不出有效分數」與「安裝完成,沒有任何失敗項目」同時出現的自相矛盾。
+#    「每一步都沒報錯」≠「裝好了」—— 沒填金鑰時每一步都會成功,但律動柱評不出來。
+if ($script:Problems.Count -gt 0) {
+    Write-Host "  有 $($script:Problems.Count) 項沒成功:" -ForegroundColor Yellow
     foreach ($p in $script:Problems) { Write-Host "    · $p" -ForegroundColor Yellow }
     Write-Host "`n  多數是網路問題,重跑一次這個安裝檔就會補上(已裝好的不會重裝)。" -ForegroundColor DarkGray
+}
+if ($lost -gt 0) {
+    Write-Host "  ⛔ 尚未完成:九柱沒齊,現在還評不出有效分數(原因見上面的柱狀表)。" -ForegroundColor Red
+} elseif ($script:Problems.Count -eq 0 -and $script:SmokeOk) {
+    Write-Host "  ✅ 安裝完成,九柱齊全,可以開始評分了。" -ForegroundColor Green
+} else {
+    Write-Host "  ⚠️ 安裝大致完成,但有項目沒過(見上面)。" -ForegroundColor Yellow
 }
 Write-Host @"
 

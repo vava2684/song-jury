@@ -266,7 +266,14 @@ if [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ]; then
   printf "      ${C_RED}⛔ 安裝不完整 —— 有 %s%% 的權重整根缺席,這台機器目前【評不出有效分數】。${C_OFF}\n" "$LOST"
   printf "      ${C_RED}   九柱制的滿分定義是九根柱子都在;少一根就是換了一把尺,${C_OFF}\n"
   printf "      ${C_RED}   算出來的分數不可與別人互比、不可拿去排行。${C_OFF}\n"
-  printf "      ${C_YEL}   → 把上面紅字的部分補起來再評(多半是網路問題,重跑這個安裝檔就會補上)。${C_OFF}\n"
+  # ⚠️ 要講出這一台缺的真正原因:沒填金鑰的人重跑一百次也不會好
+  if [ "$HAS_KEY" != 1 ]; then
+    printf "      ${C_YEL}   → 你缺的是 Gemini 金鑰(律動柱 100%% 靠它,其餘五柱各缺一項)。${C_OFF}\n"
+    printf "      ${C_YEL}     ⛔ 重跑安裝檔沒有用 —— 去 https://aistudio.google.com/apikey 申請(免費),${C_OFF}\n"
+    printf "      ${C_YEL}     把 .env.example 複製成 .env 填 GEMINI_API_KEYS,再跑 --check-only 確認。${C_OFF}\n"
+  else
+    printf "      ${C_YEL}   → 把上面紅字的部分補起來再評(多半是網路問題,重跑這個安裝檔就會補上)。${C_OFF}\n"
+  fi
 elif [ "$PARTIAL" = 1 ]; then
   printf "      ${C_YEL}⚠️ 九根柱子都算得出分,但有柱子缺細項(上面黃字)——${C_OFF}\n"
   printf "      ${C_YEL}   柱內會重新歸一化,分數出得來但與完整安裝的結果有落差,建議補齊。${C_OFF}\n"
@@ -290,12 +297,19 @@ fi
 
 # ── 總結 ────────────────────────────────────────────────────────────
 printf "\n══════════════════════════════════════════════════\n"
-if [ "${#PROBLEMS[@]}" -eq 0 ]; then
-  printf "${C_GREEN}  安裝完成,沒有任何失敗項目。${C_OFF}\n"
-else
-  printf "${C_YEL}  安裝完成,但有 %d 項沒成功:${C_OFF}\n" "${#PROBLEMS[@]}"
+# ⚠️ 總結要跟柱狀判定一致 ——「每一步都沒報錯」≠「裝好了」:
+#    沒填金鑰時每一步都會成功,但律動柱評不出來(冷安裝實測撞到的自相矛盾)。
+if [ "${#PROBLEMS[@]}" -gt 0 ]; then
+  printf "${C_YEL}  有 %d 項沒成功:${C_OFF}\n" "${#PROBLEMS[@]}"
   for p in "${PROBLEMS[@]}"; do printf "${C_YEL}    · %s${C_OFF}\n" "$p"; done
   printf "${C_DIM}\n  多數是網路問題,重跑一次這個安裝檔就會補上(已裝好的不會重裝)。${C_OFF}\n"
+fi
+if [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ]; then
+  printf "${C_RED}  ⛔ 尚未完成:九柱沒齊,現在還評不出有效分數(原因見上面的柱狀表)。${C_OFF}\n"
+elif [ "${#PROBLEMS[@]}" -eq 0 ] && [ "$SMOKE_OK" = 1 ]; then
+  printf "${C_GREEN}  ✅ 安裝完成,九柱齊全,可以開始評分了。${C_OFF}\n"
+else
+  printf "${C_YEL}  ⚠️ 安裝大致完成,但有項目沒過(見上面)。${C_OFF}\n"
 fi
 cat <<'USAGE'
 
