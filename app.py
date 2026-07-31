@@ -45,9 +45,26 @@ def _venv_py(venv):
     return str(BASE / venv / ("Scripts/python.exe" if _WIN else "bin/python"))
 
 
-def _run(cmd):
-    return subprocess.run(cmd, cwd=str(BASE), env=ENV, capture_output=True,
-                          text=True, encoding="utf-8", errors="replace")
+# 網頁版子程序的整體上限。⛔ 沒有 timeout 的話:某階段卡住(解碼器、模型下載、
+#    GPU 排隊)會讓那個 worker 與 GPU 被無限占用,而使用者關掉頁面也叫不停它。
+#    預設 2 小時(整首歌走完九柱含首次模型下載的悲觀值),可用環境變數調。
+_JOB_TIMEOUT = int(os.environ.get("SONG_JURY_WEB_TIMEOUT", "7200"))
+
+
+def _run(cmd, timeout=None):
+    """跑子程序;逾時就把**整棵程序樹**殺掉(只殺父程序的話,Demucs/torch 的子程序會留著吃 GPU)。"""
+    try:
+        return subprocess.run(cmd, cwd=str(BASE), env=ENV, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout or _JOB_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        if _WIN:      # taskkill /T 會連子孫程序一起收掉
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(getattr(e, "pid", 0))],
+                           capture_output=True)
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout=(e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
+            stderr=f"逾時:超過 {timeout or _JOB_TIMEOUT} 秒仍未完成,已中止。"
+                   f"(可設環境變數 SONG_JURY_WEB_TIMEOUT 調整)")
 
 
 # ── Ollama(本機免費 AI)────────────────────────────────────────
@@ -158,20 +175,33 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
 
     # ⛔ 完整性警語一定要在網頁版也顯示出來 —— CLI 印得很大聲,網頁版原本整段吃掉,
     #    使用者只會看到「✅ 完成」跟一個看似正常的分數。缺柱=無效評測,不可以藏。
-    _pt = _data.get("pillar_totals") or {}
+    # ⛔ 這裡要 **fail-closed**:欄位不存在或型別不對,一律當成不完整。
+    #    舊寫法 `_pt.get("完整評測", True)` 在 pillar_totals 整個不見時會回 True(fail-open)
+    #    → 最該示警的情況反而顯示「✅ 完成」。
+    _pt = _data.get("pillar_totals")
+    _ok = _pt.get("完整評測") if isinstance(_pt, dict) else None
     incomplete_md = ""
-    if _pt and not _pt.get("完整評測", True):
-        _lost = "、".join(_pt.get("缺柱") or [])
-        incomplete_md = (f"\n\n---\n### ⛔ 這不是一份完整評測\n"
-                         f"缺了 **{len(_pt.get('缺柱') or [])} 根柱**、合計 "
-                         f"**{_pt.get('缺柱權重合計')}%** 權重(缺:{_lost})。\n\n"
-                         f"分數是用剩下的柱重新歸一化算的,**不可與完整評測互比、不可拿去排行、"
-                         f"不可當作品的評測結果**。請把安裝補齊後重評。\n")
-    # 未跑到的項目也一併攤開(原本只有 CLI 看得到);鍵名以 評審團.py 實際寫出的為準
+    if _ok is not True:
+        if _ok is False:
+            _lost = _pt.get("缺柱") or []
+            incomplete_md = (f"\n\n---\n### ⛔ 這不是一份完整評測\n"
+                             f"缺了 **{len(_lost)} 根柱**、合計 "
+                             f"**{_pt.get('缺柱權重合計')}%** 權重(缺:{'、'.join(_lost)})。\n\n"
+                             f"分數是用剩下的柱重新歸一化算的,**不可與完整評測互比、不可拿去排行、"
+                             f"不可當作品的評測結果**。請把安裝補齊後重評。\n")
+        else:
+            incomplete_md = ("\n\n---\n### ⛔ 無法確認這份評測是否完整\n"
+                             "結果裡沒有 `pillar_totals.完整評測` 欄位(可能是舊格式或產出不完整)。"
+                             "**這個分數不可拿去比較或排行。**\n")
+
+    # 未跑到的項目另外攤開 —— ⚠️ 這是**細項提醒**,不是「不完整」。
+    #    舊寫法把它接在 incomplete_md 後面,而下面又用 incomplete_md 是否非空來決定要不要
+    #    掛「⛔ 評測不完整」→ 九柱齊全但有任何一則 note 就被誤報成不完整。兩者必須分開。
     _notes = _data.get("stage_notes") or []
+    notes_md = ""
     if _notes:
-        incomplete_md += "\n<details><summary>本次未完全跑到的項目</summary>\n\n" + \
-                         "\n".join(f"- {n}" for n in _notes) + "\n\n</details>\n"
+        notes_md = ("\n\n<details><summary>本次未完全跑到的項目(細項提醒)</summary>\n\n"
+                    + "\n".join(f"- {n}" for n in _notes) + "\n\n</details>\n")
 
     arc_img = None
     # ⭐ SUNO 連結會自動抓到歌詞(評審團.py 存在 fetched_lyrics)—— 原本只看文字框,
@@ -206,6 +236,7 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
             note = f"⚠️ 本機詞評失敗({e})。確認 Ollama 有在跑、模型已 `ollama pull`。"
     if incomplete_md:
         note = "⛔ **評測不完整**(詳見下方)——" + note.lstrip("✅⚠️ ") + incomplete_md
+    note += notes_md          # 細項提醒獨立附加,不影響上面的完整性判定
     return table, arc_img, lyric_eval, note
 
 

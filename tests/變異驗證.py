@@ -9,6 +9,7 @@
 這支不是 pytest 測試(它會改動原始碼再還原),所以刻意不叫 test_*.py,
 CI 也另外獨立跑它 —— 讓「測試有沒有效」本身也被自動檢查。
 """
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -36,10 +37,10 @@ MUTATIONS = [
      '_gt = _g(gemini, "total")',
      "tests/test_pillars.py::test_Gemini總分取的是gemini_reported_total而不是total"),
 
-    ("快取不驗身分(同名不同曲會讀到別首歌的分軌)",
+    ("快取夾名不帶指紋(同名不同曲會共用同一份分軌 → 分數全錯)",
      "分軌快取.py",
-     'if rec.get("fingerprint") != ident["fingerprint"]:',
-     'if False:',
+     'cache = stems_dir / f"{audio_path.stem}__{model_name}__{fp8}"',
+     'cache = stems_dir / f"{audio_path.stem}__{model_name}"',
      "tests/test_stem_cache.py::test_撞名時不會讀到另一首歌的分軌"),
 
     ("批次不看 returncode(程式炸掉但檔案已寫出 → 誤判成功)",
@@ -71,6 +72,25 @@ MUTATIONS = [
      "*.sh  text eol=lf",
      "# *.sh 沒鎖",
      "tests/test_packaging.py::test_下載ZIP的人拿到的換行是對的"),
+
+    # ── 以下是 Codex 第二輪抓到的(修完補上變異)──────────────────────
+    ("指紋只雜湊頭尾(3MB 檔中段改動測不出來 → 兩首歌共用分軌)",
+     "分軌快取.py",
+     'for chunk in iter(lambda: f.read(1 << 20), b""):\n            h.update(chunk)',
+     'h.update(f.read(1 << 20))',
+     "tests/test_stem_cache.py::test_大檔只改中段也要測得出來"),
+
+    ("批次用檔名當結果鍵(不同資料夾的同名歌會漏評)",
+     "批次評測.py",
+     'key = str(song.resolve()).replace("\\\\", "/")',
+     'key = song.name',
+     "tests/test_batch_and_windows.py::test_不同路徑的同名歌不可以共用結果鍵"),
+
+    ("批次對缺完整性欄位 fail-open(舊格式/半殘 JSON 反而放行)",
+     "批次評測.py",
+     'if not isinstance(_pt, dict):\n        return None, "結果缺少 pillar_totals(舊格式或產出不完整),拒收"',
+     'if not isinstance(_pt, dict):\n        return d, ""',
+     "tests/test_batch_and_windows.py::test_缺少完整性欄位時必須拒收"),
 ]
 
 # 打包類的變異不能靠改字串 —— 檔案一旦已被 git 追蹤,改 .gitignore 是不會讓它消失的
@@ -90,11 +110,21 @@ GIT_MUTATIONS = [
 
 
 def run_pytest(target):
-    r = subprocess.run([PY, "-m", "pytest", target, "-q", "--no-header", "-x"],
+    """回 (是否有測試真的 failed, 是否有測試真的跑到)。
+
+    ⛔ 不可以只看 pytest 的退出碼:目標測試若被 **skip**(例如 ZIP 環境沒有 .git,
+       打包檢查會誠實跳過),退出碼一樣是 0 → 會被誤判成「變異沒被抓到」。
+       skipped 不等於通過,也不等於失敗 —— 它代表這次根本沒驗到,必須另外標示。
+    """
+    r = subprocess.run([PY, "-m", "pytest", target, "-q", "--no-header", "-x",
+                        "-p", "no:cacheprovider"],
                        cwd=REPO, capture_output=True, text=True,
                        encoding="utf-8", errors="replace",
                        env={**__import__("os").environ, "PYTHONUTF8": "1"})
-    return r.returncode
+    out = (r.stdout or "") + (r.stderr or "")
+    failed = " failed" in out or "error" in out.lower() and r.returncode != 0
+    ran = not re.search(r"\b\d+ skipped\b", out) or re.search(r"\b\d+ (passed|failed)\b", out)
+    return bool(failed), bool(ran)
 
 
 def main():
@@ -103,11 +133,12 @@ def main():
     print("=" * 66)
 
     # 先確認乾淨狀態全綠,否則後面的結果沒有意義
-    if run_pytest("tests") != 0:
+    _failed, _ = run_pytest("tests")
+    if _failed:
         print("\n✗ 乾淨狀態下測試就沒過,先修好再跑變異驗證。")
         return 1
 
-    bad = []
+    bad, skipped = [], []
     for i, (desc, fname, old, new, target) in enumerate(MUTATIONS, 1):
         p = REPO / fname
         # ⛔ 一定要用二進位讀寫:read_text/write_text 在 Windows 會做換行轉換,
@@ -121,11 +152,15 @@ def main():
             continue
         p.write_bytes(src.replace(old, new, 1).encode("utf-8"))
         try:
-            rc = run_pytest(target)
+            failed, ran = run_pytest(target)
         finally:
             p.write_bytes(raw)                        # 一定要逐位元還原
-        if rc != 0:
+        if failed:
             print(f"\n[{i}/{len(MUTATIONS)}] ✅ 抓到了:{desc}")
+        elif not ran:
+            print(f"\n[{i}/{len(MUTATIONS)}] ⏭ 無法驗證:{desc}")
+            print(f"        → {target} 在這個環境被 skip,這次沒驗到(不是通過)")
+            skipped.append(desc)
         else:
             print(f"\n[{i}/{len(MUTATIONS)}] ❌ 沒抓到:{desc}")
             print(f"        → {target} 在缺陷存在時仍然通過,這條測試是裝飾品")
@@ -141,11 +176,14 @@ def main():
             bad.append(desc)
             continue
         try:
-            rc = run_pytest(target)
+            failed, ran = run_pytest(target)
         finally:
             subprocess.run(["git", "add", "--", fname], cwd=REPO, capture_output=True)
-        if rc != 0:
+        if failed:
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ✅ 抓到了:{desc}")
+        elif not ran:
+            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}(被 skip,不是通過)")
+            skipped.append(desc)
         else:
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ 沒抓到:{desc}")
             print(f"        → {target} 在缺陷存在時仍然通過,這條測試是裝飾品")
@@ -157,7 +195,15 @@ def main():
         for b in bad:
             print(f"     · {b}")
         return 1
-    print(f"  ✅ {len(MUTATIONS) + len(GIT_MUTATIONS)} 條真實缺陷全部會被測試抓到")
+    total = len(MUTATIONS) + len(GIT_MUTATIONS)
+    if skipped:
+        # ⛔ 有沒驗到的就不可以宣稱「全部抓到」——那是把 skip 當成通過,正是這支要防的事
+        print(f"  ⚠️ {total - len(skipped)}/{total} 條抓到;另有 {len(skipped)} 條在這個環境無法驗證:")
+        for s_ in skipped:
+            print(f"     ⏭ {s_}")
+        print("     (要完整驗證請在 git clone 的目錄跑,ZIP 版沒有 .git)")
+    else:
+        print(f"  ✅ {total} 條真實缺陷全部會被測試抓到")
     # 最後再確認一次:所有檔案都還原乾淨了。
     # ⚠️ 要用 `git diff --name-only`(工作區 vs index),不是 `git status --porcelain` ——
     #    後者會把「跑之前就已經 stage 的正常修改」也一起列出來,變成誤報(自己踩過)。

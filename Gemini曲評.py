@@ -160,11 +160,29 @@ def load_keys() -> list:
             v = (d.get(name) or "").strip()
             if v:
                 keys.extend(k.strip() for k in v.split(","))
-    seen, out = set(), []
+    # ⛔ 濾掉 .env.example 的佔位字串:有人把範例檔複製成 .env 卻沒改,
+    #    這些字會被當成三把真金鑰拿去打 Google API,錯誤訊息又很難懂。
+    #    真金鑰是純 ASCII 的長字串,所以「含非 ASCII」或「太短」一律不算。
+    def _looks_placeholder(k: str) -> bool:
+        if any(ord(c) > 127 for c in k):          # 含中文 → 一定是佔位字串
+            return True
+        if len(k) < 20:                            # Google API key 遠比這長
+            return True
+        return k.lower().startswith(("your", "xxx", "todo", "<"))
+
+    seen, out, skipped = set(), [], 0
     for k in keys:
-        if k and k not in seen:
-            seen.add(k)
-            out.append(k)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        if _looks_placeholder(k):
+            skipped += 1
+            continue
+        out.append(k)
+    if skipped and not out:
+        print(f"⚠ .env 裡只有 {skipped} 個佔位字串,不是真金鑰 —— "
+              f"請把 GEMINI_API_KEYS 換成 https://aistudio.google.com/apikey 申請到的值",
+              file=sys.stderr)
     return out
 
 

@@ -168,8 +168,12 @@ if (-not (Test-Path ".env")) {
     Write-Host "  Gemini 曲評需要一把 API 金鑰(免費額度就夠用)。" -ForegroundColor White
     Write-Host "  申請:https://aistudio.google.com/apikey  ← 用 Google 帳號登入就能拿" -ForegroundColor DarkGray
     Write-Host "  沒有也能跑,但律動柱(4%)會整根缺,結構/旋律/人聲/整體/曲風各缺一項。" -ForegroundColor DarkGray
-    $key = Read-Host "  貼上金鑰後按 Enter(直接按 Enter = 跳過,之後改 .env 也行)"
-    if ($key.Trim()) {
+    # ⚠️ 非互動執行(CI、管線)時 Read-Host 會回 $null,直接 .Trim() 會拋例外
+    $key = $null
+    try { $key = Read-Host "  貼上金鑰後按 Enter(直接按 Enter = 跳過,之後改 .env 也行)" }
+    catch { Warn "沒有互動輸入,跳過金鑰" }
+    if (-not [string]::IsNullOrWhiteSpace($key)) {
+        $key = $key.Trim()
         "GEMINI_API_KEYS=$($key.Trim())" | Out-File -FilePath ".env" -Encoding utf8 -NoNewline
         Ok "金鑰已寫入 .env(這個檔被 .gitignore 擋著,不會被上傳)"
     } else {
@@ -183,12 +187,12 @@ if (-not (Test-Path ".env")) {
 # ── [9] 自我檢查:哪幾根柱子真的能用 ────────────────────────────────
 Step "自我檢查 —— 實際確認九根柱子哪些可用"
 
-$hasEnv     = Test-Path ".venv\Scripts\python.exe"
+$hasEnvExe  = Test-Path ".venv\Scripts\python.exe"
 
 # ⛔ 不自己猜 demucs 在哪 —— 問評審團.py 自己解析出來的那條路徑(唯一真理來源),
 #    再實際 import 一次確認那個 python 真的有 demucs。猜的話會跟實際跑分不一致。
 $hasDemucs = $false
-if ($hasEnv) {
+if ($hasEnvExe) {
     $env:PYTHONUTF8 = "1"
     $demucsPy = (& .venv\Scripts\python.exe -c "import 評審團 as J; print(J.DEMUCS_PY)" 2>$null | Select-Object -Last 1)
     if ($demucsPy -and (Test-Path $demucsPy)) {
@@ -196,11 +200,8 @@ if ($hasEnv) {
         $hasDemucs = ($LASTEXITCODE -eq 0)
     }
 }
-$hasMl      = Test-Path ".venv-ml\Scripts\python.exe"
-$hasSongEval= Test-Path "SongEval\eval.py"
-
-# ⛔ 不能只看 python.exe 在不在:`uv venv` 建完就有 python.exe,套件裝失敗時環境是空的,
-#    照樣會被判「完整」。一定要實際 import 關鍵套件才算數。
+# ⛔ 不能只看 python.exe 在不在:`uv venv` 建完就有 python.exe,套件裝失敗時環境是空的
+#    (實測只有 0.5MB),照樣會被判「完整」。一定要實際 import 關鍵套件才算數。
 function Test-Import($venv, $mods) {
     $py = "$venv\Scripts\python.exe"
     if (-not (Test-Path $py)) { return $false }
@@ -210,8 +211,12 @@ function Test-Import($venv, $mods) {
     }
     return $true
 }
-$hasMl  = $hasMl  -and (Test-Import ".venv-ml"       @("torch", "muq", "audiobox_aesthetics"))
+# 基礎環境也要真檢查 —— 它撐著聲學、人聲量測與報告,是最不能假的一個
+$hasEnv = Test-Import ".venv" @("librosa", "numpy", "soundfile", "pyloudnorm", "reportlab")
+$hasMl  = Test-Import ".venv-ml"       @("torch", "muq", "audiobox_aesthetics")
 $hasAud = Test-Import ".venv-audition" @("torch", "s3prl", "muq")
+# SongEval 不能只看 eval.py 在不在:它要用 .venv-ml 跑,那個環境沒裝好就等於沒有
+$hasSongEval = (Test-Path "SongEval\eval.py") -and $hasMl
 # ⛔ 正則要錨在行首(多行模式),否則 `# GEMINI_API_KEY=...` 這種註解行也會被當成有金鑰;
 #    也要排除 .env.example 的佔位字串。
 $hasKey = $false
@@ -276,8 +281,11 @@ if ($hasEnv) {
     Write-Host "`n      跑一首內建測試音(確認量測管線真的活著)..." -ForegroundColor DarkGray
     $env:PYTHONUTF8 = "1"
     $out = & .venv\Scripts\python.exe song_scorer.py demo_mix.wav 2>&1 | Out-String
-    if ($out -match "總分") { Ok "冒煙測試通過:$((($out -split "`n" | Select-String '總分') | Select-Object -First 1).Line.Trim())" }
-    else { Bad "冒煙測試沒過" "量測管線有問題,先看上面的錯誤訊息" }
+    if ($out -match "總分") { Ok "冒煙測試通過:$((($out -split "`n" | Select-String '總分') | Select-Object -First 1).Line.Trim())"; $script:SmokeOk = $true }
+    else { Bad "冒煙測試沒過" "量測管線有問題,先看上面的錯誤訊息"; $script:SmokeOk = $false }
+} else {
+    Bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"
+    $script:SmokeOk = $false
 }
 
 # ── 總結 ────────────────────────────────────────────────────────────
@@ -297,4 +305,15 @@ Write-Host @"
     詳細說明   README.md
 "@ -ForegroundColor White
 Write-Host "══════════════════════════════════════════════════`n" -ForegroundColor White
-if ($Host.Name -eq "ConsoleHost") { Read-Host "按 Enter 關閉" | Out-Null }
+if ($Host.Name -eq "ConsoleHost" -and -not $CheckOnly) {
+    try { Read-Host "按 Enter 關閉" | Out-Null } catch { }
+}
+
+# ⛔ 退出碼一定要反映結果:失敗項不為零、九柱沒齊、或冒煙測試沒過 → exit 1。
+#    否則自動化/CI/包裝層看到 exit 0 會以為裝好了(Codex 實跑遇到 10 項失敗仍回 0)。
+$failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk)
+if ($failed) {
+    Write-Host "  (退出碼 1:安裝未完全成功)" -ForegroundColor DarkGray
+    exit 1
+}
+exit 0

@@ -37,7 +37,7 @@ import numpy as np
 # ⭐ 2026-07-20:separate() 抽到 分軌快取.py,和 和聲分析.py 共用同一份 Demucs 快取
 #    (快取鍵位元組等價,舊快取照樣讀得到;兩支工具只會燒一次 GPU)。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from 分軌快取 import separate  # noqa: E402
+from 分軌快取 import separate, cache_dir_of  # noqa: E402
 
 # ── 可調門檻(啟發式起手值,非論文數據)────────────────────────────
 SILENCE_FLOOR_DBFS = -55.0   # 絕對靜音地板:低於此一律當沒發聲
@@ -225,7 +225,9 @@ def main():
         #    和聲分析.py 靠 stems_dir 讀同一份快取 → Demucs 全程只跑一次。
         #    (2026-07-20 實測踩過:沒有這兩個欄位,演唱那一整關會靜靜被跳過,
         #     畫面只寫「無人聲軌」,不會報錯,很容易以為是正常的。)
-        cache = stems_dir / f"{audio.stem}__{args.model}"
+        #    ⛔ 路徑要跟 分軌快取 拿,不可以自己拼:快取命名規則改過一次(加上來源指紋),
+        #       自己拼的那份沒跟著改 → vocal_stem 變 None,人聲柱整根靜靜消失。
+        cache = cache_dir_of(audio, stems_dir, args.model)
         out["stems_dir"] = str(cache)
         vs = cache / "vocals.flac"
         out["vocal_stem"] = str(vs) if ("vocals" in sources and vs.exists()) else None

@@ -179,13 +179,16 @@ if [ ! -f .env ]; then
   echo "  Gemini 曲評需要一把 API 金鑰(免費額度就夠用)。"
   printf "  ${C_DIM}申請:https://aistudio.google.com/apikey  ← 用 Google 帳號登入就能拿${C_OFF}\n"
   printf "  ${C_DIM}沒有也能跑,但律動柱(4%%)會整根缺,結構/旋律/人聲/整體/曲風各缺一項。${C_OFF}\n"
-  read -r -p "  貼上金鑰後按 Enter(直接按 Enter = 跳過,之後改 .env 也行):" KEY
+  # ⚠️ 非互動執行(CI、管線)時 read 會遇到 EOF 直接回非零,不可以讓它中斷安裝
+  KEY=""
+  read -r -p "  貼上金鑰後按 Enter(直接按 Enter = 跳過,之後改 .env 也行):" KEY || KEY=""
   if [ -n "${KEY// /}" ]; then
     echo "GEMINI_API_KEYS=${KEY// /}" > .env
     ok "金鑰已寫入 .env(這個檔被 .gitignore 擋著,不會被上傳)"
   else
-    cp .env.example .env 2>/dev/null || true
-    warn "跳過金鑰 → 之後編輯 .env 填入 GEMINI_API_KEYS 即可"
+    # ⛔ 不複製 .env.example(要與 Windows 版一致):裡面的「你的第一把金鑰」是佔位字串,
+    #    複製過去會被當成三把真金鑰拿去打 Google API,錯誤訊息還很難懂。
+    warn "跳過金鑰 → 之後把 .env.example 複製成 .env 並填入 GEMINI_API_KEYS 即可"
   fi
 else
   ok ".env 已存在,保留你原本的金鑰設定"
@@ -194,7 +197,7 @@ fi   # ← CHECK_ONLY 結束:上面全是「安裝」,以下是「檢查」
 
 # ── [9] 自我檢查:哪幾根柱子真的能用 ────────────────────────────────
 step "自我檢查 —— 實際確認九根柱子哪些可用"
-HAS_ENV=0;  [ -x .venv/bin/python ] && HAS_ENV=1
+# (HAS_ENV 在下面用真 import 判定,不是只看直譯器在不在)
 # ⛔ 不能只看 python 在不在:`uv venv` 建完就有直譯器,套件裝失敗時環境是空的,
 #    照樣會被判「完整」。一定要實際 import 關鍵套件才算數。
 test_import() {   # $1=venv $2...=模組名
@@ -203,6 +206,8 @@ test_import() {   # $1=venv $2...=模組名
   for m in "$@"; do "$py" -c "import $m" >/dev/null 2>&1 || return 1; done
   return 0
 }
+# 基礎環境也要真檢查 —— 它撐著聲學、人聲量測與報告,最不能假
+HAS_ENV=0;  test_import .venv librosa numpy soundfile pyloudnorm reportlab && HAS_ENV=1
 HAS_ML=0;   test_import .venv-ml torch muq audiobox_aesthetics && HAS_ML=1
 HAS_SE=0;   [ -f SongEval/eval.py ] && [ "$HAS_ML" = 1 ] && HAS_SE=1
 HAS_AUD=0;  test_import .venv-audition torch s3prl muq && HAS_AUD=1
@@ -270,11 +275,17 @@ else
 fi
 
 # ── 冒煙測試 ────────────────────────────────────────────────────────
+SMOKE_OK=0
 if [ "$HAS_ENV" = 1 ]; then
   printf "\n      ${C_DIM}跑一首內建測試音(確認量測管線真的活著)...${C_OFF}\n"
   OUT=$(PYTHONUTF8=1 .venv/bin/python song_scorer.py demo_mix.wav 2>&1)
-  if echo "$OUT" | grep -q "總分"; then ok "冒煙測試通過:$(echo "$OUT" | grep '總分' | head -n1 | tr -s ' ')"
-  else bad "冒煙測試沒過" "量測管線有問題,先看上面的錯誤訊息"; fi
+  if echo "$OUT" | grep -q "總分"; then
+    ok "冒煙測試通過:$(echo "$OUT" | grep '總分' | head -n1 | tr -s ' ')"; SMOKE_OK=1
+  else
+    bad "冒煙測試沒過" "量測管線有問題,先看上面的錯誤訊息"
+  fi
+else
+  bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"
 fi
 
 # ── 總結 ────────────────────────────────────────────────────────────
@@ -294,3 +305,11 @@ cat <<'USAGE'
     詳細說明   README.md
 ══════════════════════════════════════════════════
 USAGE
+
+# ⛔ 退出碼一定要反映結果:失敗項不為零、九柱沒齊、或冒煙測試沒過 → exit 1。
+#    否則自動化/CI/包裝層看到 exit 0 會以為裝好了。
+if [ "${#PROBLEMS[@]}" -gt 0 ] || [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ] || [ "$SMOKE_OK" != 1 ]; then
+  printf "${C_DIM}  (退出碼 1:安裝未完全成功)${C_OFF}\n"
+  exit 1
+fi
+exit 0

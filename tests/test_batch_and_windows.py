@@ -11,7 +11,7 @@ import json
 import subprocess
 import types
 import pytest
-from conftest import load
+from conftest import load, REPO
 
 J = load("評審團")
 B = load("批次評測")
@@ -88,6 +88,30 @@ def test_成功時正常回傳(monkeypatch, tmp_path):
     _stub_run(monkeypatch, returncode=0, write_json=完整JSON)
     d, err = B.run_one(song)
     assert err == "" and d["pillar_totals"]["曲側合成"] == 70.0
+
+
+def test_缺少完整性欄位時必須拒收(monkeypatch, tmp_path):
+    """🔴 fail-closed:舊格式、半殘 JSON、異常子程序產出 —— 沒有 pillar_totals.完整評測
+    就是**無法確認**,必須拒收。舊寫法 `if _pt and not _pt.get(...)` 反而讓這種最該擋的
+    情況直接放行進批次表(fail-open)。"""
+    song = tmp_path / "song.wav"; song.write_bytes(b"x")
+    for 壞資料 in ({}, {"pillar_totals": {}}, {"pillar_totals": {"完整評測": "yes"}}):
+        _stub_run(monkeypatch, returncode=0, write_json=壞資料)
+        d, err = B.run_one(song)
+        assert d is None, f"🔴 放行了無法確認完整性的結果:{壞資料}"
+        assert err
+
+
+def test_不同路徑的同名歌不可以共用結果鍵(tmp_path):
+    """🔴 批次歌單可以引用不同資料夾:a/song.wav 與 b/song.wav 都叫 song.wav。
+    用檔名當結果鍵的話,第二首會被當成「已有結果」直接跳過 —— 整首歌靜靜漏評。"""
+    import 批次評測 as _B
+    a = tmp_path / "a" / "song.wav"; b = tmp_path / "b" / "song.wav"
+    for p in (a, b):
+        p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b"x")
+    src = (REPO / "批次評測.py").read_text(encoding="utf-8")
+    assert "key = song.name" not in src, "🔴 結果鍵還在用檔名 → 同名不同路徑會撞在一起"
+    assert "song.resolve()" in src, "結果鍵應該用正規化後的絕對路徑"
 
 
 def test_不完整評測不可以進批次表(monkeypatch, tmp_path):

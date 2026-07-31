@@ -29,6 +29,7 @@
 import hashlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -44,27 +45,42 @@ import numpy as np
 def _source_ident(p: Path) -> dict:
     """算音檔身分指紋 —— 給分軌快取驗「這份快取真的是這首歌的嗎」。
 
-    用「檔案大小 + 頭尾各 1MB 的 sha256」而不是整檔雜湊:整檔對幾百 MB 的歌太慢,
-    頭尾+大小已足以擋掉「同名不同曲」與「同名檔被換成新版」這兩種真實情境。
+    **整檔串流 SHA-256**。
+    ⛔ 曾經為了省時間只雜湊「大小 + 頭尾各 1MB」,結果 3MB 以上的檔案**中段改動測不出來**
+       —— 兩首大小相同、頭尾相同、只有中間不一樣的歌會共用同一份分軌,分數全錯還不報錯。
+       實測:整檔雜湊 3.3MB 只要 0.014 秒,而 Demucs 分軌同一首要幾十秒 → 成本可忽略,
+       沒有任何理由為了這點時間換來一個會靜默算錯分的快取。
     ⛔ 不用 mtime:複製/下載會讓它改變,會無謂地讓正確的快取失效。
     """
     st = p.stat()
     h = hashlib.sha256()
     h.update(str(st.st_size).encode())
-    CHUNK = 1024 * 1024
     with open(p, "rb") as f:
-        h.update(f.read(CHUNK))
-        if st.st_size > CHUNK * 2:
-            f.seek(-CHUNK, os.SEEK_END)
-            h.update(f.read(CHUNK))
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
     return {"name": p.name, "size": st.st_size, "fingerprint": h.hexdigest()}
+
+
+def cache_dir_of(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
+    """這首歌在這個模型下的快取資料夾實際位置。
+
+    ⛔ 呼叫端**不可以自己重組這個路徑** —— 編曲層次.py 曾經自己拼
+       `{stem}__{model}`,結果快取命名一改(加上指紋)就對不上,
+       vocal_stem 變成 None → 人聲柱整根靜靜消失。規則只能有一份。
+    """
+    fp8 = _source_ident(audio_path)["fingerprint"][:8]
+    newp = stems_dir / f"{audio_path.stem}__{model_name}__{fp8}"
+    if newp.is_dir():
+        return newp
+    legacy = stems_dir / f"{audio_path.stem}__{model_name}"   # 舊版共用名(向下相容)
+    return legacy if legacy.is_dir() else newp
 
 
 def separate(audio_path: Path, stems_dir: Path, model_name: str):
     """用 demucs 分軌;已有快取就直接讀。回 (dict[stem]=波形, sr, sources順序, from_cache)。
 
     波形 shape 為 (channels, samples) 的 float32 numpy。
-    ⚠️ 這個函式的行為與快取路徑必須跟 2026-07-19 版 編曲層次.py 完全一致。
+    分軌檔放在 cache_dir_of() 指的資料夾;要拿路徑請呼叫它,不要自己拼。
     """
     import torch
     import torchaudio
@@ -78,31 +94,39 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
 
     # ⛔ 快取鍵不可以只有「檔名+模型名」:不同資料夾的兩首 song.mp3、或同名檔被換成新版,
     #    會直接讀到另一首歌的分軌 —— 人聲/和聲/編曲全部算錯而且不會報錯。
-    #    這裡在資料夾旁放一份 _source.json 記下來源身分,命中時先驗身分。
+    #
+    # 現行做法:**資料夾名從一開始就帶指紋**,而不是「先用共用名、撞到才換」。
+    #   ⛔ 舊版是後者,併發時會出事:兩首同名不同曲同時首跑,雙方都看到「快取不存在」,
+    #      於是都選了同一個共用資料夾,分軌檔互相覆寫、_source.json 只符合其中一首。
+    #      名字一開始就不同,就沒有這個競賽條件。
     ident = _source_ident(audio_path)
-    cache = stems_dir / f"{audio_path.stem}__{model_name}"
+    fp8 = ident["fingerprint"][:8]
+    cache = stems_dir / f"{audio_path.stem}__{model_name}__{fp8}"
     side = cache / "_source.json"
     have_all = cache.is_dir() and all((cache / f"{s}.flac").exists() for s in sources)
 
-    if have_all:
-        if side.exists():
-            try:
-                rec = json.loads(side.read_text(encoding="utf-8"))
-            except Exception:
-                rec = {}
-            if rec.get("fingerprint") != ident["fingerprint"]:
-                # 撞名了 → 這份快取不是這首歌的。改用帶指紋的資料夾,兩首各自有快取。
-                cache = stems_dir / f"{audio_path.stem}__{model_name}__{ident['fingerprint'][:8]}"
-                side = cache / "_source.json"
-                have_all = cache.is_dir() and all((cache / f"{s}.flac").exists() for s in sources)
-        else:
-            # 舊版留下來的快取沒有身分紀錄。沿用(不強迫使用者重跑數小時的 Demucs),
-            # 但補寫身分並提醒一次 —— 之後再撞名就驗得出來了。
-            print(f"      ⚠ 舊版快取沒有來源紀錄,已補寫身分:{cache.name}", flush=True)
-            try:
-                side.write_text(json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
-            except Exception:
-                pass
+    if not have_all:
+        # 相容舊版留下的共用名資料夾(她本機有 7.4GB,不強迫重跑數小時的 Demucs)。
+        # 有身分紀錄就驗;沒有(更舊的版本)就沿用並補寫,提醒一次。
+        legacy = stems_dir / f"{audio_path.stem}__{model_name}"
+        if legacy.is_dir() and all((legacy / f"{s}.flac").exists() for s in sources):
+            rec = {}
+            lside = legacy / "_source.json"
+            if lside.exists():
+                try:
+                    rec = json.loads(lside.read_text(encoding="utf-8"))
+                except Exception:
+                    rec = {}
+            if not lside.exists():
+                print(f"      ⚠ 舊版快取沒有來源紀錄,沿用並補寫身分:{legacy.name}", flush=True)
+                try:
+                    lside.write_text(json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
+                except Exception:
+                    pass
+                cache, side, have_all = legacy, lside, True
+            elif rec.get("fingerprint") == ident["fingerprint"]:
+                cache, side, have_all = legacy, lside, True
+            # 指紋不符 → 那份是別首歌的,維持用帶指紋的新資料夾(have_all 仍為 False)
 
     if have_all:
         stems = {}
@@ -120,14 +144,30 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
         est = apply_model(model, wav[None].to(device), device=device, split=True, overlap=0.25)[0]
     est = est * ref.std() + ref.mean()
 
-    cache.mkdir(parents=True, exist_ok=True)
-    cache.joinpath("_source.json").write_text(
-        json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
+    # ── 原子發佈:先寫進本程序專屬的暫存夾,全部寫完才改名成正式快取 ──────────
+    # ⛔ 不可以直接往正式資料夾邊算邊寫:同一首歌被兩個程序同時跑時(批次 + 手動、
+    #    或評審團同時要編曲與和聲),讀取端會看到「檔案數量夠了但內容還沒寫完」的半成品。
+    #    改名在同一個檔案系統上是原子操作 → 讀取端只會看到「還沒有」或「完整的」。
+    tmp = stems_dir / f".tmp_{cache.name}_{os.getpid()}"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
     stems = {}
-    for i, s in enumerate(sources):
-        arr = est[i].cpu()
-        torchaudio.save(str(cache / f"{s}.flac"), arr, sr)
-        stems[s] = arr.numpy()
+    try:
+        for i, s in enumerate(sources):
+            arr = est[i].cpu()
+            torchaudio.save(str(tmp / f"{s}.flac"), arr, sr)
+            stems[s] = arr.numpy()
+        tmp.joinpath("_source.json").write_text(
+            json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
+        try:
+            os.replace(tmp, cache)          # 原子發佈
+        except OSError:
+            # 目標已存在 = 另一個程序先發佈了同一首歌(資料夾名含指紋,所以內容等價)
+            shutil.rmtree(tmp, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)   # 中途炸掉不留半成品
+        raise
     return stems, sr, sources, False
 
 

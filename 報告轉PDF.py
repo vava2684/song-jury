@@ -18,12 +18,65 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-def _register_cjk_fonts():
-    """跨平台註冊中文字型(取代寫死的 Windows 微軟正黑)。
-    順序:repo assets/ 內的 Noto Sans TC → 系統既有 CJK 字型(Win 微軟正黑 / mac 蘋方 / Linux Noto)。
+def _missing_glyphs(path: Path, idx, chars) -> set:
+    """這個字型檔缺了 chars 裡的哪些字。回傳缺字集合(空集合=全有)。
+
+    ⛔ 不可以只看檔案存在,也不可以只驗幾個樣本字 —— 兩邊都踩過:
+       · Windows 微軟正黑(msjh.ttc)**一個韓文字形都沒有** → 韓文整行變 □□□□
+       · 改用 Malgun Gothic 之後韓文好了,但它**沒有完整繁體字**
+         →「敘事結構」變成「事結構」、「概念論」變成「念論」,一樣是靜默缺字
+       所以要拿**報告裡實際出現的每一個字**去驗,而不是幾個代表字。
+    """
+    try:
+        f = TTFont("_probe", str(path), subfontIndex=idx) if idx is not None else TTFont("_probe", str(path))
+        cmap = f.face.charToGlyph
+        return {c for c in chars if cmap.get(ord(c), 0) == 0}
+    except Exception:
+        return set(chars)
+
+
+def _register_cjk_fonts(sample_text: str = ""):
+    """跨平台註冊 CJK 字型,並**依報告實際內容挑得動那些字的字型**。
+
+    順序:repo assets/ 的 Noto → 系統字型。
+    ⚠️ 韓文特別處理:繁中系統的預設 CJK 字型(微軟正黑/蘋方繁中)多半沒有諺文字形,
+       所以報告若含韓文,要優先選 Malgun Gothic / Noto Sans KR 這類涵蓋諺文的字型。
     .ttc 需 subfontIndex,.otf/.ttf 不用。找不到粗體→用一般體頂替;全找不到→給安裝指示。"""
     here = Path(__file__).parent
+    # ⭐ 拿**報告裡實際出現的每一個 CJK/諺文字**去挑字型,而不是幾個代表字。
+    #    只驗樣本會挑到「樣本有、正文缺」的字型,結果是靜默缺字(最糟的失敗方式)。
+    #    ⚠️ 只收「真的要用 CJK 字型畫」的字:漢字、假名、諺文、全形。
+    #       emoji(🎤✍️…)不能算 —— 沒有任何 CJK 字型有它們,算進去會每份報告都誤報缺字。
+    def _needs_cjk_font(ch):
+        o = ord(ch)
+        return (0x3040 <= o <= 0x30FF        # 平假名/片假名
+                or 0x3400 <= o <= 0x4DBF     # CJK 擴充 A
+                or 0x4E00 <= o <= 0x9FFF     # CJK 統一漢字
+                or 0xAC00 <= o <= 0xD7A3     # 諺文音節
+                or 0x1100 <= o <= 0x11FF     # 諺文字母
+                or 0x3130 <= o <= 0x318F     # 諺文相容字母
+                or 0xF900 <= o <= 0xFAFF)    # CJK 相容漢字
+    # ⭐ 主字型只用「非諺文」的字去挑 —— 諺文交給另外註冊的韓文字型,段落內用 <font> 切換。
+    #    ⛔ 不可以硬要一個字型全包:實測掃過 Windows 全部字型,**沒有任何一個同時涵蓋繁中與
+    #       諺文**;硬選 Malgun 的話韓文好了但繁體字反過來缺(敘/概/獎/真…)。
+    #       (Noto Sans CJK 有全涵蓋,但它是 CFF 輪廓,reportlab 明確不支援。)
+    def _is_hangul(ch):
+        return "가" <= ch <= "힣" or "ᄀ" <= ch <= "ᇿ" or "㄰" <= ch <= "㆏"
+    need = {c for c in (sample_text or "評分") if _needs_cjk_font(c) and not _is_hangul(c)}
+    if not need:
+        need = set("評分")
+    has_hangul = any("\uac00" <= c <= "\ud7a3" for c in sample_text)
+
+    kr_reg = [(Path("C:/Windows/Fonts/malgun.ttf"), None),                     # Windows Malgun Gothic
+              (Path("/System/Library/Fonts/AppleSDGothicNeo.ttc"), 0),         # macOS
+              (Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"), 0)]
+    kr_bold = [(Path("C:/Windows/Fonts/malgunbd.ttf"), None),
+               (Path("/System/Library/Fonts/AppleSDGothicNeo.ttc"), 0),
+               (Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"), 0)]
+
     reg_cands = [
+        # 安裝腳本抓的全 CJK 字型(中日韓全涵蓋)—— .ttc 內含多個子字型,逐一試
+        *[(here / "assets" / "NotoSansCJK-Regular.ttc", i) for i in range(6)],
         (here / "assets" / "NotoSansTC-Regular.otf", None), (here / "assets" / "NotoSansTC-Regular.ttf", None),
         (here / "assets" / "NotoSansCJKtc-Regular.otf", None),
         (Path("C:/Windows/Fonts/msjh.ttc"), 0),                                # Windows 微軟正黑
@@ -33,6 +86,7 @@ def _register_cjk_fonts():
         (Path("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"), 0),
     ]
     bold_cands = [
+        *[(here / "assets" / "NotoSansCJK-Bold.ttc", i) for i in range(6)],
         (here / "assets" / "NotoSansTC-Bold.otf", None), (here / "assets" / "NotoSansTC-Bold.ttf", None),
         (Path("C:/Windows/Fonts/msjhbd.ttc"), 0),
         (Path("/System/Library/Fonts/PingFang.ttc"), 0),
@@ -40,27 +94,73 @@ def _register_cjk_fonts():
         (Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"), 0),
         (Path("/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc"), 0),
     ]
-    def _first(cands):
+
+    def _first(cands, chars):
+        """挑「缺字最少」的字型。全涵蓋就直接用;沒有全涵蓋的就挑最好的並回報缺字。
+        ⛔ 不可以「第一個能載入的就用」—— 那正是韓文變方塊、以及換成 Malgun 之後
+           繁體字反過來缺掉的原因。"""
+        best = (None, None, None)          # (path, idx, missing)
         for p, idx in cands:
             try:
-                if p.exists():
-                    return p, idx
+                if not p.exists():
+                    continue
+                miss = _missing_glyphs(p, idx, chars)
+                if not miss:
+                    return p, idx, set()
+                if best[2] is None or len(miss) < len(best[2]):
+                    best = (p, idx, miss)
             except Exception:
                 continue
-        return None, None
+        return best
+
     def _reg(name, p, idx):
+        # ⚠️ reportlab 對「已註冊過的同名字型」會直接忽略,不會覆蓋(實測)。
+        #    所以韓文那次要註冊成**不同的名字**,再把樣式的 fontName 換過去。
         pdfmetrics.registerFont(TTFont(name, str(p), subfontIndex=idx) if idx is not None else TTFont(name, str(p)))
-    rp, ri = _first(reg_cands)
+
+    reg_name, bold_name = "JhengHei", "JhengHeiBd"
+
+    # 韓文字型另外註冊一個名字,段落內用 <font name="Hangul"> 切換過去。
+    # ⚠️ reportlab 沒有段落內自動字型 fallback,所以要自己在標記層切。
+    if has_hangul and "Hangul" not in pdfmetrics.getRegisteredFontNames():
+        kp, ki, kmiss = _first(kr_reg, {c for c in sample_text if _is_hangul(c)})
+        if kp:
+            pdfmetrics.registerFont(TTFont("Hangul", str(kp), subfontIndex=ki)
+                                    if ki is not None else TTFont("Hangul", str(kp)))
+            if kmiss:
+                print(f"⚠ 韓文字型缺 {len(kmiss)} 個諺文字形", file=sys.stderr)
+        else:
+            print("⚠ 找不到含諺文字形的字型,韓文會顯示成方塊。"
+                  "Windows 需要 Malgun Gothic;Linux 請 `apt install fonts-noto-cjk`。",
+                  file=sys.stderr)
+
+    rp, ri, miss = _first(reg_cands, need)
     if not rp:
-        raise SystemExit("找不到中文字型。Windows/macOS 通常內建;Linux 請 `apt install fonts-noto-cjk`,"
+        raise SystemExit("找不到可用的 CJK 字型。Windows/macOS 通常內建;"
+                         "Linux 請 `apt install fonts-noto-cjk`,"
                          "或把 NotoSansTC-Regular.otf(可加 -Bold)放進 assets/。")
-    _reg("JhengHei", rp, ri)
-    bp, bi = _first(bold_cands)
+    if miss:
+        # ⛔ 缺字一定要講出來 —— 靜默缺字是最糟的失敗方式:PDF 看起來正常,
+        #    但「敘事結構」少一個字變「事結構」,讀報告的人根本不會發現。
+        show = "".join(sorted(miss))[:40]
+        print(f"⚠ 目前選到的字型缺 {len(miss)} 個字形,PDF 會缺字:{show}"
+              f"{'…' if len(miss) > 40 else ''}\n"
+              f"  → 多語(尤其中文+韓文同頁)請裝涵蓋 CJK 全區的字型:\n"
+              f"    Linux: apt install fonts-noto-cjk / "
+              f"其他:把 NotoSansCJK-Regular.ttc 放進 assets/", file=sys.stderr)
+    if reg_name not in pdfmetrics.getRegisteredFontNames():
+        _reg(reg_name, rp, ri)
+    bp, bi, _ = _first(bold_cands, need)
     if not bp:
         bp, bi = rp, ri   # 沒粗體 → 用一般體頂替
-    _reg("JhengHeiBd", bp, bi)
+    if bold_name not in pdfmetrics.getRegisteredFontNames():
+        _reg(bold_name, bp, bi)
+    return reg_name, bold_name
 
 
+# 先用預設(中文)註冊一次,讓下面的 ParagraphStyle 建得起來;
+# main() 讀到報告內容後會**再註冊一次**,依實際文字挑對的字型(例如韓文報告換成 Malgun)。
+# reportlab 允許同名重註冊,後者覆蓋前者。
 _register_cjk_fonts()
 
 S_TITLE = ParagraphStyle("t", fontName="JhengHeiBd", fontSize=16, leading=22, spaceAfter=4, alignment=1)
@@ -83,6 +183,12 @@ S_FOOT = ParagraphStyle("f", fontName="JhengHei", fontSize=7.5, leading=11, text
 EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF☀-⛿✀-➿⬀-⯿️‍]")
 
+# 連續的諺文(含中間的空白)——整段換成韓文字型,免得一個字包一次標記
+HANGUL_RUN_RE = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]"
+                           r"[가-힣ᄀ-ᇿ㄰-㆏\s]*"
+                           r"[가-힣ᄀ-ᇿ㄰-㆏]"
+                           r"|[가-힣ᄀ-ᇿ㄰-㆏]")
+
 
 def md_inline(s):
     s = s.replace("✅", "(通過)").replace("❌", "(未過)")
@@ -92,6 +198,11 @@ def md_inline(s):
     s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
     s = re.sub(r"`(.+?)`", r"\1", s)
+    # ⭐ 諺文段落換成韓文字型 —— reportlab 沒有段落內自動 fallback,要自己在標記層切。
+    #    不切的話:主字型(微軟正黑/蘋方繁中)一個諺文字形都沒有 → 韓文整行變 □□□□;
+    #    但把主字型換成 Malgun 又會害繁體字缺(敘/概/獎/真…),所以只能逐段切換。
+    if "Hangul" in pdfmetrics.getRegisteredFontNames():
+        s = HANGUL_RUN_RE.sub(r'<font name="Hangul">\g<0></font>', s)
     return s
 
 
@@ -120,7 +231,17 @@ CANON_FOOTER_2 = "本報告為診斷性評審,供創作與製作決策參考;最
 
 def main():
     src = Path(sys.argv[1]).resolve()
-    lines = src.read_text(encoding="utf-8").splitlines()
+    text = src.read_text(encoding="utf-8")
+    # ⚠️ 字型要在**看過報告內容之後**才決定 —— 韓文報告需要有諺文字形的字型,
+    #    在 import 時就鎖死會讓韓文整行變成方塊(繁中系統的預設字型一個諺文字形都沒有)。
+    #    ⚠️ 落款是**程式自己生成的**,不在 .md 裡 —— 不一起算進去的話,
+    #       它那一整段中文會靜靜缺字(實測:「概念論」變「念論」)。
+    _reg_name, _bold_name = _register_cjk_fonts(text + CANON_FOOTER_1 + CANON_FOOTER_2)
+    if _reg_name != "JhengHei":          # 韓文 → 把所有樣式改綁到有諺文的那套
+        for _st in (S_TITLE, S_SUB, S_META, S_HEAD, S_HEAD3, S_QUOTE,
+                    S_BODY, S_CELL, S_CELL_B, S_FOOT):
+            _st.fontName = _bold_name if _st.fontName.endswith("Bd") else _reg_name
+    lines = text.splitlines()
     out = src.with_suffix(".pdf")
 
     story = []

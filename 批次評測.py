@@ -86,9 +86,17 @@ def run_one(song: Path, timeout=3600):
     if not out_json.exists():
         return None, (r.stderr or r.stdout or "")[-300:]
     d = json.loads(out_json.read_text(encoding="utf-8"))
-    # ⛔ 缺柱的結果不可以進批次表 —— 那是另一把尺,拿去算鑑別力會得到假結論
-    _pt = d.get("pillar_totals") or {}
-    if _pt and not _pt.get("完整評測", True):
+    # ⛔ 缺柱的結果不可以進批次表 —— 那是另一把尺,拿去算鑑別力會得到假結論。
+    #    這裡必須 **fail-closed**:欄位不存在、型別不對,一律拒收。
+    #    舊寫法是 `if _pt and not _pt.get("完整評測", True)` —— 完全沒有 pillar_totals 的
+    #    舊格式或半殘 JSON 反而會被放行進表(fail-open),等於最該擋的情況擋不住。
+    _pt = d.get("pillar_totals")
+    if not isinstance(_pt, dict):
+        return None, "結果缺少 pillar_totals(舊格式或產出不完整),拒收"
+    _ok = _pt.get("完整評測")
+    if not isinstance(_ok, bool):
+        return None, "結果的『完整評測』欄位缺失或型別不對,拒收"
+    if not _ok:
         return None, f"不完整評測,缺柱:{'、'.join(_pt.get('缺柱') or [])}(補齊安裝後重跑)"
     return d, ""
 
@@ -203,21 +211,25 @@ def main():
         results = json.loads(store.read_text(encoding="utf-8"))
 
     for i, (song, label) in enumerate(songs, 1):
-        key = song.name
+        # ⛔ 結果鍵不可以只用檔名:歌單可以引用不同資料夾,a/song.wav 與 b/song.wav
+        #    會撞在一起 —— 第二首被當成「已有結果」直接跳過,整首歌靜靜漏評。
+        #    用正規化後的絕對路徑當鍵,顯示名另外存。
+        key = str(song.resolve()).replace("\\", "/")
         if key in results:
-            print(f"[{i}/{len(songs)}] {key} — 已有結果,跳過")
+            print(f"[{i}/{len(songs)}] {song.name} — 已有結果,跳過")
         else:
             t0 = time.time()
-            print(f"[{i}/{len(songs)}] {key} … ", end="", flush=True)
+            print(f"[{i}/{len(songs)}] {song.name} … ", end="", flush=True)
             try:
                 m, err = run_one(song)
             except subprocess.TimeoutExpired:
                 m, err = None, "逾時"
             if m is None:
                 print(f"✗ {err[:70]}")
-                results[key] = {"error": err, "label": label}
+                results[key] = {"error": err, "label": label, "_name": song.name}
             else:
                 m["_label"] = label
+                m["_name"] = song.name          # 顯示名(鍵是路徑,不能拿來當標題)
                 results[key] = m
                 print(f"✓ {time.time()-t0:.0f}s")
             store.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")

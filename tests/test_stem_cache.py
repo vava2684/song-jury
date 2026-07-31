@@ -37,14 +37,20 @@ def test_同曲換路徑指紋不變(tmp_path):
     assert C._source_ident(a)["fingerprint"] == C._source_ident(b)["fingerprint"]
 
 
-def test_只改中段內容也要測得出來(tmp_path):
-    """指紋取頭尾各 1MB + 大小;小檔案(<2MB)會整份讀入,所以中段改動也抓得到。"""
+def test_大檔只改中段也要測得出來(tmp_path):
+    """🔴 這條原本是**裝飾品**:名字說驗中段,測資卻只有 200KB ——
+    舊版指紋取「大小 + 頭尾各 1MB」,200KB 整份都落在頭部取樣範圍內,
+    等於根本沒測到中段。用 3MB 才驗得到真實大音檔的情境(Codex 抓到的)。
+    現在指紋是整檔 SHA-256,任何一個位元組變動都測得出來。"""
     a = tmp_path / "song.wav"
-    _mk(a, b"ABCD")
+    _mk(a, b"ABCD", size=3 * 1024 * 1024)          # 3MB:頭 1MB + 中 1MB + 尾 1MB
     f1 = C._source_ident(a)["fingerprint"]
-    data = bytearray(a.read_bytes()); data[1000:1010] = b"\x00" * 10
+    data = bytearray(a.read_bytes())
+    mid = len(data) // 2                            # 正中央,離頭尾各 1.5MB
+    data[mid:mid + 10] = b"\x00" * 10
     a.write_bytes(bytes(data))
-    assert C._source_ident(a)["fingerprint"] != f1
+    assert C._source_ident(a)["fingerprint"] != f1, \
+        "🔴 大檔中段改動測不出來 → 兩首大小相同、頭尾相同的歌會共用分軌,分數全錯"
 
 
 class _T:
@@ -127,6 +133,32 @@ def test_同一首歌第二次會命中快取(monkeypatch, tmp_path):
     _mk(a, b"AAAA")
     assert C.separate(a, stems, "htdemucs_6s")[3] is False
     assert C.separate(a, stems, "htdemucs_6s")[3] is True
+
+
+def test_呼叫端不可以自己拼快取路徑():
+    """🔴 真實迴歸:編曲層次.py 自己寫死 `{stem}__{model}` 拼快取路徑,
+    我把快取命名加上來源指紋之後,它那份沒跟著改 → vocal_stem 變 None,
+    **人聲柱整根靜靜消失**(15.2% 權重),而且不會報錯。
+
+    規則只能有一份:路徑一律跟 分軌快取.cache_dir_of() 拿。"""
+    import re as _re
+    for f in ("編曲層次.py", "和聲分析.py", "伴奏混音.py"):
+        src = (REPO / f).read_text(encoding="utf-8")
+        # 找「自己用 stem + model 拼資料夾名」的字樣
+        bad = _re.findall(r'stems_dir\s*/\s*f?"[^"]*__\{[^"]*\}', src)
+        assert not bad, f"{f} 自己拼了快取路徑 {bad} —— 請改用 cache_dir_of()"
+
+
+def test_cache_dir_of與separate指到同一個位置(monkeypatch, tmp_path):
+    """交接契約:下游拿 vocal_stem 要拿得到真的檔案。"""
+    _fake_torch(monkeypatch)
+    stems = tmp_path / "_stems"
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    C.separate(a, stems, "htdemucs_6s")
+    d = C.cache_dir_of(a, stems, "htdemucs_6s")
+    assert d.is_dir(), "cache_dir_of 指到的資料夾不存在"
+    assert (d / "vocals.flac").exists(), "下游要的 vocals.flac 不在 cache_dir_of 指的地方"
 
 
 def test_快取夾會寫下來源身分(monkeypatch, tmp_path):
