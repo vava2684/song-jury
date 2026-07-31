@@ -227,43 +227,69 @@ def _state_lock(timeout=10.0):
             lockf.unlink(missing_ok=True)
 
 
-def save_state(state: dict):
-    """冷卻狀態寫本機小檔(已列入 .gitignore)。寫不進去不算致命 —— 大不了下次再撞一次死金鑰。
+def _locked_update(mutator):
+    """在跨程序鎖內「重讀 → mutator 改 → 原子換上」。回是否真的寫成了。
 
-    ⚠️ 一律「鎖內重讀 → 合併 → 原子換上」,不可以直接覆寫(見 _state_lock 的說明)。
-    合併規則:同一把金鑰取**較晚到期**的冷卻(比較保守,寧可多冷卻也不要誤放行)。
+    ⛔ 兩條 Codex 抓到的鐵則:
+       (a) **沒拿到鎖就不准寫** —— 舊版 save_state 忽略鎖的取得結果,等 10 秒
+           拿不到就照樣無鎖讀改寫,lost update 從正門回來。
+       (b) 「合併」表達不了「刪除」—— 成功後 state.pop(fp) 再存,merge 會把磁碟上
+           舊的 fp 又保留下來,實測冷卻永遠清不掉。所以刪除要有自己的原語,
+           mutator 直接在**鎖內最新狀態**上操作,要刪就真的刪。
     """
     try:
-        with _state_lock():
-            cur = {}
+        with _state_lock() as acquired:
+            if not acquired:
+                return False          # 沒鎖就跳過保存,絕不無鎖寫入
             try:
                 cur = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                if not isinstance(cur, dict):
+                    cur = {}
             except Exception:
                 cur = {}
-            merged = dict(cur)
-            for k, v in (state or {}).items():
-                old = merged.get(k)
-                if isinstance(old, dict) and isinstance(v, dict):
-                    # 欄位名以 cool_down() 實際寫的為準(cooldown_until,不是 until)
-                    _n = float(v.get("cooldown_until", 0) or 0)
-                    _o = float(old.get("cooldown_until", 0) or 0)
-                    merged[k] = v if _n >= _o else old
-                else:
-                    merged[k] = v
+            mutator(cur)
             tmp = STATE_FILE.with_suffix(f".json.tmp{os.getpid()}")
-            tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=1), encoding="utf-8")
             os.replace(tmp, STATE_FILE)
+            return True
     except Exception:
-        pass
+        return False
+
+
+def merge_cooldown(fp: str, record: dict):
+    """寫入/更新一把金鑰的冷卻。同一把取**較晚到期**的(寧可多冷卻,不誤放行)。"""
+    def _m(cur):
+        old = cur.get(fp)
+        if isinstance(old, dict):
+            _n = float(record.get("cooldown_until", 0) or 0)
+            _o = float(old.get("cooldown_until", 0) or 0)
+            if _o > _n:
+                return                 # 磁碟上那筆比較晚到期 → 保留它
+        cur[fp] = record
+    _locked_update(_m)
+
+
+def delete_cooldown(fp: str):
+    """金鑰確認是好的 → 把它的冷卻從磁碟上真的刪掉(merge 表達不了刪除)。"""
+    _locked_update(lambda cur: cur.pop(fp, None))
+
+
+def save_state(state: dict):
+    """(相容舊介面)把 state 裡的每一筆冷卻合併進磁碟。刪除請用 delete_cooldown。"""
+    for k, v in (state or {}).items():
+        if isinstance(v, dict):
+            merge_cooldown(k, v)
 
 
 def cool_down(state: dict, key: str, seconds: float, reason: str):
-    state[_fingerprint(key)] = {
+    fp = _fingerprint(key)
+    rec = {
         "cooldown_until": time.time() + seconds,
         "reason": reason,
         "marked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    save_state(state)
+    state[fp] = rec
+    merge_cooldown(fp, rec)
 
 
 def is_cooling(state: dict, key: str):
@@ -565,9 +591,11 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
                 meta["attempts"].append({"key": fp, "attempt": attempt + 1, "result": "ok"})
                 meta["key_used"] = fp
                 # 這把是好的 → 清掉它可能殘留的舊冷卻記錄
+                # ⛔ 要用 delete_cooldown:save_state 走「合併」,磁碟上的舊冷卻
+                #    不會因為記憶體 dict 少了它而被刪掉(Codex 實測清不掉)。
                 if fp in state:
                     state.pop(fp, None)
-                    save_state(state)
+                delete_cooldown(fp)
                 return txt, meta
 
             if r.status_code == 429:

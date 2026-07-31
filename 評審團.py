@@ -11,6 +11,7 @@
 輸出: 歌名_評審團.json + 主控台摘要
 """
 import json
+import math
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 import urllib.request
 from pathlib import Path
 
@@ -159,7 +161,10 @@ def build_pillar_items(physical, harmony, arrangement, gemini, songeval, audiobo
     _hm = ((harmony or {}).get("metrics") or {})
     _gd = ((gemini or {}).get("dimensions") or {})
     _gt = _g(gemini, "gemini_reported_total", "raw_0to10")
-    _se = {k: (v * 20.0) for k, v in (songeval or {}).items()}   # 1-5 → 0-100
+    # 1-5 → 0-100。⛔ 只換算真的數字:SongEval 版本異常吐出字串時 "abc"*20.0 會
+    #    TypeError 炸掉整份組裝;非數字一律當缺席,交給數值閘門(_valid_score)留痕。
+    _se = {k: (v * 20.0) for k, v in (songeval or {}).items()
+           if isinstance(v, (int, float)) and not isinstance(v, bool)}
     _pq = _g(audiobox, "PQ")
 
     return {
@@ -200,22 +205,43 @@ def build_pillar_items(physical, harmony, arrangement, gemini, songeval, audiobo
     }
 
 
+def _valid_score(v):
+    """最後一道數值閘門:必須是「非 bool 的有限數字,且落在 0–100」。
+
+    ⛔ 為什麼不能只判 `is not None`(Codex 探針四種值全數穿透):
+       NaN      → 柱分與曲側合成整個變 NaN
+       Infinity → 寫出非標準 JSON
+       101 / -1 → 直接進正式分數
+       True     → Python 的 bool 是 int,會被當成 1 分
+       任何一個引擎(Gemini/SongEval/Audiobox/量測)版本異常都可能吐這些,
+       閘門設在組裝層才能一次擋住所有來源。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    return math.isfinite(v) and 0.0 <= v <= 100.0
+
+
 def build_pillar_totals(pillar_items):
     """柱內缺項重正規化 → 柱分;柱間缺柱重正規化 → 曲側合成;並算完整性旗標。
 
     回 dict,結構與寫進 _評審團.json 的 pillar_totals 相同。
     ⛔ 缺柱時「完整評測」必為 False —— 那是換了一把尺,不可與完整評測互比或排行。
+    ⛔ 非法數值(NaN/∞/超範圍/bool)= 該項缺席 + invalid_numeric 留痕,絕不進分。
     """
     pillar_scores, pillar_detail = {}, {}
     for pname, items in pillar_items.items():
-        have = [(n, w, v) for n, w, v in items if v is not None]
+        have = [(n, w, v) for n, w, v in items if _valid_score(v)]
         miss = [n for n, w, v in items if v is None]
+        invalid = {n: repr(v) for n, w, v in items
+                   if v is not None and not _valid_score(v)}
         if have:
             wsum = sum(w for _, w, _ in have)
             pillar_scores[pname] = round(sum(w * v for _, w, v in have) / wsum, 1)
-        pillar_detail[pname] = {"score": pillar_scores.get(pname),
-                                "items": {n: round(v, 1) for n, w, v in have},
-                                "missing": miss}
+        detail = {"score": pillar_scores.get(pname),
+                  "items": {n: round(v, 1) for n, w, v in have},
+                  "missing": miss + sorted(invalid)}
+        if invalid:
+            detail["invalid_numeric"] = invalid   # 留痕:是「值不合法」,不是「沒跑到」
+        pillar_detail[pname] = detail
 
     wsum_song = sum(PILLAR_W[p] for p in pillar_scores)
     song_side = (round(sum(PILLAR_W[p] * s for p, s in pillar_scores.items()) / wsum_song, 1)
@@ -252,6 +278,11 @@ def _load_stage_json(path, label):
         d = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception as e:
         return None, f"{label}:讀不到 JSON({type(e).__name__})"
+    # ⛔ 「解析得開」不代表「格式對」:引擎異常吐出 [] 或 "error" 時,json.loads 會成功,
+    #    但下一行 .get() 直接 AttributeError → 整份評審團退出。頂層必須是 dict,
+    #    否則標成該階段格式錯誤(= 缺席),不准炸掉整份報告。
+    if not isinstance(d, dict):
+        return None, f"{label}:JSON 頂層是 {type(d).__name__},不是預期的物件(格式錯誤,視為缺席)"
     if d.get("degraded"):
         return d, f"{label}:降級模式({d.get('error') or d.get('stem_error') or '見 JSON'})"
     return d, ""
@@ -636,29 +667,36 @@ def resolve_input(arg):
     # ⛔ 不可以無上限 copyfileobj:對方若回一個持續串流(或超大檔),會把磁碟塞爆。
     #    500MB 遠大於任何一首歌(4 分鐘 320kbps ≈ 10MB),超過就是不對勁。
     MAX_BYTES = 500 * 1024 * 1024
+    # ⛔ 清理必須集中在一個外層 finally,不可以在每個錯誤分支各自手動清:
+    #    之前漏掉「part.replace(dest) 本身失敗」(權限/磁碟/防毒鎖檔)這條路徑,
+    #    保留檔與 .part 會雙雙洩漏 —— Codex 探針重現過。
+    #    finally 的規則:保留檔一律釋放;沒發布成功就把 .part 刪掉。
     try:
-        with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
-            got = 0
-            while True:
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                got += len(chunk)
-                if got > MAX_BYTES:
-                    raise RuntimeError(f"下載超過上限 {MAX_BYTES // 1024 // 1024}MB,已中止")
-                f.write(chunk)
-    except urllib.error.HTTPError as e:
-        part.unlink(missing_ok=True); _release_stem(dest.stem)
-        sys.exit(f"下載失敗(HTTP {e.code})。歌曲可能不是「公開」狀態——"
-                 f"私人歌曲請先在 SUNO 網站下載,再用方式 3(直接給檔)評。")
-    except Exception as e:
-        part.unlink(missing_ok=True); _release_stem(dest.stem)
-        sys.exit(f"下載失敗:{type(e).__name__}: {e}(網路問題或連結失效)")
-    if part.stat().st_size < 10240:  # <10KB 幾乎必是錯誤頁/壞檔,不是音檔
-        part.unlink(missing_ok=True); _release_stem(dest.stem)
-        sys.exit("下載到的檔案過小,不像有效音檔(可能是私人歌、連結失效或被擋)。")
-    part.replace(dest)  # 完整下載才 rename 成正式檔,中斷不留壞檔
-    _release_stem(dest.stem)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
+                got = 0
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > MAX_BYTES:
+                        raise RuntimeError(f"下載超過上限 {MAX_BYTES // 1024 // 1024}MB,已中止")
+                    f.write(chunk)
+        except urllib.error.HTTPError as e:
+            sys.exit(f"下載失敗(HTTP {e.code})。歌曲可能不是「公開」狀態——"
+                     f"私人歌曲請先在 SUNO 網站下載,再用方式 3(直接給檔)評。")
+        except SystemExit:
+            raise
+        except Exception as e:
+            sys.exit(f"下載失敗:{type(e).__name__}: {e}(網路問題或連結失效)")
+        if part.stat().st_size < 10240:  # <10KB 幾乎必是錯誤頁/壞檔,不是音檔
+            sys.exit("下載到的檔案過小,不像有效音檔(可能是私人歌、連結失效或被擋)。")
+        part.replace(dest)  # 完整下載才 rename 成正式檔,中斷不留壞檔
+    finally:
+        _release_stem(dest.stem)
+        if not dest.exists():
+            part.unlink(missing_ok=True)
     if lyrics:  # 下載成功才寫歌詞,下載失敗不留孤兒歌詞檔
         res_dir = dl_dir / f"{dest.stem}_評分結果"
         res_dir.mkdir(parents=True, exist_ok=True)
@@ -666,6 +704,43 @@ def resolve_input(arg):
         print(f"📝 歌詞已自動抓取: {res_dir / (dest.stem + '_歌詞.txt')}")
     print(f"已存: {dest}\n")
     return dest
+
+
+def _pid_alive(pid: int):
+    """這個 PID 的程序還活著嗎。判不出來回 None(呼叫端退回 mtime 判斷)。
+
+    ⛔ Windows **不可以**用 os.kill(pid, 0):Python 在 Windows 上的 os.kill
+       對非 CTRL 訊號走 TerminateProcess —— 「檢查」會變成「殺掉對方」。
+       要走 ctypes OpenProcess + GetExitCodeProcess(STILL_ACTIVE=259)。
+    """
+    if pid <= 0:
+        return False
+    if _WIN:
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+            if not h:
+                return False          # 開不了多半是不存在(權限問題極少見於本機自己的鎖)
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return None
+                return code.value == 259      # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)               # POSIX:訊號 0 = 只檢查不送
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                   # 存在但不是我們的 → 算活著
+    except Exception:
+        return None
 
 
 @contextlib.contextmanager
@@ -679,37 +754,67 @@ def _job_lock(song: Path):
     ⚠️ 這把鎖只擋「同一個音檔」,不同的歌(含 SUNO 抽卡的各個 take,音檔不同)照樣可以並行。
     """
     lockf = song.with_name(f".{song.stem}.evaluating.lock")
+    # ⭐ 持有者代號:誰建的鎖,鎖檔裡就寫誰的 token。
+    #    ⛔ 沒有它會「刪錯人的鎖」(Codex 在 POSIX 實測重現):
+    #       A 的鎖被判定陳舊 → B 接管建了自己的鎖 → A(其實還活著)結束時無條件刪鎖
+    #       → 把 B 的鎖刪掉 → C 在 B 還在跑時也拿到鎖,三方同檔互踩。
+    #       解法:刪除前重讀鎖檔,token 是自己的才准刪。
+    token = uuid.uuid4().hex
+    my_rec = json.dumps({"pid": os.getpid(), "token": token,
+                         "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+    def _try_acquire():
+        f = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(f, my_rec.encode("utf-8"))
+        return f
+
     fd = None
     try:
         try:
-            fd = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"pid={os.getpid()} at={time.strftime('%Y-%m-%d %H:%M:%S')}".encode())
+            fd = _try_acquire()
         except FileExistsError:
-            # 陳舊鎖(前一個程序被砍)超過 6 小時就搶過來,免得永久卡住
+            # 陳舊判定:**看持有者的 PID 還活不活著**,不是只看 mtime。
+            # ⛔ 只看 mtime 的問題(Codex 指出):網頁版逾時是強制 kill,finally 不會跑,
+            #    鎖會留著 —— 等 6 小時才能接管等於把使用者卡住近半天。
+            #    PID 死了 → 立刻接管;PID 活著 → 不管跑多久都不搶(它是合法的長工作)。
+            holder_alive = None
             try:
-                stale = (time.time() - lockf.stat().st_mtime) > 6 * 3600
+                rec = json.loads(lockf.read_text(encoding="utf-8"))
+                holder_alive = _pid_alive(int(rec.get("pid", -1)))
             except Exception:
-                stale = False
-            if not stale:
+                pass          # 讀不到/舊格式 → 退回 mtime 判斷
+            if holder_alive is None:
+                try:
+                    holder_alive = (time.time() - lockf.stat().st_mtime) <= 6 * 3600
+                except Exception:
+                    holder_alive = False
+            if holder_alive:
                 sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\n"
                          f"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\n"
                          f"   → 等它跑完再試;確定沒有其他工作在跑的話,刪掉 {lockf.name} 即可。")
+            # 持有者已死 → 接管。兩個程序同時接管時只有一個 O_EXCL 會成功;
+            # 輸的那個拿到 FileExistsError → 當成「別人已接管」明確退出,不硬搶。
             lockf.unlink(missing_ok=True)
-            fd = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                fd = _try_acquire()
+            except FileExistsError:
+                sys.exit(f"⛔ 另一個工作剛接管了這個檔的評測:{song.name},請稍後再試。")
         yield
     finally:
-        # ⛔ 只有**真的拿到鎖**的人才可以刪鎖檔。
-        #    否則搶不到鎖的那一方在 finally 裡會把持有者的鎖檔刪掉(自己踩過),
-        #    等於鎖形同虛設,Windows 上還會因為持有者還開著檔案而 PermissionError。
+        # ⛔ 兩道防線:(a) 只有真的拿到鎖的人(fd 不為 None)才走到這;
+        #    (b) 刪除前重讀鎖檔驗 token —— 萬一自己的鎖曾被誤判陳舊而遭接管,
+        #        現在檔案裡是別人的 token,就絕不能刪。
         if fd is not None:
             try:
                 os.close(fd)
             except Exception:
                 pass
             try:
-                lockf.unlink(missing_ok=True)
+                cur = json.loads(lockf.read_text(encoding="utf-8"))
+                if cur.get("token") == token:
+                    lockf.unlink(missing_ok=True)
             except Exception:
-                pass
+                pass          # 讀不到 = 檔案已不在或已是別人的,都不動它
 
 
 def main():

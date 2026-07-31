@@ -243,6 +243,36 @@ def test_舊快取搬不動時解析路徑仍要對得上(monkeypatch, tmp_path)
     assert (d / "vocals.flac").exists()
 
 
+def test_只有部分軌的快取不可以被當成完整(monkeypatch, tmp_path):
+    """🔴 Codex 第六輪:「有任一 flac」不等於「完整」——
+    sidecar 正確 + 只有 drums.flac 的殘缺新夾,仍被 cache_dir_of 選中,
+    下游拿不到 vocals.flac。sidecar 要記軌清單,驗證要求**全部**存在。"""
+    _fake_torch(monkeypatch)
+    stems = tmp_path / "_stems"
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    fp = C._source_ident(a)["fingerprint"]
+    srcs = ["drums", "bass", "other", "vocals"]
+
+    # 新夾:sidecar 正確且記了軌清單,但只有 drums.flac(殘缺)
+    newp = stems / C._cache_name(a, "htdemucs_6s", fp)
+    newp.mkdir(parents=True)
+    (newp / "drums.flac").write_bytes(b"x")
+    (newp / "_source.json").write_text(
+        json.dumps({"fingerprint": fp, "sources": srcs}), encoding="utf-8")
+    # 舊夾:完整
+    legacy = stems / "song__htdemucs_6s"
+    legacy.mkdir(parents=True)
+    for s in srcs:
+        (legacy / f"{s}.flac").write_bytes(b"x")
+    (legacy / "_source.json").write_text(
+        json.dumps({"fingerprint": fp, "sources": srcs}), encoding="utf-8")
+
+    d = C.cache_dir_of(a, stems, "htdemucs_6s")
+    assert (d / "vocals.flac").exists(), \
+        f"🔴 選中了只有 drums.flac 的殘缺夾 {d.name} → 人聲柱會消失"
+
+
 def test_殘缺新快取不可以蓋過合法舊快取(monkeypatch, tmp_path):
     """🔴 交叉狀態(Codex 第五輪):新 SHA 夾**存在但殘缺**、舊快取完整且身分正確。
     separate() 會退去用舊的,cache_dir_of() 卻因為「新夾存在」就回傳那個空夾

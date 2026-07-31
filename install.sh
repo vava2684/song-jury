@@ -293,7 +293,10 @@ SMOKE_OK=0
 if [ "$HAS_ENV" = 1 ]; then
   printf "\n      ${C_DIM}跑一首內建測試音(確認量測管線真的活著)...${C_OFF}\n"
   # ⛔ 不可以只 grep 顯示文字:看不出退出碼、失敗時也查不到原因。
+  #    也不可以只判「非空」:"N/A"、None、NaN、999 都會被 [ -n ] 當成成功
+  #    (Codex 抓到 install.sh 沒跟上 PowerShell 版的驗證)。
   _sj="${TMPDIR:-/tmp}/song_jury_smoke_$$.json"
+  rm -f "$_sj"          # 先刪舊產物,免得誤收上一次的檔
   OUT=$(PYTHONUTF8=1 .venv/bin/python song_scorer.py demo_mix.wav --json "$_sj" 2>&1); RC=$?
   if [ "$RC" -ne 0 ]; then
     bad "冒煙測試沒過(退出碼 $RC)" "量測管線有問題"
@@ -302,11 +305,17 @@ if [ "$HAS_ENV" = 1 ]; then
     bad "冒煙測試沒產出 JSON" "程式回報成功卻沒寫檔"
     printf "      ${C_DIM}↳ 原始輸出尾段:\n%s${C_OFF}\n" "$(echo "$OUT" | tail -n 12)"
   else
-    TOT=$(PYTHONUTF8=1 .venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8'))['scores']['total'])" "$_sj" 2>/dev/null)
+    # 與 install.ps1 同一套驗證:非 bool、有限數字、0-100,否則不算通過
+    TOT=$(PYTHONUTF8=1 .venv/bin/python -c "
+import json,math,sys
+v=json.load(open(sys.argv[1],encoding='utf-8'))['scores']['total']
+assert isinstance(v,(int,float)) and not isinstance(v,bool)
+assert math.isfinite(v) and 0<=v<=100
+print(v)" "$_sj" 2>/dev/null)
     if [ -n "$TOT" ]; then ok "冒煙測試通過:總分 $TOT / 100"; SMOKE_OK=1
-    else bad "冒煙測試的 JSON 沒有 scores.total" "產出格式不對"; fi
-    rm -f "$_sj"
+    else bad "冒煙測試的 scores.total 不是 0-100 的有限數字" "產出格式不對"; fi
   fi
+  rm -f "$_sj"          # 成功失敗都清,不留舊產物給下一輪誤收
 else
   bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"
 fi

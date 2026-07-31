@@ -104,6 +104,27 @@ def _sidecar_fp(cache: Path):
         return None
 
 
+def _sidecar_complete(cache: Path, fingerprint: str) -> bool:
+    """身分相符 **且** sidecar 記錄的每一軌 flac 都在,才算可用。
+
+    ⛔ 曾經只驗 `any(*.flac)`:「有任何一個 flac」不等於「完整」——
+       Codex 造出「sidecar 正確 + 只有 drums.flac」的殘缺夾,cache_dir_of 照樣選它,
+       下游拿不到 vocals.flac → 人聲柱又消失。這種殘缺真的會發生:
+       rmtree(ignore_errors=True) 刪到一半失敗、或發佈中途被砍都會留下部分內容。
+    sidecar 沒記軌清單(更舊版本寫的)→ 至少要求下游真正用的 vocals.flac 在。
+    """
+    try:
+        rec = json.loads((cache / "_source.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if rec.get("fingerprint") != fingerprint:
+        return False
+    srcs = rec.get("sources")
+    if isinstance(srcs, list) and srcs:
+        return all((cache / f"{s}.flac").exists() for s in srcs)
+    return (cache / "vocals.flac").exists()
+
+
 def cache_dir_of(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
     """這首歌在這個模型下的快取資料夾實際位置。
 
@@ -122,11 +143,10 @@ def cache_dir_of(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
     #    這時 separate() 會退去用合法的舊快取,而這裡卻回傳那個殘缺的新路徑
     #    → 下游拿不到 vocals.flac,人聲柱又一次靜默消失(這已經是第三次了)。
     #    判斷順序必須跟 separate() 完全一致:新的「有內容」才算數,否則看舊的。
-    if newp.is_dir() and _sidecar_fp(newp) == ident["fingerprint"] \
-            and any(newp.glob("*.flac")):
+    if newp.is_dir() and _sidecar_complete(newp, ident["fingerprint"]):
         return newp
     if legacy.is_dir():
-        if _sidecar_fp(legacy) == ident["fingerprint"] and any(legacy.glob("*.flac")):
+        if _sidecar_complete(legacy, ident["fingerprint"]):
             return legacy          # 身分相符且有內容 → 跟 separate() 一致
         if _TRUST_LEGACY and _sidecar_fp(legacy) is None:
             return legacy          # 無身分但使用者明確授權沿用
@@ -178,6 +198,12 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
                     os.replace(legacy, cache)
                     print(f"      ↳ 舊快取身分相符,已搬到帶指紋的新路徑:{cache.name}", flush=True)
                     have_all = True
+                    try:      # 舊 sidecar 沒記軌清單 → 補寫,cache_dir_of 才驗得了「完整」
+                        (cache / "_source.json").write_text(
+                            json.dumps({**ident, "sources": sources},
+                                       ensure_ascii=False, indent=1), encoding="utf-8")
+                    except Exception:
+                        pass
                 except OSError:
                     cache, have_all = legacy, True     # 搬不動(權限/跨磁碟)就原地用
             elif not (legacy / "_source.json").exists():
@@ -190,7 +216,8 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
                           f"{legacy.name}(風險自負)", flush=True)
                     try:
                         (legacy / "_source.json").write_text(
-                            json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
+                            json.dumps({**ident, "sources": sources},
+                                       ensure_ascii=False, indent=1), encoding="utf-8")
                     except Exception:
                         pass
                     cache, have_all = legacy, True
@@ -232,8 +259,11 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
             arr = est[i].cpu()
             torchaudio.save(str(tmp / f"{s}.flac"), arr, sr)
             stems[s] = arr.numpy()
+        # ⭐ sidecar 一併記錄軌清單:cache_dir_of 靠它驗「完整」而不是「有任一 flac」
+        #    (只驗 any 的話,殘缺夾會被誤認可用 → 下游拿不到 vocals.flac)
         tmp.joinpath("_source.json").write_text(
-            json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
+            json.dumps({**ident, "sources": sources}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
         try:
             os.replace(tmp, cache)          # 原子發佈
         except OSError as e:

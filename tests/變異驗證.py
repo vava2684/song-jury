@@ -87,9 +87,52 @@ MUTATIONS = [
 
     ("合法舊快取不被 cache_dir_of 認可(搬不動時指到不存在的位置 → 人聲柱又消失)",
      "分軌快取.py",
-     '        if _sidecar_fp(legacy) == ident["fingerprint"] and any(legacy.glob("*.flac")):',
-     '        if False:',
+     "        if _sidecar_complete(legacy, ident[\"fingerprint\"]):",
+     "        if False:",
      "tests/test_stem_cache.py::test_舊快取搬不動時解析路徑仍要對得上"),
+
+    # ── Codex 第六輪 ──────────────────────────────────────────────────
+    ("鎖沒有持有者代號(接管後原持有者刪掉別人的鎖 → 三方同檔互踩)",
+     "評審團.py",
+     '                cur = json.loads(lockf.read_text(encoding="utf-8"))\n                if cur.get("token") == token:\n                    lockf.unlink(missing_ok=True)',
+     '                lockf.unlink(missing_ok=True)',
+     "tests/test_lock_and_gate.py::test_鎖被接管後原持有者不可以刪掉新鎖"),
+
+    ("陳舊判定只看 mtime(被 kill 的工作卡別人 6 小時)",
+     "評審團.py",
+     "                holder_alive = _pid_alive(int(rec.get(\"pid\", -1)))",
+     "                holder_alive = None",
+     "tests/test_lock_and_gate.py::test_持有者死掉的鎖立刻可接管"),
+
+    ("數值閘門退回 is not None(NaN/∞/超範圍/bool 全部進分)",
+     "評審團.py",
+     "    if isinstance(v, bool) or not isinstance(v, (int, float)):\n        return False\n    return math.isfinite(v) and 0.0 <= v <= 100.0",
+     "    return v is not None",
+     "tests/test_lock_and_gate.py::test_非法數值不可以進柱分"),
+
+    ("快取完整性退回「有任一 flac」(殘缺夾被當可用)",
+     "分軌快取.py",
+     "    if isinstance(srcs, list) and srcs:\n        return all((cache / f\"{s}.flac\").exists() for s in srcs)\n    return (cache / \"vocals.flac\").exists()",
+     "    return any(cache.glob(\"*.flac\"))",
+     "tests/test_stem_cache.py::test_只有部分軌的快取不可以被當成完整"),
+
+    ("Gemini 拿不到鎖照樣無鎖寫入(lost update 從正門回來)",
+     "Gemini曲評.py",
+     "            if not acquired:\n                return False          # 沒鎖就跳過保存,絕不無鎖寫入",
+     "            if False:\n                return False",
+     "tests/test_lock_and_gate.py::test_拿不到鎖絕不無鎖寫入"),
+
+    ("Gemini 刪除冷卻退化成 no-op(好金鑰永遠被當冷卻中)",
+     "Gemini曲評.py",
+     '    _locked_update(lambda cur: cur.pop(fp, None))',
+     '    pass',
+     "tests/test_lock_and_gate.py::test_成功清除冷卻要真的從磁碟消失"),
+
+    ("階段 JSON 頂層型別不驗(list 讓整份評測 AttributeError)",
+     "評審團.py",
+     '    if not isinstance(d, dict):\n        return None, f"{label}:JSON 頂層是 {type(d).__name__},不是預期的物件(格式錯誤,視為缺席)"',
+     '    if False:\n        pass',
+     "tests/test_lock_and_gate.py::test_頂層是list的JSON要當格式錯誤不是炸掉"),
 
     # ── Codex 第五輪 ──────────────────────────────────────────────────
     ("佔名直接建立正式 mp3(下載失敗留下 0 byte 幽靈檔)",
@@ -100,20 +143,20 @@ MUTATIONS = [
 
     ("同一個音檔可以同時評兩次(九個中間檔互相覆寫)",
      "評審團.py",
-     "            if not stale:\n                sys.exit(",
+     "            if holder_alive:\n                sys.exit(",
      "            if False:\n                sys.exit(",
      "tests/test_download_and_lock.py::test_同一個音檔不可以同時評兩次"),
 
-    ("Gemini 冷卻狀態直接覆寫(lost update → 死金鑰又被呼叫)",
+    ("Gemini 冷卻狀態不重讀磁碟(lost update → 死金鑰又被呼叫)",
      "Gemini曲評.py",
-     "            merged = dict(cur)",
-     "            merged = {}",
+     "            mutator(cur)",
+     "            cur.clear()\n            mutator(cur)",
      "tests/test_download_and_lock.py::test_冷卻狀態不可以lost_update"),
 
     ("殘缺新快取蓋過合法舊快取(cache_dir_of 指到沒有 flac 的空夾)",
      "分軌快取.py",
-     'if newp.is_dir() and _sidecar_fp(newp) == ident["fingerprint"] \\\n            and any(newp.glob("*.flac")):',
-     'if newp.is_dir():',
+     '    if newp.is_dir() and _sidecar_complete(newp, ident["fingerprint"]):',
+     '    if newp.is_dir():',
      "tests/test_stem_cache.py::test_殘缺新快取不可以蓋過合法舊快取"),
 
     ("批次把損壞主檔複製成備份(唯一好備份被毀)",
