@@ -137,16 +137,27 @@ PILLAR_W = {"詞": 25.3, "人聲": 15.2, "和聲": 13.6, "結構編曲": 12.6, "
             "旋律記憶": 6.1, "真實風格": 6.1, "整體": 5.1, "律動": 4.0}
 
 
+def _num_or_none(v):
+    """真的數字才放行:⛔ bool 要在**這裡**就擋,不能等中央閘門。
+    Python 的 bool 是 int 的子類 → float(True)=1.0,一過這關就洗白成合法浮點數,
+    中央閘門看到的是 1.0 不是 True(Codex 探針:引擎吐 True 的 spectral_balance
+    → 聲學柱正式分數變 1.0)。非有限值(NaN/∞)一併在源頭擋。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    return f if math.isfinite(f) else None
+
+
 def _g(d, *ks):
-    """安全取巢狀鍵,拿不到或不是數字就回 None(絕不亂猜補值)。"""
+    """安全取巢狀鍵,拿不到或不是「非 bool 的有限數字」就回 None(絕不亂猜補值)。"""
     for k in ks:
         d = (d or {}).get(k) if isinstance(d, dict) else None
-    return float(d) if isinstance(d, (int, float)) else None
+    return _num_or_none(d)
 
 
 def _vnum(x):
     """vocal_detail 的值可能是 dict{score} 或直接是數字。"""
-    return _g(x, "score") if isinstance(x, dict) else (float(x) if isinstance(x, (int, float)) else None)
+    return _g(x, "score") if isinstance(x, dict) else _num_or_none(x)
 
 
 def build_pillar_items(physical, harmony, arrangement, gemini, songeval, audiobox, singmos, realdist):
@@ -270,6 +281,48 @@ def iter_windows(n_samples, win):
        演唱聽感.py 與 真實距離.py 共用這個函式,免得同一個 off-by-one 犯兩次。
     """
     return range(0, max(1, n_samples - win + 1), win)
+
+
+def _clean_scores(d, label, notes):
+    """把引擎輸出清洗成「只含有限數字」的 dict —— 算分、JSON、主控台**共用同一份**。
+
+    ⛔ 為什麼要在源頭清一次(Codex 探針):組裝層有閘門,但主控台摘要另外對
+       **原始值** sum()/格式化 —— SongEval 混進一個 "N/A",報告 JSON 都寫完了,
+       最後摘要那行 TypeError 讓整個程序以失敗收場,批次/網頁版因此拒收這次
+       昂貴的完整評測。清洗一次、處處用同一份,這類「深層 schema 地雷」整類消失。"""
+    if not isinstance(d, dict):
+        if d:
+            notes.append(f"{label}:輸出不是物件(拿到 {type(d).__name__}),已忽略")
+        return {}
+    bad = sorted(k for k, v in d.items()
+                 if not (isinstance(v, (int, float)) and not isinstance(v, bool)
+                         and math.isfinite(v)))
+    if bad:
+        notes.append(f"{label}:忽略非數值欄位 {bad}")
+    return {k: float(v) for k, v in d.items() if k not in bad}
+
+
+def _scrub_nonfinite(o):
+    """遞迴把 NaN/±Infinity 換成 None —— json.dumps 預設會把它們寫成
+    非標準的 NaN/Infinity 字面值,嚴格的 JSON 解析器(下游網站/工具)直接拒收。"""
+    if isinstance(o, dict):
+        return {k: _scrub_nonfinite(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_scrub_nonfinite(v) for v in o]
+    if isinstance(o, float) and not math.isfinite(o):
+        return None
+    return o
+
+
+def _write_report(merged: dict, out_path: Path):
+    """正式報告的唯一出口:清洗非有限值 + allow_nan=False 雙保險 + 原子發布。
+    ⛔ 直接 write_text 覆寫的問題:寫到一半中斷/磁碟錯誤會留半截報告,
+       批次的 --skip-existing 讀到它就 JSONDecodeError。"""
+    cleaned = _scrub_nonfinite(merged)
+    tmp = out_path.with_suffix(f".json.tmp{os.getpid()}")
+    tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, allow_nan=False),
+                   encoding="utf-8")
+    os.replace(tmp, out_path)
 
 
 def _load_stage_json(path, label):
@@ -706,115 +759,55 @@ def resolve_input(arg):
     return dest
 
 
-def _pid_alive(pid: int):
-    """這個 PID 的程序還活著嗎。判不出來回 None(呼叫端退回 mtime 判斷)。
-
-    ⛔ Windows **不可以**用 os.kill(pid, 0):Python 在 Windows 上的 os.kill
-       對非 CTRL 訊號走 TerminateProcess —— 「檢查」會變成「殺掉對方」。
-       要走 ctypes OpenProcess + GetExitCodeProcess(STILL_ACTIVE=259)。
-    """
-    if pid <= 0:
-        return False
-    if _WIN:
-        try:
-            import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            k32 = ctypes.windll.kernel32
-            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-            if not h:
-                return False          # 開不了多半是不存在(權限問題極少見於本機自己的鎖)
-            try:
-                code = ctypes.c_ulong()
-                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
-                    return None
-                return code.value == 259      # STILL_ACTIVE
-            finally:
-                k32.CloseHandle(h)
-        except Exception:
-            return None
-    try:
-        os.kill(pid, 0)               # POSIX:訊號 0 = 只檢查不送
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True                   # 存在但不是我們的 → 算活著
-    except Exception:
-        return None
-
-
 @contextlib.contextmanager
 def _job_lock(song: Path):
-    """同一個音檔同時只准有一個評測工作。
+    """同一個音檔同時只准有一個評測工作 —— 用 **OS 原生諮詢鎖** 實作。
 
-    ⛔ 為什麼需要:所有中間檔都叫 `{音檔名}_編曲層次.json`、`_評分.json`、`_和聲分析.json`…
-       同一個檔被評兩次(批次在跑 + 手動再評、.bat 開兩次、CLI 與網頁同時評)時,
-       兩邊會共用這些檔 —— 一邊讀完 unlink() 之後另一邊就找不到檔案、
-       或讀到正在覆寫的半截 JSON。
-    ⚠️ 這把鎖只擋「同一個音檔」,不同的歌(含 SUNO 抽卡的各個 take,音檔不同)照樣可以並行。
+    ⛔ 為什麼不再自己管鎖的生命週期(PID/token/mtime 都試過,Codex 三輪都找得到洞):
+       · 「判斷已死 → unlink → 重建」不是不可分割操作:兩個接管者同步進場,
+         100 次有 13 次雙雙進鎖(Codex POSIX 探針)。
+       · O_EXCL 建檔後立刻崩潰會留下**空鎖**,被當活鎖擋人 6 小時。
+       · PID 會被重用,誤判存活。
+       OS 鎖(Windows msvcrt.locking / POSIX flock)由核心保證互斥,
+       **程序死亡自動釋放** —— 陳舊、接管、PID 重用整類問題直接消失。
+    ⚠️ 鎖檔**永遠不刪**:POSIX 上「unlink 再重建」會讓兩個工作鎖在不同 inode 上,
+       互斥失效 —— 這是 flock 的經典陷阱。留一個隱藏小檔是正確的代價。
+    ⚠️ 這把鎖只擋「同一個音檔」,不同的歌(含 SUNO 抽卡的各個 take)照樣並行。
     """
     lockf = song.with_name(f".{song.stem}.evaluating.lock")
-    # ⭐ 持有者代號:誰建的鎖,鎖檔裡就寫誰的 token。
-    #    ⛔ 沒有它會「刪錯人的鎖」(Codex 在 POSIX 實測重現):
-    #       A 的鎖被判定陳舊 → B 接管建了自己的鎖 → A(其實還活著)結束時無條件刪鎖
-    #       → 把 B 的鎖刪掉 → C 在 B 還在跑時也拿到鎖,三方同檔互踩。
-    #       解法:刪除前重讀鎖檔,token 是自己的才准刪。
-    token = uuid.uuid4().hex
-    my_rec = json.dumps({"pid": os.getpid(), "token": token,
-                         "at": time.strftime("%Y-%m-%d %H:%M:%S")})
-
-    def _try_acquire():
-        f = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(f, my_rec.encode("utf-8"))
-        return f
-
-    fd = None
+    f = open(lockf, "a+", encoding="utf-8")
     try:
         try:
-            fd = _try_acquire()
-        except FileExistsError:
-            # 陳舊判定:**看持有者的 PID 還活不活著**,不是只看 mtime。
-            # ⛔ 只看 mtime 的問題(Codex 指出):網頁版逾時是強制 kill,finally 不會跑,
-            #    鎖會留著 —— 等 6 小時才能接管等於把使用者卡住近半天。
-            #    PID 死了 → 立刻接管;PID 活著 → 不管跑多久都不搶(它是合法的長工作)。
-            holder_alive = None
-            try:
-                rec = json.loads(lockf.read_text(encoding="utf-8"))
-                holder_alive = _pid_alive(int(rec.get("pid", -1)))
-            except Exception:
-                pass          # 讀不到/舊格式 → 退回 mtime 判斷
-            if holder_alive is None:
-                try:
-                    holder_alive = (time.time() - lockf.stat().st_mtime) <= 6 * 3600
-                except Exception:
-                    holder_alive = False
-            if holder_alive:
-                sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\n"
-                         f"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\n"
-                         f"   → 等它跑完再試;確定沒有其他工作在跑的話,刪掉 {lockf.name} 即可。")
-            # 持有者已死 → 接管。兩個程序同時接管時只有一個 O_EXCL 會成功;
-            # 輸的那個拿到 FileExistsError → 當成「別人已接管」明確退出,不硬搶。
-            lockf.unlink(missing_ok=True)
-            try:
-                fd = _try_acquire()
-            except FileExistsError:
-                sys.exit(f"⛔ 另一個工作剛接管了這個檔的評測:{song.name},請稍後再試。")
+            if _WIN:
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\n"
+                     f"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\n"
+                     f"   → 等它跑完再試。持有工作若被強制終止,OS 會自動釋放這把鎖,不必手動清。")
+        try:      # 持有者資訊只是給人看的診斷,不參與互斥
+            f.seek(0)
+            f.truncate()
+            f.write(f"pid={os.getpid()} at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.flush()
+        except Exception:
+            pass
         yield
     finally:
-        # ⛔ 兩道防線:(a) 只有真的拿到鎖的人(fd 不為 None)才走到這;
-        #    (b) 刪除前重讀鎖檔驗 token —— 萬一自己的鎖曾被誤判陳舊而遭接管,
-        #        現在檔案裡是別人的 token,就絕不能刪。
-        if fd is not None:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-            try:
-                cur = json.loads(lockf.read_text(encoding="utf-8"))
-                if cur.get("token") == token:
-                    lockf.unlink(missing_ok=True)
-            except Exception:
-                pass          # 讀不到 = 檔案已不在或已是別人的,都不動它
+        # 關閉檔案 = 釋放鎖(OS 保證)。⛔ 不 unlink —— 見上方 inode 陷阱說明。
+        try:
+            if _WIN:
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except Exception:
+            pass
+        f.close()
+
 
 
 def main():
@@ -928,7 +921,8 @@ def _evaluate(song: Path):
                 notes.append(f"SongEval:{_se_err}")
             else:
                 se_raw = json.loads((tmp_out / "result.json").read_text(encoding="utf-8"))
-                songeval = list(se_raw.values())[0] if se_raw else {}
+                songeval = _clean_scores(list(se_raw.values())[0] if se_raw else {},
+                                         "SongEval", notes)
         except Exception as e:
             notes.append(f"SongEval:讀取結果失敗({e})")
         finally:
@@ -946,7 +940,7 @@ def _evaluate(song: Path):
             print("      ↳ 跳過:Audiobox 沒安裝或執行失敗(製作品質等細項會缺)")
             notes.append(f"Audiobox:{_ab_err}")
         else:
-            audiobox = _last_json(p.stdout) or {}
+            audiobox = _clean_scores(_last_json(p.stdout) or {}, "Audiobox", notes)
     finally:
         tmp_lst.unlink(missing_ok=True)
 
@@ -1076,7 +1070,7 @@ def _evaluate(song: Path):
         "出處": "重構庭 2026-07-25 定版(T1-T4;沿革見 docs/權重沿革.md)",
     }
     out_path = song.with_name(song.stem + "_評審團.json")
-    out_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_report(merged, out_path)   # 清洗非有限值 + allow_nan=False + 原子發布
 
     se_avg = (sum(songeval.values()) / len(songeval)) if songeval else None   # SongEval 沒裝時為 None
     print()

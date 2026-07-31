@@ -91,19 +91,44 @@ MUTATIONS = [
      "        if False:",
      "tests/test_stem_cache.py::test_舊快取搬不動時解析路徑仍要對得上"),
 
+    # ── Codex 第七輪:OS 鎖、bool 洗白、清洗共用、原子報告 ───────────────
+    ("拿不到 OS 鎖卻照樣進入評測(互斥失效)",
+     "評審團.py",
+     '        except OSError:\n            sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\\n"',
+     '        except OSError:\n            pass\n        if False:\n            sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\\n"',
+     "tests/test_download_and_lock.py::test_同一個音檔不可以同時評兩次"),
+
+    ("bool 在取值層被 float() 洗成 1.0(True 混進正式柱分)",
+     "評審團.py",
+     "    if isinstance(v, bool) or not isinstance(v, (int, float)):\n        return None",
+     "    if not isinstance(v, (int, float)):\n        return None",
+     "tests/test_lock_and_gate.py::test_bool不可以在取值層被洗成浮點數"),
+
+    ("引擎輸出不清洗(摘要層 sum 到字串 → 報告寫完才 TypeError)",
+     "評審團.py",
+     "    return {k: float(v) for k, v in d.items() if k not in bad}",
+     "    return dict(d)",
+     "tests/test_lock_and_gate.py::test_clean_scores把非數值欄位清掉並留痕"),
+
+    ("報告不清洗非有限值(寫出 NaN/Infinity 的非標準 JSON)",
+     "評審團.py",
+     "    cleaned = _scrub_nonfinite(merged)",
+     "    cleaned = merged",
+     "tests/test_lock_and_gate.py::test_報告寫出是原子的且不含NaN"),
+
+    ("狀態鎖不互斥(兩個持有者同時進鎖 → lost update)",
+     "Gemini曲評.py",
+     "    try:\n        yield acquired",
+     "    try:\n        yield True",
+     "tests/test_lock_and_gate.py::test_狀態鎖真的互斥"),
+
+    ("金鑰租約形同虛設(同一把 key 同時被兩個工作轟)",
+     "Gemini曲評.py",
+     '    lockf = STATE_FILE.with_name(f".gemini_key_{_fingerprint(key)}.inflight")\n    yield from _os_file_lock(lockf, timeout)',
+     '    lockf = STATE_FILE.with_name(f".gemini_key_{_fingerprint(key)}.inflight")\n    yield True',
+     "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
+
     # ── Codex 第六輪 ──────────────────────────────────────────────────
-    ("鎖沒有持有者代號(接管後原持有者刪掉別人的鎖 → 三方同檔互踩)",
-     "評審團.py",
-     '                cur = json.loads(lockf.read_text(encoding="utf-8"))\n                if cur.get("token") == token:\n                    lockf.unlink(missing_ok=True)',
-     '                lockf.unlink(missing_ok=True)',
-     "tests/test_lock_and_gate.py::test_鎖被接管後原持有者不可以刪掉新鎖"),
-
-    ("陳舊判定只看 mtime(被 kill 的工作卡別人 6 小時)",
-     "評審團.py",
-     "                holder_alive = _pid_alive(int(rec.get(\"pid\", -1)))",
-     "                holder_alive = None",
-     "tests/test_lock_and_gate.py::test_持有者死掉的鎖立刻可接管"),
-
     ("數值閘門退回 is not None(NaN/∞/超範圍/bool 全部進分)",
      "評審團.py",
      "    if isinstance(v, bool) or not isinstance(v, (int, float)):\n        return False\n    return math.isfinite(v) and 0.0 <= v <= 100.0",
@@ -140,12 +165,6 @@ MUTATIONS = [
      'lock = dl / f".{stem}.mp3.reserving"',
      'lock = dl / f"{stem}.mp3"',
      "tests/test_download_and_lock.py::test_佔名不可以建立正式mp3"),
-
-    ("同一個音檔可以同時評兩次(九個中間檔互相覆寫)",
-     "評審團.py",
-     "            if holder_alive:\n                sys.exit(",
-     "            if False:\n                sys.exit(",
-     "tests/test_download_and_lock.py::test_同一個音檔不可以同時評兩次"),
 
     ("Gemini 冷卻狀態不重讀磁碟(lost update → 死金鑰又被呼叫)",
      "Gemini曲評.py",

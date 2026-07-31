@@ -202,29 +202,60 @@ def _state_lock(timeout=10.0):
        A 寫下金鑰 A 的冷卻,B 用更早讀到的空狀態覆蓋回去,A 的冷卻就消失了,
        **已經被限流或判死的金鑰會再被呼叫一次**。必須鎖起來、鎖內重讀再合併。
     拿不到鎖也不阻斷評分(冷卻只是最佳化),但會退回不上鎖的舊行為。"""
-    lockf = STATE_FILE.with_suffix(".lock")
-    fd = None
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        try:
-            fd = os.open(str(lockf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            try:    # 陳舊鎖(前一個程序被砍)超過 60 秒就搶過來
-                if time.time() - lockf.stat().st_mtime > 60:
-                    lockf.unlink(missing_ok=True)
-                    continue
-            except Exception:
-                pass
-            time.sleep(0.05)
-        except Exception:
-            break
+    # ⭐ 用 OS 諮詢鎖(msvcrt/flock),不再自己管生命週期:
+    #    ⛔ 舊版「超過 60 秒就 unlink 搶過來」有跟工作鎖一模一樣的 check-then-delete 競態
+    #       (A、B 同判陳舊 → B 刪掉 A 剛建的新鎖;退出時也沒驗所有權)。
+    #    OS 鎖由核心保證互斥、程序死亡自動釋放 —— 陳舊接管邏輯整段不需要存在。
+    #    ⚠️ 鎖檔永遠不刪:POSIX 上 unlink+重建會讓兩個持有者鎖在不同 inode 上,互斥失效。
+    yield from _os_file_lock(STATE_FILE.with_suffix(".lock"), timeout)
+
+
+def _os_file_lock(lockf: Path, timeout: float):
+    """開檔 + 非阻塞 OS 鎖,輪詢到 timeout;yield 是否取得。關檔即釋放,永不 unlink。"""
+    f = None
+    acquired = False
     try:
-        yield fd is not None
+        f = open(lockf, "a+", encoding="utf-8")
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                time.sleep(0.05)
+    except Exception:
+        pass
+    try:
+        yield acquired
     finally:
-        if fd is not None:
-            os.close(fd)
-            lockf.unlink(missing_ok=True)
+        if f is not None:
+            if acquired and sys.platform == "win32":
+                try:
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+            f.close()
+
+
+@contextlib.contextmanager
+def key_lease(key: str, timeout: float = 120.0):
+    """同一把金鑰同時只准一個工作在打 —— 每把 key 的 in-flight 租約。
+
+    ⛔ 冷卻只在**收到 429 之後**才生效;兩個合法並行的工作(不同 SUNO take)
+       仍會同時轟同一把 key,把 429 撞得更兇(Codex 探針:同 key 同時在途 = 2)。
+    租約用 OS 鎖 → 程序死亡自動釋放,不會出現「租約洩漏卡死金鑰」。
+    """
+    lockf = STATE_FILE.with_name(f".gemini_key_{_fingerprint(key)}.inflight")
+    yield from _os_file_lock(lockf, timeout)
 
 
 def _locked_update(mutator):
@@ -550,97 +581,107 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{GEMINI_MUSIC_MODEL}:generateContent?key={key}")
 
-        for attempt in range(ATTEMPTS_PER_KEY):
-            try:
-                r = requests.post(url, json=body, timeout=timeout)
-            except Exception as e:
-                # 網路層抖動:不算金鑰的錯,不冷卻,同一把再試
-                meta["attempts"].append({"key": fp, "attempt": attempt + 1,
-                                         "result": "network_error", "error": f"{type(e).__name__}"})
+        # ⭐ 每把 key 的 in-flight 租約:同一把金鑰同時只准一個工作在打。
+        #    ⛔ 冷卻只在收到 429 之後才生效 —— 兩個合法並行的工作(不同 take)
+        #       仍會同時轟同一把 key,把 429 撞得更兇(Codex 探針:同 key 在途=2)。
+        #    租約是 OS 鎖,程序死亡自動釋放;拿不到就換下一把 key,不硬等。
+        with key_lease(key, timeout=5.0) as leased:
+            if not leased:
+                meta["attempts"].append({"key": fp, "result": "busy_inflight"})
                 if verbose:
-                    print(f"  ! 金鑰 {fp} 第 {attempt+1} 次:連線失敗 {type(e).__name__}", flush=True)
+                    print(f"  ⏭ 金鑰 {fp} 另一個工作使用中 → 換下一把", flush=True)
+                continue
+            for attempt in range(ATTEMPTS_PER_KEY):
+                try:
+                    r = requests.post(url, json=body, timeout=timeout)
+                except Exception as e:
+                    # 網路層抖動:不算金鑰的錯,不冷卻,同一把再試
+                    meta["attempts"].append({"key": fp, "attempt": attempt + 1,
+                                             "result": "network_error", "error": f"{type(e).__name__}"})
+                    if verbose:
+                        print(f"  ! 金鑰 {fp} 第 {attempt+1} 次:連線失敗 {type(e).__name__}", flush=True)
+                    if attempt < ATTEMPTS_PER_KEY - 1:
+                        time.sleep(6)
+                        continue
+                    break
+
+                if r.status_code == 200:
+                    try:
+                        cand = r.json()["candidates"][0]
+                        txt = cand["content"]["parts"][0]["text"]
+                    except Exception:
+                        # 200 但沒文字:多半是安全過濾或 MAX_TOKENS 把 thinking 吃光 —— 講明白,別當通用錯誤
+                        fr = ""
+                        try:
+                            fr = (r.json().get("candidates") or [{}])[0].get("finishReason", "")
+                        except Exception:
+                            pass
+                        if not fr:
+                            try:
+                                fr = str((r.json().get("promptFeedback") or {}).get("blockReason", "") or "無 candidates")
+                            except Exception:
+                                fr = "回應結構非預期"
+                        meta["attempts"].append({"key": fp, "attempt": attempt + 1,
+                                                 "result": "empty_response", "finish_reason": fr})
+                        if verbose:
+                            print(f"  ! 金鑰 {fp}:200 但沒拿到文字(finishReason={fr})", flush=True)
+                        if attempt < ATTEMPTS_PER_KEY - 1:
+                            time.sleep(4)
+                            continue
+                        break
+                    meta["attempts"].append({"key": fp, "attempt": attempt + 1, "result": "ok"})
+                    meta["key_used"] = fp
+                    # 這把是好的 → 清掉它可能殘留的舊冷卻記錄
+                    # ⛔ 要用 delete_cooldown:save_state 走「合併」,磁碟上的舊冷卻
+                    #    不會因為記憶體 dict 少了它而被刪掉(Codex 實測清不掉)。
+                    if fp in state:
+                        state.pop(fp, None)
+                    delete_cooldown(fp)
+                    return txt, meta
+
+                if r.status_code == 429:
+                    delay = _retry_delay_sec(r)
+                    meta["attempts"].append({"key": fp, "attempt": attempt + 1,
+                                             "result": "rate_limited", "suggested_delay_sec": delay})
+                    if attempt < ATTEMPTS_PER_KEY - 1 and delay + 2 <= MAX_SLEEP_SEC:
+                        if verbose:
+                            print(f"  ⏳ 金鑰 {fp}:429,依 Google 建議等 {delay:.0f}s 後重試", flush=True)
+                        time.sleep(min(delay + 2, MAX_SLEEP_SEC))
+                        continue
+                    # 等不起(或重試用完)→ 標冷卻,換下一把
+                    cool_down(state, key, max(delay, COOLDOWN_RATE_SEC), "429 額度/頻率上限")
+                    if verbose:
+                        print(f"  ↪ 金鑰 {fp}:429 且等不起 → 冷卻並換下一把", flush=True)
+                    break
+
+                if r.status_code in (400, 401, 403):
+                    emsg = _err_message(r)
+                    dead = ("API_KEY_INVALID" in emsg or "PERMISSION_DENIED" in emsg
+                            or "API key not valid" in emsg or r.status_code in (401, 403))
+                    if dead:
+                        meta["attempts"].append({"key": fp, "attempt": attempt + 1,
+                                                 "result": "key_rejected", "http": r.status_code,
+                                                 "error": emsg[:200]})
+                        cool_down(state, key, COOLDOWN_DEAD_SEC, f"HTTP {r.status_code} 金鑰無效/被拒")
+                        if verbose:
+                            print(f"  ↪ 金鑰 {fp}:HTTP {r.status_code} 金鑰無效/被拒 → 冷卻 24h,換下一把", flush=True)
+                        break
+                    # 400 但不是金鑰問題(模型 id 打錯、payload 壞掉)→ 換金鑰也沒用,直接收工
+                    meta["attempts"].append({"key": fp, "attempt": attempt + 1,
+                                             "result": "bad_request", "http": 400, "error": emsg[:200]})
+                    meta["degraded_reason"] = f"HTTP 400(非金鑰問題,換金鑰無用):{emsg[:200]}"
+                    return None, meta
+
+                # 5xx / 其他:伺服器端暫時性,不冷卻金鑰
+                meta["attempts"].append({"key": fp, "attempt": attempt + 1,
+                                         "result": "http_error", "http": r.status_code,
+                                         "error": _err_message(r)[:200]})
+                if verbose:
+                    print(f"  ! 金鑰 {fp}:HTTP {r.status_code}", flush=True)
                 if attempt < ATTEMPTS_PER_KEY - 1:
                     time.sleep(6)
                     continue
                 break
-
-            if r.status_code == 200:
-                try:
-                    cand = r.json()["candidates"][0]
-                    txt = cand["content"]["parts"][0]["text"]
-                except Exception:
-                    # 200 但沒文字:多半是安全過濾或 MAX_TOKENS 把 thinking 吃光 —— 講明白,別當通用錯誤
-                    fr = ""
-                    try:
-                        fr = (r.json().get("candidates") or [{}])[0].get("finishReason", "")
-                    except Exception:
-                        pass
-                    if not fr:
-                        try:
-                            fr = str((r.json().get("promptFeedback") or {}).get("blockReason", "") or "無 candidates")
-                        except Exception:
-                            fr = "回應結構非預期"
-                    meta["attempts"].append({"key": fp, "attempt": attempt + 1,
-                                             "result": "empty_response", "finish_reason": fr})
-                    if verbose:
-                        print(f"  ! 金鑰 {fp}:200 但沒拿到文字(finishReason={fr})", flush=True)
-                    if attempt < ATTEMPTS_PER_KEY - 1:
-                        time.sleep(4)
-                        continue
-                    break
-                meta["attempts"].append({"key": fp, "attempt": attempt + 1, "result": "ok"})
-                meta["key_used"] = fp
-                # 這把是好的 → 清掉它可能殘留的舊冷卻記錄
-                # ⛔ 要用 delete_cooldown:save_state 走「合併」,磁碟上的舊冷卻
-                #    不會因為記憶體 dict 少了它而被刪掉(Codex 實測清不掉)。
-                if fp in state:
-                    state.pop(fp, None)
-                delete_cooldown(fp)
-                return txt, meta
-
-            if r.status_code == 429:
-                delay = _retry_delay_sec(r)
-                meta["attempts"].append({"key": fp, "attempt": attempt + 1,
-                                         "result": "rate_limited", "suggested_delay_sec": delay})
-                if attempt < ATTEMPTS_PER_KEY - 1 and delay + 2 <= MAX_SLEEP_SEC:
-                    if verbose:
-                        print(f"  ⏳ 金鑰 {fp}:429,依 Google 建議等 {delay:.0f}s 後重試", flush=True)
-                    time.sleep(min(delay + 2, MAX_SLEEP_SEC))
-                    continue
-                # 等不起(或重試用完)→ 標冷卻,換下一把
-                cool_down(state, key, max(delay, COOLDOWN_RATE_SEC), "429 額度/頻率上限")
-                if verbose:
-                    print(f"  ↪ 金鑰 {fp}:429 且等不起 → 冷卻並換下一把", flush=True)
-                break
-
-            if r.status_code in (400, 401, 403):
-                emsg = _err_message(r)
-                dead = ("API_KEY_INVALID" in emsg or "PERMISSION_DENIED" in emsg
-                        or "API key not valid" in emsg or r.status_code in (401, 403))
-                if dead:
-                    meta["attempts"].append({"key": fp, "attempt": attempt + 1,
-                                             "result": "key_rejected", "http": r.status_code,
-                                             "error": emsg[:200]})
-                    cool_down(state, key, COOLDOWN_DEAD_SEC, f"HTTP {r.status_code} 金鑰無效/被拒")
-                    if verbose:
-                        print(f"  ↪ 金鑰 {fp}:HTTP {r.status_code} 金鑰無效/被拒 → 冷卻 24h,換下一把", flush=True)
-                    break
-                # 400 但不是金鑰問題(模型 id 打錯、payload 壞掉)→ 換金鑰也沒用,直接收工
-                meta["attempts"].append({"key": fp, "attempt": attempt + 1,
-                                         "result": "bad_request", "http": 400, "error": emsg[:200]})
-                meta["degraded_reason"] = f"HTTP 400(非金鑰問題,換金鑰無用):{emsg[:200]}"
-                return None, meta
-
-            # 5xx / 其他:伺服器端暫時性,不冷卻金鑰
-            meta["attempts"].append({"key": fp, "attempt": attempt + 1,
-                                     "result": "http_error", "http": r.status_code,
-                                     "error": _err_message(r)[:200]})
-            if verbose:
-                print(f"  ! 金鑰 {fp}:HTTP {r.status_code}", flush=True)
-            if attempt < ATTEMPTS_PER_KEY - 1:
-                time.sleep(6)
-                continue
-            break
 
     # 全部金鑰都走完還是沒結果 → ⛔ 絕不沉默,把原因寫死在 JSON 裡讓成績單可以誠實標示
     if meta["degraded_reason"] is None:
