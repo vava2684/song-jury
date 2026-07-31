@@ -61,6 +61,25 @@ MUTATIONS = [
      "                if True:",
      "tests/test_stem_cache.py::test_無身分的舊快取預設不採信"),
 
+    # ── Codex 第四輪:這三條原本沒有有效防線(關鍵字測試擋不住)────────────
+    ("暫存夾只用 PID(同程序兩執行緒共用同一個暫存夾互相覆寫)",
+     "分軌快取.py",
+     'uuid.uuid4().hex[:8]}"',
+     'fixed"',
+     "tests/test_stem_cache.py::test_同程序兩執行緒不會共用暫存夾"),
+
+    ("原子改名吞掉所有錯誤(權限不足/磁碟滿被當成『別人先做好了』)",
+     "分軌快取.py",
+     "            if not cache.exists():\n                raise",
+     "            if False:\n                raise",
+     "tests/test_stem_cache.py::test_原子改名不可以吞掉非預期錯誤"),
+
+    ("合法舊快取沒搬到新路徑(cache_dir_of 指到不存在的位置 → 人聲柱又消失)",
+     "分軌快取.py",
+     "        if _sidecar_fp(legacy) == ident[\"fingerprint\"]:\n            return legacy",
+     "        if False:\n            return legacy",
+     "tests/test_stem_cache.py::test_舊快取搬不動時解析路徑仍要對得上"),
+
     ("批次不看 returncode(程式炸掉但檔案已寫出 → 誤判成功)",
      "批次評測.py",
      'if r.returncode != 0:\n        return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]',

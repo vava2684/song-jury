@@ -292,11 +292,20 @@ fi
 SMOKE_OK=0
 if [ "$HAS_ENV" = 1 ]; then
   printf "\n      ${C_DIM}跑一首內建測試音(確認量測管線真的活著)...${C_OFF}\n"
-  OUT=$(PYTHONUTF8=1 .venv/bin/python song_scorer.py demo_mix.wav 2>&1)
-  if echo "$OUT" | grep -q "總分"; then
-    ok "冒煙測試通過:$(echo "$OUT" | grep '總分' | head -n1 | tr -s ' ')"; SMOKE_OK=1
+  # ⛔ 不可以只 grep 顯示文字:看不出退出碼、失敗時也查不到原因。
+  _sj="${TMPDIR:-/tmp}/song_jury_smoke_$$.json"
+  OUT=$(PYTHONUTF8=1 .venv/bin/python song_scorer.py demo_mix.wav --json "$_sj" 2>&1); RC=$?
+  if [ "$RC" -ne 0 ]; then
+    bad "冒煙測試沒過(退出碼 $RC)" "量測管線有問題"
+    printf "      ${C_DIM}↳ 原始輸出尾段:\n%s${C_OFF}\n" "$(echo "$OUT" | tail -n 12)"
+  elif [ ! -f "$_sj" ]; then
+    bad "冒煙測試沒產出 JSON" "程式回報成功卻沒寫檔"
+    printf "      ${C_DIM}↳ 原始輸出尾段:\n%s${C_OFF}\n" "$(echo "$OUT" | tail -n 12)"
   else
-    bad "冒煙測試沒過" "量測管線有問題,先看上面的錯誤訊息"
+    TOT=$(PYTHONUTF8=1 .venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8'))['scores']['total'])" "$_sj" 2>/dev/null)
+    if [ -n "$TOT" ]; then ok "冒煙測試通過:總分 $TOT / 100"; SMOKE_OK=1
+    else bad "冒煙測試的 JSON 沒有 scores.total" "產出格式不對"; fi
+    rm -f "$_sj"
   fi
 else
   bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"

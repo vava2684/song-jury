@@ -6,6 +6,8 @@
    人聲、和聲、編曲全部算錯,**而且不會報錯**。
 """
 import json
+import pytest
+from pathlib import Path
 import sys
 import types
 from conftest import load, REPO
@@ -186,18 +188,119 @@ def test_無身分的舊快取預設不採信(monkeypatch, tmp_path):
         "🔴 不可以把本首的身分蓋章到來源不明的舊快取上"
 
 
-def test_暫存夾名要帶隨機碼():
-    """⛔ 只用 PID 的話,同一個程序裡的兩個執行緒會共用同一個暫存夾互相覆寫。"""
-    src = (REPO / "分軌快取.py").read_text(encoding="utf-8")
-    assert "uuid" in src and ".tmp_" in src, "暫存夾名應含 uuid,不能只有 PID"
+def test_合法舊快取與解析路徑必須一致(monkeypatch, tmp_path):
+    """🔴 真實迴歸(第二次):separate() 接受了身分相符的舊快取,
+    但 cache_dir_of() 卻回傳不存在的新 SHA 路徑 → 編曲層次拿不到 vocals.flac,
+    **人聲柱又一次靜靜消失**。兩邊的採用判斷必須一致。"""
+    _fake_torch(monkeypatch)
+    stems = tmp_path / "_stems"
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    fp = C._source_ident(a)["fingerprint"]
+    srcs = ["drums", "bass", "other", "vocals"]
+
+    legacy = stems / "song__htdemucs_6s"          # 舊名,但身分正確
+    legacy.mkdir(parents=True)
+    for s in srcs:
+        (legacy / f"{s}.flac").write_bytes(b"x")
+    (legacy / "_source.json").write_text(json.dumps({"fingerprint": fp}), encoding="utf-8")
+
+    # ① 正常情況:合法舊快取會被**搬到**新路徑,之後只有一個位置
+    _, _, _, cached = C.separate(a, stems, "htdemucs_6s")
+    assert cached is True, "身分相符的舊快取應該被採用,不該重跑 Demucs"
+    d = C.cache_dir_of(a, stems, "htdemucs_6s")
+    assert d.exists(), f"🔴 cache_dir_of 指到不存在的路徑 {d.name} → vocal_stem 會變 None"
+    assert (d / "vocals.flac").exists(), "下游要的 vocals.flac 不在解析出來的位置"
+    assert not legacy.exists(), "搬過去之後舊路徑不該還在(留著就是兩個位置,規則又會漂移)"
 
 
-def test_原子改名只吞目標已存在的錯誤():
-    """⛔ 權限不足、磁碟滿、路徑太長都必須拋出來 —— 全部吞掉的話,使用者會以為
-    快取寫好了,下一輪又整首重跑,永遠查不出原因。"""
-    src = (REPO / "分軌快取.py").read_text(encoding="utf-8")
-    assert "if not cache.exists():" in src and "raise" in src, \
-        "os.replace 的 OSError 不可以無條件吞掉"
+def test_舊快取搬不動時解析路徑仍要對得上(monkeypatch, tmp_path):
+    """🔴 搬家可能失敗(權限、跨磁碟)。那時 separate() 會原地沿用舊路徑 ——
+    cache_dir_of() 必須跟著回傳同一個位置,否則又是「兩份規則漂移」那個老問題。
+
+    ⚠️ 這條是 fallback 路徑:上一條測試蓋不到它(正常情況搬家會成功),
+       所以少了這條,把 cache_dir_of 的 legacy 判斷拿掉也不會被抓到(變異驗證證明過)。"""
+    _fake_torch(monkeypatch)
+    import os as _os
+    stems = tmp_path / "_stems"
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    fp = C._source_ident(a)["fingerprint"]
+    srcs = ["drums", "bass", "other", "vocals"]
+
+    legacy = stems / "song__htdemucs_6s"
+    legacy.mkdir(parents=True)
+    for s in srcs:
+        (legacy / f"{s}.flac").write_bytes(b"x")
+    (legacy / "_source.json").write_text(json.dumps({"fingerprint": fp}), encoding="utf-8")
+
+    monkeypatch.setattr(_os, "replace", lambda s, d: (_ for _ in ()).throw(OSError("模擬搬不動")))
+
+    _, _, _, cached = C.separate(a, stems, "htdemucs_6s")
+    assert cached is True, "搬不動也應該原地沿用,不該白白重跑 Demucs"
+    d = C.cache_dir_of(a, stems, "htdemucs_6s")
+    assert d == legacy, f"🔴 搬不動時 cache_dir_of 指到 {d.name},與 separate 用的 {legacy.name} 不一致"
+    assert (d / "vocals.flac").exists()
+
+
+def test_同程序兩執行緒不會共用暫存夾(monkeypatch, tmp_path):
+    """🔴 只用 PID 命名的話,同一個程序裡的兩個執行緒會共用同一個暫存夾互相覆寫。
+
+    ⚠️ 這條原本是**關鍵字裝飾品**(只 grep 原始碼有沒有 'uuid'),Codex 實測
+       「把 uuid 改回固定 PID 值」測試照樣通過 → 等於沒守到。改成行為測試:
+       同一個程序裡真的開兩條執行緒跑,看暫存夾名是不是兩個不同的。"""
+    _fake_torch(monkeypatch)
+    import threading
+    seen, lock = set(), threading.Lock()
+    real_mkdir = Path.mkdir
+
+    def spy(self, *a, **k):        # mkdir(parents=True) 每一層都會呼叫 → 用集合去重
+        if self.name.startswith(".tmp_"):
+            with lock:
+                seen.add(self.name)
+        return real_mkdir(self, *a, **k)
+    monkeypatch.setattr(Path, "mkdir", spy)
+
+    stems = tmp_path / "_stems"
+    songs = []
+    for i in (1, 2):
+        p = tmp_path / f"s{i}" / "song.wav"
+        _mk(p, bytes([65 + i]) * 4)
+        songs.append(p)
+    ts = [threading.Thread(target=C.separate, args=(s, stems, "htdemucs_6s")) for s in songs]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(seen) == 2, f"🔴 兩條執行緒共用同一個暫存夾(只出現 {len(seen)} 個):{seen}"
+
+
+def test_原子改名不可以吞掉非預期錯誤(monkeypatch, tmp_path):
+    """🔴 權限不足、磁碟滿、路徑太長都必須**立刻**拋出來 —— 全吞掉的話使用者會以為
+    快取寫好了,下一輪又整首重跑,而且永遠查不出原因。
+
+    ⚠️ 這條原本是關鍵字裝飾品(grep 'raise'),改成行為測試之後**還是抓不到** ——
+       因為錯誤路徑與正確路徑「最後都會拋 PermissionError」,看例外型別分不出來。
+       真正的差別是:正確版本看到「目標不存在」就直接重拋(os.replace 只被呼叫 1 次);
+       吞掉的版本會往下走到修復分支、再呼叫一次 os.replace(共 2 次)。
+       所以要**數呼叫次數**,不是看例外型別。(這一課是 Codex 逼出來的。)"""
+    _fake_torch(monkeypatch)
+    import os as _os
+    calls = []
+
+    def boom(src, dst):
+        calls.append((str(src), str(dst)))
+        raise PermissionError("模擬權限不足")
+    monkeypatch.setattr(_os, "replace", boom)
+
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    with pytest.raises(OSError):
+        C.separate(a, tmp_path / "_stems", "htdemucs_6s")
+    assert len(calls) == 1, \
+        f"🔴 目標不存在時應該立刻重拋,而不是走去修復分支再試一次(os.replace 被呼叫 {len(calls)} 次)"
+    leftovers = list((tmp_path / "_stems").glob(".tmp_*"))
+    assert not leftovers, f"炸掉後留了半成品:{leftovers}"
 
 
 def test_呼叫端不可以自己拼快取路徑():

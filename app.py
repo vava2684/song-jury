@@ -59,9 +59,14 @@ def _run(cmd, timeout=None):
        `taskkill /PID 0` —— 父程序被 run() 收掉,但 Demucs/torch 的子孫程序留在背景吃 GPU。
     """
     lim = timeout or _JOB_TIMEOUT
+    # ⛔ POSIX 一定要 start_new_session=True:不開新 session 的話子程序會留在 **本網頁服務
+    #    自己的程序群組**裡,下面那個 killpg 會把 Gradio app 甚至啟動它的 shell 一起殺掉。
+    #    Windows 用 CREATE_NEW_PROCESS_GROUP,taskkill /T 才收得乾淨。
+    _iso = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _WIN
+            else {"start_new_session": True})
     p = subprocess.Popen(cmd, cwd=str(BASE), env=ENV,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, encoding="utf-8", errors="replace")
+                         text=True, encoding="utf-8", errors="replace", **_iso)
     try:
         out, err = p.communicate(timeout=lim)
         return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)

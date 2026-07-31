@@ -297,9 +297,30 @@ if ($lost -gt 0) {
 if ($hasEnv) {
     Write-Host "`n      跑一首內建測試音(確認量測管線真的活著)..." -ForegroundColor DarkGray
     $env:PYTHONUTF8 = "1"
-    $out = & .venv\Scripts\python.exe song_scorer.py demo_mix.wav 2>&1 | Out-String
-    if ($out -match "總分") { Ok "冒煙測試通過:$((($out -split "`n" | Select-String '總分') | Select-Object -First 1).Line.Trim())"; $script:SmokeOk = $true }
-    else { Bad "冒煙測試沒過" "量測管線有問題,先看上面的錯誤訊息"; $script:SmokeOk = $false }
+    # ⛔ 不可以只 grep 顯示文字:那樣既看不出程式是不是真的成功(退出碼),
+    #    失敗時又完全查不到原因(Codex 實測遇過一次「冒煙測試沒過」但立刻重跑就過,
+    #    因為沒印原始輸出,根本無從追查)。改成:看退出碼 + 解析 JSON + 失敗印輸出。
+    $smokeJson = Join-Path $env:TEMP "song_jury_smoke_$PID.json"
+    $out = & .venv\Scripts\python.exe song_scorer.py demo_mix.wav --json $smokeJson 2>&1 | Out-String
+    $rc = $LASTEXITCODE
+    $script:SmokeOk = $false
+    if ($rc -ne 0) {
+        Bad "冒煙測試沒過(退出碼 $rc)" "量測管線有問題"
+        Write-Host ("      ↳ 原始輸出尾段:`n" + (($out -split "`n" | Select-Object -Last 12) -join "`n")) -ForegroundColor DarkGray
+    } elseif (-not (Test-Path $smokeJson)) {
+        Bad "冒煙測試沒產出 JSON" "程式回報成功卻沒寫檔"
+        Write-Host ("      ↳ 原始輸出尾段:`n" + (($out -split "`n" | Select-Object -Last 12) -join "`n")) -ForegroundColor DarkGray
+    } else {
+        try {
+            $j = Get-Content $smokeJson -Raw -Encoding UTF8 | ConvertFrom-Json
+            $tot = $j.scores.total
+            if ($null -ne $tot) { Ok "冒煙測試通過:總分 $tot / 100"; $script:SmokeOk = $true }
+            else { Bad "冒煙測試的 JSON 沒有 scores.total" "產出格式不對" }
+        } catch {
+            Bad "冒煙測試的 JSON 讀不了" $_.Exception.Message
+        }
+        Remove-Item $smokeJson -EA SilentlyContinue
+    }
 } else {
     Bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"
     $script:SmokeOk = $false

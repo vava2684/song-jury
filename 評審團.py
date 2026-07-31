@@ -502,13 +502,27 @@ def _last_json(text):
 
 
 def _unique_stem(base):
-    """在 下載/ 內找不撞名的 stem(同名重抽/多版自動加 v2/v3…,不覆蓋)。"""
+    """在 下載/ 內取一個不撞名的 stem(同名重抽/多版自動加 v2/v3…,不覆蓋)。
+
+    ⛔ 不可以只「檢查存在就回傳」(check-then-use):兩個程序同時評同一首歌時,
+       雙方都會看到「還沒有」而拿到同一個名字,接著共用同一個 .part 互相覆寫。
+       這裡用 O_CREAT|O_EXCL **原子地把名字佔起來**(先建一個 0 byte 的佔位檔),
+       誰先建成功誰就擁有這個名字,另一個會拿到下一個編號。
+    """
     dl = BASE / "下載"
+    dl.mkdir(parents=True, exist_ok=True)
     stem, k = base, 2
-    while (dl / f"{stem}.mp3").exists():
-        stem = f"{base} v{k}"
-        k += 1
-    return stem
+    while True:
+        target = dl / f"{stem}.mp3"
+        try:
+            fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)                 # 佔位成功 → 這個名字歸我(下載會覆寫它)
+            return stem
+        except FileExistsError:
+            stem = f"{base} v{k}"
+            k += 1
+            if k > 999:                  # 保險:不讓它無限繞
+                raise RuntimeError(f"下載/ 裡 {base} 的版本號已超過 999")
 
 
 def _is_youtube(url):

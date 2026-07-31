@@ -92,19 +92,38 @@ def _cache_is_valid(cache: Path, sources, fingerprint: str) -> bool:
     return rec.get("fingerprint") == fingerprint
 
 
+def _legacy_dir(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
+    """舊版共用名(沒有指紋)的快取位置。"""
+    return stems_dir / f"{audio_path.stem}__{model_name}"
+
+
+def _sidecar_fp(cache: Path):
+    try:
+        return json.loads((cache / "_source.json").read_text(encoding="utf-8")).get("fingerprint")
+    except Exception:
+        return None
+
+
 def cache_dir_of(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
     """這首歌在這個模型下的快取資料夾實際位置。
 
     ⛔ 呼叫端**不可以自己重組這個路徑** —— 編曲層次.py 曾經自己拼 `{stem}__{model}`,
        快取命名一改就對不上,vocal_stem 變成 None → 人聲柱整根靜靜消失。
+    ⛔ 這個函式與 separate() 的採用判斷**必須一致**:曾經 separate() 接受了身分相符的
+       舊快取,這裡卻回傳不存在的新 SHA 路徑 → 同一個 bug 又發生一次。
+       現在 separate() 會把合法舊快取**搬到新路徑**,所以正常情況只會有一個位置;
+       萬一搬不動(權限/跨磁碟),下面兩個 fallback 讓兩邊仍然對得起來。
     """
     ident = _source_ident(audio_path)
     newp = stems_dir / _cache_name(audio_path, model_name, ident["fingerprint"])
     if newp.is_dir():
         return newp
-    legacy = stems_dir / f"{audio_path.stem}__{model_name}"        # 舊版共用名
-    if _TRUST_LEGACY and legacy.is_dir():
-        return legacy
+    legacy = _legacy_dir(audio_path, stems_dir, model_name)
+    if legacy.is_dir():
+        if _sidecar_fp(legacy) == ident["fingerprint"]:
+            return legacy          # 身分相符 → 安全,跟 separate() 一致
+        if _TRUST_LEGACY and _sidecar_fp(legacy) is None:
+            return legacy          # 無身分但使用者明確授權沿用
     return newp
 
 
@@ -138,10 +157,19 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
     have_all = _cache_is_valid(cache, sources, fp)
 
     if not have_all:
-        legacy = stems_dir / f"{audio_path.stem}__{model_name}"       # 舊版共用名
+        legacy = _legacy_dir(audio_path, stems_dir, model_name)       # 舊版共用名
         if legacy.is_dir() and all((legacy / f"{s}.flac").exists() for s in sources):
             if _cache_is_valid(legacy, sources, fp):
-                cache, have_all = legacy, True         # 身分相符 → 安全沿用
+                # ⭐ 身分相符 → **搬到新路徑**,而不是原地沿用。
+                #    留在舊路徑的話,cache_dir_of() 與這裡就得各自維護一套「要不要接受舊名」
+                #    的判斷,兩份規則遲早漂移(已經漂過一次:vocal_stem 變 None)。
+                #    搬過去之後全系統只有一個位置,整類問題消失。改名是 metadata 操作,很快。
+                try:
+                    os.replace(legacy, cache)
+                    print(f"      ↳ 舊快取身分相符,已搬到帶指紋的新路徑:{cache.name}", flush=True)
+                    have_all = True
+                except OSError:
+                    cache, have_all = legacy, True     # 搬不動(權限/跨磁碟)就原地用
             elif not (legacy / "_source.json").exists():
                 # ⛔ 沒有身分紀錄的舊快取**不可以自動採信、更不可以蓋章成本首的身分**:
                 #    它有可能是另一首同名歌的分軌,一旦認領就把錯的分軌變成「正確快取」,

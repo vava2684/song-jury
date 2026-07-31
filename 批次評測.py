@@ -21,6 +21,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -59,6 +60,26 @@ def collect_songs(target: Path):
         else:
             print(f"⚠ 找不到,跳過:{p}", file=sys.stderr)
     return out
+
+
+def _save_store(store: Path, results: dict):
+    """原子寫入批次進度檔,並留一份上一版備份。
+
+    ⛔ 直接覆寫的話,寫到一半斷電/被 Ctrl-C 就留下半截 JSON,
+       下次 --skip-existing 讀它會 JSONDecodeError 而且**永遠修不好**。
+       做法:寫暫存檔 → flush+fsync(確定真的落地)→ 舊檔轉備份 → os.replace 原子換上。
+    """
+    tmp = store.with_suffix(f".json.tmp{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    if store.exists():
+        try:
+            shutil.copy2(store, store.with_suffix(".json.bak"))
+        except Exception:
+            pass
+    os.replace(tmp, store)
 
 
 def run_one(song: Path, timeout=3600):
@@ -208,7 +229,20 @@ def main():
     results, rows = {}, []
     store = out_dir / "批次結果.json"
     if skip and store.exists():
-        results = json.loads(store.read_text(encoding="utf-8"))
+        # ⛔ 進度檔可能是上一輪寫到一半被中斷的殘檔 → 直接 json.loads 會 JSONDecodeError
+        #    整個批次當場退出,而且**永遠修不好**(每次重跑都撞同一個壞檔)。
+        #    壞掉就退回備份;備份也壞就從頭跑,不要讓一個殘檔卡死整批。
+        try:
+            results = json.loads(store.read_text(encoding="utf-8"))
+        except Exception as e:
+            bak = store.with_suffix(".json.bak")
+            print(f"⚠ 進度檔損壞({type(e).__name__}),嘗試用備份:{bak.name}", file=sys.stderr)
+            try:
+                results = json.loads(bak.read_text(encoding="utf-8"))
+                print("  ↳ 已用備份續跑", file=sys.stderr)
+            except Exception:
+                results = {}
+                print("  ↳ 備份也不可用,這批從頭跑", file=sys.stderr)
 
     for i, (song, label) in enumerate(songs, 1):
         # ⛔ 結果鍵不可以只用檔名:歌單可以引用不同資料夾,a/song.wav 與 b/song.wav
@@ -232,7 +266,7 @@ def main():
                 m["_name"] = song.name          # 顯示名(鍵是路徑,不能拿來當標題)
                 results[key] = m
                 print(f"✓ {time.time()-t0:.0f}s")
-            store.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
+            _save_store(store, results)
 
         m = results.get(key)
         if m and "error" not in m:
