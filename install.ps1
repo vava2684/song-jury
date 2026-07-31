@@ -48,7 +48,8 @@ Write-Host @"
   ║   song-jury 歌曲評審團 · 安裝程式            ║
   ╚══════════════════════════════════════════════╝
   這會下載數 GB 的模型,依網速大約 15～60 分鐘。
-  中途可以去泡杯茶,失敗的部分最後會一次列給你。
+  ⚠️ 開頭會問你一個問題(Gemini 金鑰),回答完就可以放著不管 ——
+     之後全程自動,失敗的部分最後會一次列給你。
 
 "@ -ForegroundColor White
 
@@ -82,7 +83,35 @@ if (-not $okUv) {
     exit 1
 }
 
-# ── [2] 量測環境 ─────────────────────────────────────────────────────
+# ── [2] Gemini 金鑰 ─────────────────────────────────────────────────
+# ⚠️ 這一步**故意排在所有下載之前**。
+#    原本放在第 8 步,而橫幅又叫使用者「中途可以去泡杯茶」——
+#    人走開了,安裝就卡在 Read-Host 等輸入,回來才發現半小時原地不動。
+#    互動一律放最前面:問完就能安心離開。
+Step "Gemini 金鑰(先問完,後面就可以放著讓它自己下載)"
+if (Test-Path ".env") {
+    Ok ".env 已存在,保留你原本的金鑰設定"
+} else {
+    Write-Host ""
+    Write-Host "  ⛔ 這一把是【必要】的,不是可選:" -ForegroundColor Yellow
+    Write-Host "     律動柱(4%)100% 靠 Gemini,沒有它那根柱子整根評不出來 →" -ForegroundColor Yellow
+    Write-Host "     依九柱制的定義,這台機器就【評不出有效分數】(結構/旋律/人聲/整體/曲風也各缺一項)。" -ForegroundColor Yellow
+    Write-Host "  申請:https://aistudio.google.com/apikey  ← Google 帳號登入就能拿,免費額度夠用" -ForegroundColor White
+    # ⚠️ 非互動執行(CI、管線)時 Read-Host 會回 $null,直接 .Trim() 會拋例外
+    $key = $null
+    try { $key = Read-Host "  貼上金鑰後按 Enter(沒有的話直接按 Enter 先跳過,裝完再補)" }
+    catch { Warn "沒有互動輸入,跳過金鑰" }
+    if (-not [string]::IsNullOrWhiteSpace($key)) {
+        "GEMINI_API_KEYS=$($key.Trim())" | Out-File -FilePath ".env" -Encoding utf8 -NoNewline
+        Ok "金鑰已寫入 .env(這個檔被 .gitignore 擋著,不會被上傳)"
+    } else {
+        # ⛔ 不複製 .env.example:那裡面的「你的第一把金鑰」是佔位字串,複製過去會被程式
+        #    當成真金鑰拿去打 Google API,錯誤訊息還很難懂。乾脆不要有 .env。
+        Warn "跳過金鑰 → 裝完會顯示【評不出有效分數】;把 .env.example 複製成 .env 填進去即可"
+    }
+}
+
+# ── [3] 量測環境 ─────────────────────────────────────────────────────
 Step "建立量測環境 .venv(響度/動態/頻譜/和弦/演唱量測 + 報告)"
 $okVenv = Try-Step ".venv 建立" { uv venv --python 3.11 .venv }
 if ($okVenv) { $okVenv = Try-Step ".venv 套件安裝" { uv pip install --python .venv\Scripts\python.exe -r requirements.txt } }
@@ -151,7 +180,7 @@ if (-not $SkipML) {
     } else { Bad ".venv-audition 失敗" "人聲柱的 SingMOS 與真實風格柱會缺項" }
 
     # ── [8] 詞典與金鑰 ──────────────────────────────────────────────
-    Step "情緒詞典 + Gemini 金鑰"
+    Step "情緒詞典(情感弧線用;禁再散布,自官方源代取)"
     if ($okVenv) {
         & .venv\Scripts\python.exe setup_nrcvad.py
         if ($LASTEXITCODE -ne 0) { Warn "NRC-VAD 詞典沒取到 → 情感弧線圖不可用(不計分,不影響總分)" }
@@ -162,26 +191,6 @@ if (-not $SkipML) {
     Warn "只有量測與報告可用;九柱中有六根會缺模型細項"
 }
 
-# ── Gemini 金鑰(互動輸入)───────────────────────────────────────────
-if (-not (Test-Path ".env")) {
-    Write-Host ""
-    Write-Host "  Gemini 曲評需要一把 API 金鑰(免費額度就夠用)。" -ForegroundColor White
-    Write-Host "  申請:https://aistudio.google.com/apikey  ← 用 Google 帳號登入就能拿" -ForegroundColor DarkGray
-    Write-Host "  沒有也能跑,但律動柱(4%)會整根缺,結構/旋律/人聲/整體/曲風各缺一項。" -ForegroundColor DarkGray
-    # ⚠️ 非互動執行(CI、管線)時 Read-Host 會回 $null,直接 .Trim() 會拋例外
-    $key = $null
-    try { $key = Read-Host "  貼上金鑰後按 Enter(直接按 Enter = 跳過,之後改 .env 也行)" }
-    catch { Warn "沒有互動輸入,跳過金鑰" }
-    if (-not [string]::IsNullOrWhiteSpace($key)) {
-        $key = $key.Trim()
-        "GEMINI_API_KEYS=$($key.Trim())" | Out-File -FilePath ".env" -Encoding utf8 -NoNewline
-        Ok "金鑰已寫入 .env(這個檔被 .gitignore 擋著,不會被上傳)"
-    } else {
-        # ⛔ 不複製 .env.example:那裡面的「你的第一把金鑰」是佔位字串,複製過去會被程式
-        #    當成真金鑰拿去打 Google API,錯誤訊息還很難懂。乾脆不要有 .env。
-        Warn "跳過金鑰 → 之後把 .env.example 複製成 .env 並填入 GEMINI_API_KEYS 即可"
-    }
-} else { Ok ".env 已存在,保留你原本的金鑰設定" }
 }   # ← if (-not $CheckOnly) 結束:上面全是「安裝」,以下是「檢查」,-CheckOnly 直接跳到這
 
 # ── [9] 自我檢查:哪幾根柱子真的能用 ────────────────────────────────
