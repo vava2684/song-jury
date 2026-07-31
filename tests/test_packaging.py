@@ -22,7 +22,11 @@ def _tracked():
     r = subprocess.run(["git", "-c", "core.quotepath=false", "ls-files"],
                        cwd=REPO, capture_output=True, text=True, encoding="utf-8")
     if r.returncode != 0:
-        pytest.skip("不在 git repo 裡,跳過打包檢查")
+        # ⚠️ 這個訊息要講清楚跳了什麼 —— 從 GitHub 下載 ZIP 的人沒有 .git,
+        #    這幾條會全部跳過。程式本身不受影響(產品程式完全不依賴 git),
+        #    但「打包有沒有漏檔」這一層就沒被驗到。要驗請改用 git clone。
+        pytest.skip("這是 ZIP/非 git 目錄 → 跳過打包自足性檢查"
+                    "(程式功能不受影響;要驗打包請用 git clone 後再跑)")
     return {p.strip() for p in r.stdout.splitlines() if p.strip()}
 
 
@@ -166,6 +170,61 @@ def test_不可洩漏作者本機路徑或指向沒進repo的內部檔案():
             if m:
                 bad.append(f"{f}:{i} 出現 {m.group(0)!r}")
     assert not bad, "\n".join(bad)
+
+
+def test_下載ZIP的人拿到的換行是對的():
+    """大部分使用者不會 git clone,而是**在 GitHub 按「Download ZIP」**。
+
+    那份 ZIP 是 GitHub 用 `git archive` 產的,會套用 .gitattributes ——
+    所以 .sh 必須是純 LF(否則 Linux 一跑就噴 `bash: \\r: command not found`)、
+    .bat 必須是 CRLF(否則 cmd 會碎字)。
+    分兩層驗:
+      ① .gitattributes 有沒有宣告規則 —— 規則被刪掉,下一次提交就會生出壞掉的 ZIP
+      ② git archive 吐出來的內容對不對 —— 這才是使用者真正拿到的東西
+    ⚠️ 只驗 ② 是不夠的:archive 讀的是**已提交**的 .gitattributes,
+       工作區把規則刪掉它照樣是對的,要等提交後才爆(變異驗證抓到過)。
+    """
+    _tracked()      # 沒有 git 就跳過(ZIP 環境本身)
+
+    # ① 規則還在嗎
+    attrs = (REPO / ".gitattributes").read_text(encoding="utf-8")
+    for rule in ("*.sh", "*.bat"):
+        assert re.search(rf"^\s*\{rule}\s+.*eol=", attrs, re.M), \
+            f".gitattributes 沒有鎖 {rule} 的換行 → 下載 ZIP 的人會拿到壞掉的檔案"
+    r = subprocess.run(["git", "archive", "HEAD"], cwd=REPO, capture_output=True)
+    if r.returncode != 0:
+        pytest.skip("git archive 失敗,跳過")
+
+    import io
+    import tarfile
+    bad = []
+    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            name = m.name
+            if not name.endswith((".sh", ".bat")):
+                continue
+            b = tf.extractfile(m).read()
+            crlf = b.count(b"\r\n")
+            lf = b.count(b"\n") - crlf
+            if name.endswith(".sh") and crlf:
+                bad.append(f"{name} 在 ZIP 裡有 {crlf} 個 CRLF → Linux 會噴 bash: \\r")
+            if name.endswith(".bat") and lf:
+                bad.append(f"{name} 在 ZIP 裡有 {lf} 個純 LF → cmd 會碎字")
+    assert not bad, "\n".join(bad)
+
+
+def test_產品程式不可依賴git():
+    """ZIP 下載沒有 .git。任何產品程式若呼叫 git,ZIP 使用者就會壞掉。
+    (測試可以依賴 git —— 它們會誠實跳過並說明原因。)"""
+    bad = []
+    for f in _tracked_py():
+        src = (REPO / f).read_text(encoding="utf-8")
+        for pat in (r'"git"', r"'git'", r"\bgit ls-files\b", r"\bgit rev-parse\b"):
+            if re.search(pat, src):
+                bad.append(f"{f} 疑似呼叫 git({pat})—— ZIP 使用者沒有 .git")
+    assert not bad, "\n".join(sorted(set(bad)))
 
 
 def test_評審團py頂層只用標準庫():

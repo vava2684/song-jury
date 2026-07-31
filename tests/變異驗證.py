@@ -65,6 +65,12 @@ MUTATIONS = [
      "requests            # Gemini曲評.py 呼叫 API 用",
      "# requests 忘了寫",
      "tests/test_packaging.py::test_每個環境的第三方相依都由該環境的requirements宣告"),
+
+    ("換行沒鎖(下載 ZIP 的 Linux 使用者會噴 bash: \\r)",
+     ".gitattributes",
+     "*.sh  text eol=lf",
+     "# *.sh 沒鎖",
+     "tests/test_packaging.py::test_下載ZIP的人拿到的換行是對的"),
 ]
 
 # 打包類的變異不能靠改字串 —— 檔案一旦已被 git 追蹤,改 .gitignore 是不會讓它消失的

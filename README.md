@@ -60,7 +60,17 @@
 
 ### 完全不懂電腦的話:雙擊一個檔就好
 
-**Windows** —— 下載本專案後,雙擊 **`一鍵安裝.bat`**。
+**先把專案抓下來**,兩種都可以:
+
+- **不會用 git** → 在本頁按綠色的 **Code → Download ZIP**,解開就好(解出來的資料夾叫
+  `song-jury-master`,可以自己改名)。**功能完全一樣** —— 程式不依賴 git,
+  換行也已經處理好(`.sh` 是 LF、`.bat` 是 CRLF,有測試在守)。
+- **會用 git** → `git clone https://github.com/vava2684/song-jury.git`
+  (好處:之後 `git pull` 就能更新;另外 `tests/` 裡有 8 條打包自足性檢查需要 git,
+  ZIP 版會誠實跳過並告訴你原因。)
+
+**然後**:
+**Windows** —— 雙擊 **`一鍵安裝.bat`**。
 **Linux / macOS** —— 開終端機,`bash install.sh`。
 
 它會自己做完這些,**中間任何一步失敗都不會中斷**,最後一次告訴你哪裡沒成功:
