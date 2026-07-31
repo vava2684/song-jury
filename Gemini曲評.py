@@ -207,17 +207,32 @@ def _state_lock(timeout=10.0):
     #       (A、B 同判陳舊 → B 刪掉 A 剛建的新鎖;退出時也沒驗所有權)。
     #    OS 鎖由核心保證互斥、程序死亡自動釋放 —— 陳舊接管邏輯整段不需要存在。
     #    ⚠️ 鎖檔永遠不刪:POSIX 上 unlink+重建會讓兩個持有者鎖在不同 inode 上,互斥失效。
-    yield from _os_file_lock(STATE_FILE.with_suffix(".lock"), timeout)
+    with _os_file_lock(STATE_FILE.with_suffix(".lock"), timeout) as status:
+        # 狀態鎖:busy 與 error 都回 False(不寫比亂寫安全;冷卻只是最佳化)
+        yield status == "ok"
 
 
+@contextlib.contextmanager
 def _os_file_lock(lockf: Path, timeout: float):
-    """開檔 + 非阻塞 OS 鎖,輪詢到 timeout;yield 是否取得。關檔即釋放,永不 unlink。"""
+    """開檔 + 非阻塞 OS 鎖,輪詢到 timeout;yield "ok"/"busy"/"error"。關檔即釋放,永不 unlink。
+
+    ⛔ 「忙碌」與「壞掉」必須分開(Codex 抓到):權限問題、ENOLCK、不支援鎖的
+       網路檔案系統若被當成 busy,Gemini 會誤跳過**所有** key、工作鎖會誤報
+       「另一個工作正在處理」—— 使用者被一個根本不存在的持有者擋住。
+       只有真正的爭用 errno(EACCES/EAGAIN/EWOULDBLOCK/EDEADLK)算 busy。
+    ⚠️ 本輪驗證過本機 NTFS 與 WSL /tmp;任意 NFS/SMB 不在保證範圍。"""
+    import errno
+    _BUSY = {errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+             getattr(errno, "EDEADLK", -1), getattr(errno, "EDEADLOCK", -1)}
     f = None
-    acquired = False
+    status = "error"
     try:
         f = open(lockf, "a+", encoding="utf-8")
+    except Exception:
+        f = None          # 連鎖檔都開不了 → 鎖不可用,不是有人持有
+    if f is not None:
         t0 = time.time()
-        while time.time() - t0 < timeout:
+        while True:
             try:
                 if sys.platform == "win32":
                     import msvcrt
@@ -226,17 +241,25 @@ def _os_file_lock(lockf: Path, timeout: float):
                 else:
                     import fcntl
                     fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
+                status = "ok"
                 break
-            except OSError:
-                time.sleep(0.05)
-    except Exception:
-        pass
+            except OSError as e:
+                if e.errno in _BUSY:
+                    status = "busy"
+                    if time.time() - t0 >= timeout:
+                        break
+                    time.sleep(0.05)
+                else:
+                    status = "error"      # ENOLCK/EBADF/網路 FS… → 明確回報鎖不可用
+                    break
+            except Exception:
+                status = "error"
+                break
     try:
-        yield acquired
+        yield status
     finally:
         if f is not None:
-            if acquired and sys.platform == "win32":
+            if status == "ok" and sys.platform == "win32":
                 try:
                     import msvcrt
                     f.seek(0)
@@ -255,7 +278,16 @@ def key_lease(key: str, timeout: float = 120.0):
     租約用 OS 鎖 → 程序死亡自動釋放,不會出現「租約洩漏卡死金鑰」。
     """
     lockf = STATE_FILE.with_name(f".gemini_key_{_fingerprint(key)}.inflight")
-    yield from _os_file_lock(lockf, timeout)
+    with _os_file_lock(lockf, timeout) as status:
+        if status == "error":
+            # ⛔ 鎖壞掉(權限/ENOLCK/網路 FS)≠ 有人持有:此時若回 False,
+            #    所有 key 都會被記 busy_inflight 跳過 → 一次 API 都打不出去。
+            #    改成警告後照常放行(冷卻機制仍是兜底),互斥保證僅在鎖可用時成立。
+            print(f"⚠ 金鑰租約鎖不可用(檔案系統可能不支援鎖),本次不做同 key 互斥",
+                  file=sys.stderr)
+            yield True
+        else:
+            yield status == "ok"
 
 
 def _locked_update(mutator):
@@ -576,7 +608,6 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
                 print(f"  ⏭ 金鑰 {fp} 冷卻中(剩 {left}s,{why})→ 跳過", flush=True)
             continue
 
-        meta["keys_tried"] += 1
         # ⚠️ 金鑰放 query string 是 Google 官方寫法;所以絕不把 url 印出來或寫進 JSON。
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{GEMINI_MUSIC_MODEL}:generateContent?key={key}")
@@ -587,10 +618,25 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
         #    租約是 OS 鎖,程序死亡自動釋放;拿不到就換下一把 key,不硬等。
         with key_lease(key, timeout=5.0) as leased:
             if not leased:
+                # ⛔ 這裡**沒有**呼叫 API,所以不可以加 keys_tried ——
+                #    否則「忙碌、根本沒打」也被記成呼叫失敗,統計會說謊。
                 meta["attempts"].append({"key": fp, "result": "busy_inflight"})
                 if verbose:
                     print(f"  ⏭ 金鑰 {fp} 另一個工作使用中 → 換下一把", flush=True)
                 continue
+            # ⭐ 等租約的期間,前一個持有者可能剛收到 429 寫入冷卻 ——
+            #    ⛔ 沿用等待前的舊快照會直接對著剛被限流的 key 再打一發(Codex 探針
+            #       post_count=2)。拿到租約後**重讀**冷卻,確認仍可用才打。
+            state.clear()
+            state.update(load_state())
+            cooling, left, why = is_cooling(state, key)
+            if cooling and not ignore_cooldown:
+                meta["attempts"].append({"key": fp, "result": "skipped_cooldown_after_wait",
+                                         "cooldown_left_sec": left, "reason": why})
+                if verbose:
+                    print(f"  ⏭ 金鑰 {fp} 等租約期間被冷卻(剩 {left}s,{why})→ 跳過", flush=True)
+                continue
+            meta["keys_tried"] += 1
             for attempt in range(ATTEMPTS_PER_KEY):
                 try:
                     r = requests.post(url, json=body, timeout=timeout)

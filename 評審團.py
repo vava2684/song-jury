@@ -178,41 +178,61 @@ def build_pillar_items(physical, harmony, arrangement, gemini, songeval, audiobo
            if isinstance(v, (int, float)) and not isinstance(v, bool)}
     _pq = _g(audiobox, "PQ")
 
+    def _ev(d, *ks):
+        """取值但**保留非法原值當證據** —— 閘門會把它記進 invalid_numeric。
+        ⛔ 在這裡就轉成 None 的話,「值不合法」與「沒跑到」在報告裡無法區分
+           (Codex 抓到:bool 防線把先前承諾的 invalid_numeric 證據洗掉了)。
+        合法數字回 float;非法(bool/字串/NaN)回**原值**;真的沒有才回 None。"""
+        for k in ks:
+            d = (d or {}).get(k) if isinstance(d, dict) else None
+        if d is None:
+            return None
+        n = _num_or_none(d)
+        return n if n is not None else d
+
+    def _evnum(x):
+        if isinstance(x, dict):
+            return _ev(x, "score")
+        if x is None:
+            return None
+        n = _num_or_none(x)
+        return n if n is not None else x
+
     return {
-        "聲學": [("頻譜平衡", 26, _g(_md, "spectral_balance", "score")),
-                 ("混音結構", 18, _g(_md, "structure", "score")),
+        "聲學": [("頻譜平衡", 26, _ev(_md, "spectral_balance", "score")),
+                 ("混音結構", 18, _ev(_md, "structure", "score")),
                  ("結構清晰(SongEval)", 18, _se.get("Clarity")),
-                 ("立體聲", 10, _g(_md, "stereo", "score")),
-                 ("諧波", 10, _g(_md, "harmony", "score")),
-                 ("動態LRA", 10, _g(_md, "dynamic_range", "score")),
+                 ("立體聲", 10, _ev(_md, "stereo", "score")),
+                 ("諧波", 10, _ev(_md, "harmony", "score")),
+                 ("動態LRA", 10, _ev(_md, "dynamic_range", "score")),
                  ("製作品質(Audiobox)", 8, (_pq * 10) if _pq is not None else None)],
-        "人聲": [("嗓音品質", 23, _vnum(_vd.get("voice_quality"))),
-                 ("演唱聽感(SingMOS)", 12, _g(singmos, "score")),
-                 ("動態控制", 11, _vnum(_vd.get("dynamics"))),
-                 ("音準", 10, _vnum(_vd.get("pitch"))),
-                 ("顫音", 10, _vnum(_vd.get("vibrato"))),
-                 ("音域", 10, _vnum(_vd.get("range"))),
-                 ("人聲表現(Gemini M5)", 10, _g(_gd, "M5", "score")),
+        "人聲": [("嗓音品質", 23, _evnum(_vd.get("voice_quality"))),
+                 ("演唱聽感(SingMOS)", 12, _ev(singmos, "score")),
+                 ("動態控制", 11, _evnum(_vd.get("dynamics"))),
+                 ("音準", 10, _evnum(_vd.get("pitch"))),
+                 ("顫音", 10, _evnum(_vd.get("vibrato"))),
+                 ("音域", 10, _evnum(_vd.get("range"))),
+                 ("人聲表現(Gemini M5)", 10, _ev(_gd, "M5", "score")),
                  ("人聲自然(SongEval)", 8, _se.get("Naturalness")),
-                 ("長音穩定", 6, _vnum(_vd.get("stability")))],
-        "和聲": [("終止式", 20, _g(_hm, "cadence", "score")),
-                 ("和弦詞彙(過濾版·復權)", 19, _g(_hm, "chord_vocabulary", "score")),
-                 ("調性穩定", 18, _g(_hm, "key_stability", "score")),
-                 ("五度動線", 16, _g(_hm, "fifth_motion", "score")),
-                 ("和聲節奏", 15, _g(_hm, "harmonic_rhythm", "score")),
-                 ("延伸和弦", 12, _g(_hm, "extended_chords", "score"))],
-        "結構編曲": [("能量成長", 32, _g(arrangement, "score_growth")),
-                     ("編制變化", 18, _g(arrangement, "score_delta")),
-                     ("結構弧線(Gemini M1)", 18, _g(_gd, "M1", "score")),
+                 ("長音穩定", 6, _evnum(_vd.get("stability")))],
+        "和聲": [("終止式", 20, _ev(_hm, "cadence", "score")),
+                 ("和弦詞彙(過濾版·復權)", 19, _ev(_hm, "chord_vocabulary", "score")),
+                 ("調性穩定", 18, _ev(_hm, "key_stability", "score")),
+                 ("五度動線", 16, _ev(_hm, "fifth_motion", "score")),
+                 ("和聲節奏", 15, _ev(_hm, "harmonic_rhythm", "score")),
+                 ("延伸和弦", 12, _ev(_hm, "extended_chords", "score"))],
+        "結構編曲": [("能量成長", 32, _ev(arrangement, "score_growth")),
+                     ("編制變化", 18, _ev(arrangement, "score_delta")),
+                     ("結構弧線(Gemini M1)", 18, _ev(_gd, "M1", "score")),
                      ("連貫(SongEval)", 18, _se.get("Coherence")),
-                     ("配器音色(Gemini M4)", 14, _g(_gd, "M4", "score"))],
-        "旋律記憶": [("旋律記憶(Gemini M2)", 52, _g(_gd, "M2", "score")),
+                     ("配器音色(Gemini M4)", 14, _ev(_gd, "M4", "score"))],
+        "旋律記憶": [("旋律記憶(Gemini M2)", 52, _ev(_gd, "M2", "score")),
                      ("記憶點(SongEval)", 48, _se.get("Memorability"))],
-        "律動": [("節奏律動(Gemini M3)", 100, _g(_gd, "M3", "score"))],
+        "律動": [("節奏律動(Gemini M3)", 100, _ev(_gd, "M3", "score"))],
         "整體": [("Gemini 總分", 51, (_gt * 10) if _gt is not None else None),
                  ("音樂性(SongEval)", 49, _se.get("Musicality"))],
-        "真實風格": [("真實距離(馬氏)", 60, _g(realdist, "score")),
-                     ("曲風創新(Gemini M6)", 40, _g(_gd, "M6", "score"))],
+        "真實風格": [("真實距離(馬氏)", 60, _ev(realdist, "score")),
+                     ("曲風創新(Gemini M6)", 40, _ev(_gd, "M6", "score"))],
     }
 
 
@@ -283,7 +303,18 @@ def iter_windows(n_samples, win):
     return range(0, max(1, n_samples - win + 1), win)
 
 
-def _clean_scores(d, label, notes):
+def _fmt(v, nd=1):
+    """主控台格式化前的安全轉換:先過 _num_or_none,非法回 None(呼叫端跳過那一行)。
+
+    ⛔ 深層欄位(vocal_detail/harmony 的 {score:...})曾直接 f"{v['score']:.1f}" ——
+       引擎混一個 "N/A",正式報告都寫完了,摘要在最後一刻 ValueError 讓整個程序
+       以失敗收場(Codex 完整 _evaluate 探針重現)。清洗器管平面模型,
+       巢狀欄位一律經過這裡再印。"""
+    n = _num_or_none(v)
+    return None if n is None else f"{n:.{nd}f}"
+
+
+def _clean_scores(d, label, notes, lo=None, hi=None):
     """把引擎輸出清洗成「只含有限數字」的 dict —— 算分、JSON、主控台**共用同一份**。
 
     ⛔ 為什麼要在源頭清一次(Codex 探針):組裝層有閘門,但主控台摘要另外對
@@ -299,7 +330,17 @@ def _clean_scores(d, label, notes):
                          and math.isfinite(v)))
     if bad:
         notes.append(f"{label}:忽略非數值欄位 {bad}")
-    return {k: float(v) for k, v in d.items() if k not in bad}
+    out = {k: float(v) for k, v in d.items() if k not in bad}
+    # ⛔ 也要驗來源量尺範圍(Codex 探針:SongEval Musicality=99 →
+    #    主控台印「平均 99.0 / 5」、正式柱分卻拒絕 1980 —— 兩邊互相矛盾)。
+    #    越界在載入時就清掉並留痕,主控台與柱分才永遠一致。
+    if lo is not None and hi is not None:
+        oor = sorted(k for k, v in out.items() if not (lo <= v <= hi))
+        if oor:
+            notes.append(f"{label}:忽略超出量尺 {lo}-{hi} 的欄位 "
+                         f"{[f'{k}={out[k]}' for k in oor]}")
+            out = {k: v for k, v in out.items() if k not in oor}
+    return out
 
 
 def _scrub_nonfinite(o):
@@ -320,9 +361,14 @@ def _write_report(merged: dict, out_path: Path):
        批次的 --skip-existing 讀到它就 JSONDecodeError。"""
     cleaned = _scrub_nonfinite(merged)
     tmp = out_path.with_suffix(f".json.tmp{os.getpid()}")
-    tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, allow_nan=False),
-                   encoding="utf-8")
-    os.replace(tmp, out_path)
+    try:
+        tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, allow_nan=False),
+                       encoding="utf-8")
+        os.replace(tmp, out_path)
+    finally:
+        # 發布失敗(權限/磁碟)時舊報告保持完整,但**暫存檔要清掉**——
+        # *.json.tmpPID 不能越積越多(Codex 抓到)。成功時 tmp 已被 replace 走,無害。
+        tmp.unlink(missing_ok=True)
 
 
 def _load_stage_json(path, label):
@@ -775,7 +821,16 @@ def _job_lock(song: Path):
     ⚠️ 這把鎖只擋「同一個音檔」,不同的歌(含 SUNO 抽卡的各個 take)照樣並行。
     """
     lockf = song.with_name(f".{song.stem}.evaluating.lock")
-    f = open(lockf, "a+", encoding="utf-8")
+    try:
+        f = open(lockf, "a+", encoding="utf-8")
+    except Exception as e:
+        # 連鎖檔都開不了 = 鎖不可用,不是有人持有 —— 警告後放行,別把使用者擋在門外
+        print(f"⚠ 無法建立工作鎖({type(e).__name__}),本次不做同檔互斥保護", file=sys.stderr)
+        yield
+        return
+    import errno
+    _BUSY = {errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+             getattr(errno, "EDEADLK", -1), getattr(errno, "EDEADLOCK", -1)}
     try:
         try:
             if _WIN:
@@ -785,10 +840,16 @@ def _job_lock(song: Path):
             else:
                 import fcntl
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\n"
-                     f"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\n"
-                     f"   → 等它跑完再試。持有工作若被強制終止,OS 會自動釋放這把鎖,不必手動清。")
+        except OSError as e:
+            # ⛔「忙碌」與「壞掉」要分開(Codex 抓到):ENOLCK/不支援鎖的網路檔案系統
+            #    若被當成 busy,使用者會被一個**根本不存在的持有者**擋住。
+            #    只有真正的爭用 errno 算忙碌;其餘警告後放行(互斥保證僅在鎖可用時成立)。
+            if e.errno in _BUSY:
+                sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\n"
+                         f"   (中間檔會互相覆寫,所以同一個檔不允許同時評兩次)\n"
+                         f"   → 等它跑完再試。持有工作若被強制終止,OS 會自動釋放這把鎖,不必手動清。")
+            print(f"⚠ 工作鎖在此檔案系統不可用(errno={e.errno}),本次不做同檔互斥保護",
+                  file=sys.stderr)
         try:      # 持有者資訊只是給人看的診斷,不參與互斥
             f.seek(0)
             f.truncate()
@@ -922,7 +983,7 @@ def _evaluate(song: Path):
             else:
                 se_raw = json.loads((tmp_out / "result.json").read_text(encoding="utf-8"))
                 songeval = _clean_scores(list(se_raw.values())[0] if se_raw else {},
-                                         "SongEval", notes)
+                                         "SongEval", notes, lo=0, hi=5)
         except Exception as e:
             notes.append(f"SongEval:讀取結果失敗({e})")
         finally:
@@ -940,7 +1001,7 @@ def _evaluate(song: Path):
             print("      ↳ 跳過:Audiobox 沒安裝或執行失敗(製作品質等細項會缺)")
             notes.append(f"Audiobox:{_ab_err}")
         else:
-            audiobox = _clean_scores(_last_json(p.stdout) or {}, "Audiobox", notes)
+            audiobox = _clean_scores(_last_json(p.stdout) or {}, "Audiobox", notes, lo=0, hi=10)
     finally:
         tmp_lst.unlink(missing_ok=True)
 
@@ -1110,8 +1171,9 @@ def _evaluate(song: Path):
     if vd:
         print(f"【演唱表現】(人聲柱量測項;柱內權重=重構庭定版)")
         for k, v in vd.items():
-            if isinstance(v, dict) and v.get("score") is not None:
-                print(f"  ・{VOCAL_LABELS.get(k, k)}:{v['score']:.1f}")
+            _s = _fmt(v.get("score") if isinstance(v, dict) else None)
+            if _s is not None:
+                print(f"  ・{VOCAL_LABELS.get(k, k)}:{_s}")
 
     if arrangement and not arrangement.get("degraded"):
         a = arrangement.get("arrangement") or {}
@@ -1128,8 +1190,9 @@ def _evaluate(song: Path):
         print(f"【和聲分析】(真和弦辨識;舊「和聲豐富度」仍在物理關內並存)")
         print(f"  ・調性:{key.get('label')}  和弦段落:{harmony.get('n_chord_segments')}")
         for k, v in hm.items():
-            if isinstance(v, dict) and v.get("score") is not None:
-                print(f"  ・{HARMONY_LABELS.get(k, k)}:{v['score']:.1f}")
+            _s = _fmt(v.get("score") if isinstance(v, dict) else None)
+            if _s is not None:
+                print(f"  ・{HARMONY_LABELS.get(k, k)}:{_s}")
 
     if se_avg is None:
         print("【美學-SongEval】 缺席(沒安裝 SongEval;相關細項不計分,見文末未跑到清單)")

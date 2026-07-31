@@ -94,20 +94,57 @@ MUTATIONS = [
     # ── Codex 第七輪:OS 鎖、bool 洗白、清洗共用、原子報告 ───────────────
     ("拿不到 OS 鎖卻照樣進入評測(互斥失效)",
      "評審團.py",
-     '        except OSError:\n            sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\\n"',
-     '        except OSError:\n            pass\n        if False:\n            sys.exit(f"⛔ 這個檔正在被另一個評測工作處理中:{song.name}\\n"',
+     "            if e.errno in _BUSY:\n                sys.exit(",
+     "            if False:\n                sys.exit(",
      "tests/test_download_and_lock.py::test_同一個音檔不可以同時評兩次"),
 
     ("bool 在取值層被 float() 洗成 1.0(True 混進正式柱分)",
      "評審團.py",
      "    if isinstance(v, bool) or not isinstance(v, (int, float)):\n        return None",
      "    if not isinstance(v, (int, float)):\n        return None",
-     "tests/test_lock_and_gate.py::test_bool不可以在取值層被洗成浮點數"),
+     "tests/test_lock_and_gate.py::test_bool不可以被洗成浮點數且要留下證據"),
+
+    # ── Codex 第八輪 ──────────────────────────────────────────────────
+    ("拿到租約後沿用舊冷卻快照(對剛被限流的 key 再打一發)",
+     "Gemini曲評.py",
+     "            state.clear()\n            state.update(load_state())",
+     "            pass",
+     "tests/test_lock_and_gate.py::test_拿到租約後要重讀冷卻不可沿用舊快照"),
+
+    ("取值層把非法值抹成 None(invalid_numeric 證據消失)",
+     "評審團.py",
+     "        n = _num_or_none(d)\n        return n if n is not None else d",
+     "        return _num_or_none(d)",
+     "tests/test_lock_and_gate.py::test_bool不可以被洗成浮點數且要留下證據"),
+
+    ("清洗器不驗來源量尺(SongEval 99 讓主控台與柱分互相矛盾)",
+     "評審團.py",
+     "    if lo is not None and hi is not None:",
+     "    if False:",
+     "tests/test_lock_and_gate.py::test_clean_scores驗來源量尺範圍"),
+
+    ("深層欄位直接格式化(N/A 讓摘要在報告寫完後炸掉)",
+     "評審團.py",
+     '    n = _num_or_none(v)\n    return None if n is None else f"{n:.{nd}f}"',
+     '    return f"{v:.{nd}f}"',
+     "tests/test_lock_and_gate.py::test_深層欄位格式化不可以炸掉"),
+
+    ("報告直接覆寫正式檔(發布失敗留下半截報告)",
+     "評審團.py",
+     '    try:\n        tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, allow_nan=False),',
+     '    try:\n        out_path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2, allow_nan=False),',
+     "tests/test_lock_and_gate.py::test_報告發布失敗要保住舊報告且不留暫存"),
+
+    ("鎖壞掉被當成有人持有(所有 key 被跳過/使用者被幽靈持有者擋住)",
+     "Gemini曲評.py",
+     '                if e.errno in _BUSY:\n                    status = "busy"',
+     '                if True:\n                    status = "busy"',
+     "tests/test_lock_and_gate.py::test_鎖壞掉不可以被當成有人持有"),
 
     ("引擎輸出不清洗(摘要層 sum 到字串 → 報告寫完才 TypeError)",
      "評審團.py",
-     "    return {k: float(v) for k, v in d.items() if k not in bad}",
-     "    return dict(d)",
+     "    out = {k: float(v) for k, v in d.items() if k not in bad}",
+     "    out = dict(d)",
      "tests/test_lock_and_gate.py::test_clean_scores把非數值欄位清掉並留痕"),
 
     ("報告不清洗非有限值(寫出 NaN/Infinity 的非標準 JSON)",
@@ -118,14 +155,14 @@ MUTATIONS = [
 
     ("狀態鎖不互斥(兩個持有者同時進鎖 → lost update)",
      "Gemini曲評.py",
-     "    try:\n        yield acquired",
-     "    try:\n        yield True",
+     "        # 狀態鎖:busy 與 error 都回 False(不寫比亂寫安全;冷卻只是最佳化)\n        yield status == \"ok\"",
+     "        # 狀態鎖:busy 與 error 都回 False(不寫比亂寫安全;冷卻只是最佳化)\n        yield True",
      "tests/test_lock_and_gate.py::test_狀態鎖真的互斥"),
 
     ("金鑰租約形同虛設(同一把 key 同時被兩個工作轟)",
      "Gemini曲評.py",
-     '    lockf = STATE_FILE.with_name(f".gemini_key_{_fingerprint(key)}.inflight")\n    yield from _os_file_lock(lockf, timeout)',
-     '    lockf = STATE_FILE.with_name(f".gemini_key_{_fingerprint(key)}.inflight")\n    yield True',
+     "        else:\n            yield status == \"ok\"",
+     "        else:\n            yield True",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
     # ── Codex 第六輪 ──────────────────────────────────────────────────

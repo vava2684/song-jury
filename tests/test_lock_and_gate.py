@@ -163,16 +163,21 @@ def test_拿不到鎖絕不無鎖寫入(tmp_path, monkeypatch):
 
 
 # ── 第七輪:bool 洗白、清洗共用、原子報告、狀態鎖互斥、金鑰租約 ─────────
-def test_bool不可以在取值層被洗成浮點數():
-    """🔴 Codex 探針:引擎 JSON 給 spectral_balance.score=True →
-    float(True)=1.0 在 _g() 就洗白,中央閘門看到的是合法的 1.0 → 聲學柱正式分數 1.0。
-    要走**完整路徑**驗(引擎 dict → build_pillar_items → 閘門),不能只餵閘門。"""
+def test_bool不可以被洗成浮點數且要留下證據():
+    """🔴 兩層契約(Codex 兩輪各抓到一半):
+    第七輪:float(True)=1.0 在取值層洗白 → 聲學柱正式分數 1.0。
+    第八輪:改成轉 None 之後,「值不合法」與「沒跑到」在報告裡分不出來 ——
+            先前承諾的 invalid_numeric 證據被抹掉了。
+    正確語義:取值層**保留非法原值**,閘門拒絕它並記進 invalid_numeric。
+    要走完整路徑驗(引擎 dict → build_pillar_items → 閘門),不能只餵閘門。"""
     phys = {"mix_detail": {"spectral_balance": {"score": True}}}
     items = J.build_pillar_items(phys, {}, {}, {}, {}, {}, {}, {})
-    assert dict((n, v) for n, w, v in items["聲學"])["頻譜平衡"] is None, \
-        "🔴 True 被 float() 洗成 1.0 混進聲學柱"
+    v = dict((n, x) for n, w, x in items["聲學"])["頻譜平衡"]
+    assert v is True, f"🔴 非法原值沒被保留(拿到 {v!r})→ 證據鏈斷掉"
     out = J.build_pillar_totals(items)
-    assert out["柱分"]["聲學"]["score"] is None
+    assert out["柱分"]["聲學"]["score"] is None, "🔴 True 混進了正式分數"
+    assert "頻譜平衡" in out["柱分"]["聲學"].get("invalid_numeric", {}), \
+        "🔴 invalid_numeric 證據不見了 —— 讀報告的人會以為量測沒跑到"
 
 
 def test_clean_scores把非數值欄位清掉並留痕():
@@ -223,3 +228,98 @@ def test_同一把金鑰同時只准一個工作在打(tmp_path, monkeypatch):
             assert l2 is False, "🔴 同一把金鑰兩個工作同時在途"
         with G.key_lease("KEY-B", timeout=0.5) as other:
             assert other is True, "不同金鑰不應互相卡"
+
+
+def test_鎖壞掉不可以被當成有人持有(tmp_path, monkeypatch):
+    """🔴 Codex:權限問題/ENOLCK/不支援鎖的網路 FS 若被當成 busy ——
+    Gemini 會把**所有** key 記成 busy_inflight 跳過(一次 API 都打不出去)、
+    工作鎖會用一個根本不存在的持有者把使用者擋住。
+    正確語義:租約壞掉 → 警告後放行;狀態鎖壞掉 → 拒寫(安全方向)。"""
+    import errno as _e
+    monkeypatch.setattr(G, "STATE_FILE", tmp_path / "state.json")
+    if sys.platform == "win32":
+        import msvcrt
+        monkeypatch.setattr(msvcrt, "locking",
+                            lambda fd, m, n: (_ for _ in ()).throw(OSError(_e.ENOLCK, "no locks")))
+    else:
+        import fcntl
+        monkeypatch.setattr(fcntl, "flock",
+                            lambda fd, fl: (_ for _ in ()).throw(OSError(_e.ENOLCK, "no locks")))
+    with G.key_lease("KEY-X", timeout=0.5) as leased:
+        assert leased is True, "🔴 鎖不可用被當成有人持有 → 所有 key 都會被跳過"
+    with G._state_lock(timeout=0.5) as acq:
+        assert acq is False, "狀態鎖壞掉要拒寫(不寫比亂寫安全)"
+
+
+def test_拿到租約後要重讀冷卻不可沿用舊快照(tmp_path, monkeypatch):
+    """🔴 Codex 探針(post_count=2):A、B 同讀「沒冷卻」→ A 拿租約、吃 429、
+    寫入冷卻、釋放 → B 等到租約後**沿用等待前的舊快照**直接再打一發。
+    真的走 call_gemini:進場快照是空的、磁碟上有冷卻 → 必須 0 次 POST。"""
+    monkeypatch.setattr(G, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(G, "load_keys", lambda: ["KEY-FRESH-" + "x" * 20])
+    key = "KEY-FRESH-" + "x" * 20
+    G.cool_down({}, key, 3600, "429(別的工作剛寫入)")      # 磁碟上有冷卻
+
+    real_load = G.load_state
+    snapshots = [{}]                     # call_gemini 進場的第一次 load_state 讀到舊快照
+    monkeypatch.setattr(G, "load_state",
+                        lambda: snapshots.pop(0) if snapshots else real_load())
+
+    posts = []
+    def no_post(*a, **k):
+        posts.append(1)
+        raise RuntimeError("不該打到這")
+    monkeypatch.setattr(G.requests, "post", no_post)
+
+    mp3 = tmp_path / "x.mp3"
+    mp3.write_bytes(b"\xff\xfb" + b"\x00" * 512)             # 小假 mp3,夠編 base64 就好
+    _, meta = G.call_gemini(mp3, "zh", 5, ignore_cooldown=False, verbose=False)
+    assert posts == [], \
+        "🔴 沿用等待前的舊快照,對著剛被限流的 key 又打了一發"
+    assert any(a.get("result") == "skipped_cooldown_after_wait"
+               for a in meta["attempts"]), f"要留痕:{meta['attempts']}"
+    assert meta["keys_tried"] == 0, "沒真的打出去就不可以計入 keys_tried"
+
+
+def test_clean_scores驗來源量尺範圍():
+    """🔴 Codex 探針:SongEval Musicality=99 → 主控台印「平均 99.0 / 5」、
+    正式柱分卻拒絕 1980 —— 兩邊互相矛盾。載入時就按來源量尺清掉越界值。"""
+    notes = []
+    out = J._clean_scores({"Musicality": 99.0, "Coherence": 4.2}, "SongEval",
+                          notes, lo=0, hi=5)
+    assert out == {"Coherence": 4.2}, f"🔴 越界值沒被清掉:{out}"
+    assert any("超出量尺" in n for n in notes), "越界要留痕"
+
+
+def test_深層欄位格式化不可以炸掉():
+    """🔴 vocal_detail 混一個 score="N/A":報告寫完了,摘要 f"{v:.1f}" ValueError
+    收場 → 批次/網頁版拒收這次昂貴評測。_fmt 對非法值回 None,呼叫端跳過那行。"""
+    assert J._fmt(88.04) == "88.0"
+    assert J._fmt("N/A") is None
+    assert J._fmt(True) is None
+    assert J._fmt(float("nan")) is None
+    assert J._fmt(None) is None
+
+
+def test_報告發布失敗要保住舊報告且不留暫存(tmp_path, monkeypatch):
+    """🔴 兩個契約:(a) 發布失敗時舊報告保持完整(不是半截);
+    (b) 成敗都不留 *.json.tmpPID(Codex:失敗會累積暫存檔)。
+    模擬磁碟壞掉:寫檔寫到一半就炸。"""
+    from pathlib import Path as _P
+    out = tmp_path / "song_評審團.json"
+    out.write_text(json.dumps({"舊報告": "完整"}), encoding="utf-8")
+
+    real_write = _P.write_text
+    def disk_full(self, data, *a, **k):
+        with open(self, "w", encoding="utf-8") as f:
+            f.write(data[:10])            # 寫一半
+        raise OSError("disk full")
+    monkeypatch.setattr(_P, "write_text", disk_full)
+
+    with pytest.raises(OSError):
+        J._write_report({"新報告": 1}, out)
+    monkeypatch.setattr(_P, "write_text", real_write)
+
+    assert json.loads(out.read_text(encoding="utf-8")) == {"舊報告": "完整"}, \
+        "🔴 發布失敗把舊報告毀了(直接覆寫的症狀)"
+    assert not list(tmp_path.glob("*.tmp*")), "🔴 失敗後留下暫存檔"
