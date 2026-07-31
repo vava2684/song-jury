@@ -1,0 +1,14 @@
+# 換行鎖定 —— 不靠使用者的 core.autocrlf 設定,免得 clone 下來直接跑不動。
+#   .sh  用 CRLF 會噴 "bash: \r: command not found"
+#   .bat 用 LF   在 cmd 底下會碎字
+* text=auto
+
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.py  text eol=lf
+*.md  text eol=lf
+
+*.png binary
+*.wav binary
+*.npz binary

@@ -14,6 +14,7 @@
 
 # ── 第二步:放行「說明與設定」──
 !.gitignore
+!.gitattributes
 !README.md
 !LICENSE
 !SKILL.md
