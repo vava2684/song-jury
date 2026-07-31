@@ -4,5 +4,9 @@
 #
 # ⚠️ 測試刻意**不需要**那四個重量級 venv(torch / demucs / SongEval 合計十幾 GB)。
 #    它測的是接線與邏輯 —— 這個專案出過的 bug 幾乎全部都在那裡。
+#
+# 下面除了 pytest 之外,都是「測試要 import 那些產品模組時,它們頂層需要的輕量套件」。
+# 新的產品模組若在頂層 import 了別的輕量套件,這裡也要補一行,否則 CI 會 collect 失敗。
 pytest
-numpy
+numpy               # 分軌快取.py 頂層
+requests            # Gemini曲評.py 頂層

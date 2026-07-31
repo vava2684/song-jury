@@ -28,8 +28,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - name: 裝測試相依(只要 pytest + numpy,不裝模型)
-        run: python -m pip install --quiet --upgrade pip pytest numpy
+      - name: 裝測試相依(輕量;⛔ 不裝那四個重量級 venv)
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -r requirements-dev.txt
 
       - name: 跑測試
         env:
@@ -46,7 +48,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install --quiet --upgrade pip pytest numpy
+      - run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -r requirements-dev.txt
       - name: 把真實 bug 塞回去,確認測試會失敗
         env:
           PYTHONUTF8: "1"
