@@ -184,13 +184,14 @@ def test_下載ZIP的人拿到的換行是對的():
     ⚠️ 只驗 ② 是不夠的:archive 讀的是**已提交**的 .gitattributes,
        工作區把規則刪掉它照樣是對的,要等提交後才爆(變異驗證抓到過)。
     """
-    _tracked()      # 沒有 git 就跳過(ZIP 環境本身)
-
-    # ① 規則還在嗎
+    # ① 規則還在嗎 —— ⚠️ 這一段**離線就能驗**,要放在 _tracked() 之前。
+    #    放在後面的話,ZIP 環境會整條 skip,連能驗的部分都沒驗到(Codex 抓到)。
     attrs = (REPO / ".gitattributes").read_text(encoding="utf-8")
     for rule in ("*.sh", "*.bat"):
         assert re.search(rf"^\s*\{rule}\s+.*eol=", attrs, re.M), \
             f".gitattributes 沒有鎖 {rule} 的換行 → 下載 ZIP 的人會拿到壞掉的檔案"
+
+    _tracked()      # ② 以下要比對 archive 內容,沒有 git 就跳過(ZIP 環境本身)
     r = subprocess.run(["git", "archive", "HEAD"], cwd=REPO, capture_output=True)
     if r.returncode != 0:
         pytest.skip("git archive 失敗,跳過")

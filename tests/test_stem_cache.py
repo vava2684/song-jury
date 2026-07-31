@@ -135,6 +135,71 @@ def test_同一首歌第二次會命中快取(monkeypatch, tmp_path):
     assert C.separate(a, stems, "htdemucs_6s")[3] is True
 
 
+def test_快取夾名用完整指紋而不是前幾碼(tmp_path):
+    """🔴 前 8 碼只有 32 位元,生日碰撞期望約 65,536 個檔案 ——
+    Codex 實測 70,698 次就撞到,第二首被判 from_cache 讀到第一首的分軌。"""
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    fp = C._source_ident(a)["fingerprint"]
+    name = C._cache_name(a, "htdemucs_6s", fp)
+    assert name.endswith(fp), "快取夾名必須帶完整 SHA-256,不可以截短"
+    assert len(fp) == 64
+
+
+def test_命中快取一定要驗完整身分(tmp_path):
+    """⛔ 只信資料夾名不夠:名字可能碰撞、快取也可能被人手動搬動。"""
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    fp = C._source_ident(a)["fingerprint"]
+    srcs = ["drums", "bass", "other", "vocals"]
+    d = tmp_path / "_stems" / C._cache_name(a, "htdemucs_6s", fp)
+    d.mkdir(parents=True)
+    for s in srcs:
+        (d / f"{s}.flac").write_bytes(b"x")
+
+    (d / "_source.json").write_text(json.dumps({"fingerprint": "別首歌"}), encoding="utf-8")
+    assert not C._cache_is_valid(d, srcs, fp), "🔴 身分不符卻判有效 → 會讀到別首歌的分軌"
+
+    (d / "_source.json").unlink()
+    assert not C._cache_is_valid(d, srcs, fp), "沒有身分紀錄也不可以判有效"
+
+    (d / "_source.json").write_text(json.dumps({"fingerprint": fp}), encoding="utf-8")
+    assert C._cache_is_valid(d, srcs, fp), "身分相符時應該可以用"
+
+
+def test_無身分的舊快取預設不採信(monkeypatch, tmp_path):
+    """⛔ 沒有身分紀錄的舊快取可能是另一首同名歌的分軌。自動蓋章成本首身分的話,
+    錯的分軌會變成「正確快取」,之後所有分數都錯而且再也查不出來。
+    預設重新分軌;要沿用必須用環境變數明確授權。"""
+    _fake_torch(monkeypatch)
+    stems = tmp_path / "_stems"
+    a = tmp_path / "song.wav"
+    _mk(a, b"AAAA")
+    legacy = stems / "song__htdemucs_6s"        # 舊版共用名,沒有 _source.json
+    legacy.mkdir(parents=True)
+    for s in ["drums", "bass", "other", "vocals"]:
+        (legacy / f"{s}.flac").write_bytes(b"x")
+
+    assert C.separate(a, stems, "htdemucs_6s")[3] is False, \
+        "🔴 無身分的舊快取被自動採信了"
+    assert not (legacy / "_source.json").exists(), \
+        "🔴 不可以把本首的身分蓋章到來源不明的舊快取上"
+
+
+def test_暫存夾名要帶隨機碼():
+    """⛔ 只用 PID 的話,同一個程序裡的兩個執行緒會共用同一個暫存夾互相覆寫。"""
+    src = (REPO / "分軌快取.py").read_text(encoding="utf-8")
+    assert "uuid" in src and ".tmp_" in src, "暫存夾名應含 uuid,不能只有 PID"
+
+
+def test_原子改名只吞目標已存在的錯誤():
+    """⛔ 權限不足、磁碟滿、路徑太長都必須拋出來 —— 全部吞掉的話,使用者會以為
+    快取寫好了,下一輪又整首重跑,永遠查不出原因。"""
+    src = (REPO / "分軌快取.py").read_text(encoding="utf-8")
+    assert "if not cache.exists():" in src and "raise" in src, \
+        "os.replace 的 OSError 不可以無條件吞掉"
+
+
 def test_呼叫端不可以自己拼快取路徑():
     """🔴 真實迴歸:編曲層次.py 自己寫死 `{stem}__{model}` 拼快取路徑,
     我把快取命名加上來源指紋之後,它那份沒跟著改 → vocal_stem 變 None,

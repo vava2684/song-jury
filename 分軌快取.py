@@ -31,7 +31,12 @@ import json
 import os
 import shutil
 import sys
+import uuid
 from pathlib import Path
+
+# ⛔ 沒有身分紀錄的舊快取預設**不採信**(它可能是另一首同名歌的分軌,一旦認領就永遠錯下去)。
+#    確知舊快取正確的人,才用這個環境變數明確授權沿用。
+_TRUST_LEGACY = os.environ.get("SONG_JURY_TRUST_LEGACY_STEMS") == "1"
 
 os.environ.setdefault("PYTHONUTF8", "1")
 try:
@@ -61,19 +66,46 @@ def _source_ident(p: Path) -> dict:
     return {"name": p.name, "size": st.st_size, "fingerprint": h.hexdigest()}
 
 
+def _cache_name(audio_path: Path, model_name: str, fingerprint: str) -> str:
+    """快取資料夾名。⛔ **命名規則只能有這一份** —— 同一條規則寫兩份必定漂移
+    (編曲層次.py 自己拼過一次,加指紋後沒跟著改 → 人聲柱整根靜靜消失)。
+
+    用**完整** SHA-256,不是前幾碼:前 8 碼只有 32 位元,生日碰撞期望約 65,536 個檔案
+    —— 實測 70,698 次就撞到,第二首會被判 from_cache 讀到第一首的分軌。
+    歌名截短是為了避開 Windows 的路徑長度上限。"""
+    return f"{audio_path.stem[:40]}__{model_name}__{fingerprint}"
+
+
+def _cache_is_valid(cache: Path, sources, fingerprint: str) -> bool:
+    """這個快取夾是否「檔案齊全 **且** 身分完全相符」。
+
+    ⛔ 不可以只信資料夾名:名字可能碰撞、也可能被人手動搬動。
+       每次命中都要比對 _source.json 的**完整**指紋。"""
+    if not cache.is_dir():
+        return False
+    if not all((cache / f"{s}.flac").exists() for s in sources):
+        return False
+    try:
+        rec = json.loads((cache / "_source.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return rec.get("fingerprint") == fingerprint
+
+
 def cache_dir_of(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
     """這首歌在這個模型下的快取資料夾實際位置。
 
-    ⛔ 呼叫端**不可以自己重組這個路徑** —— 編曲層次.py 曾經自己拼
-       `{stem}__{model}`,結果快取命名一改(加上指紋)就對不上,
-       vocal_stem 變成 None → 人聲柱整根靜靜消失。規則只能有一份。
+    ⛔ 呼叫端**不可以自己重組這個路徑** —— 編曲層次.py 曾經自己拼 `{stem}__{model}`,
+       快取命名一改就對不上,vocal_stem 變成 None → 人聲柱整根靜靜消失。
     """
-    fp8 = _source_ident(audio_path)["fingerprint"][:8]
-    newp = stems_dir / f"{audio_path.stem}__{model_name}__{fp8}"
+    ident = _source_ident(audio_path)
+    newp = stems_dir / _cache_name(audio_path, model_name, ident["fingerprint"])
     if newp.is_dir():
         return newp
-    legacy = stems_dir / f"{audio_path.stem}__{model_name}"   # 舊版共用名(向下相容)
-    return legacy if legacy.is_dir() else newp
+    legacy = stems_dir / f"{audio_path.stem}__{model_name}"        # 舊版共用名
+    if _TRUST_LEGACY and legacy.is_dir():
+        return legacy
+    return newp
 
 
 def separate(audio_path: Path, stems_dir: Path, model_name: str):
@@ -100,32 +132,34 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
     #      於是都選了同一個共用資料夾,分軌檔互相覆寫、_source.json 只符合其中一首。
     #      名字一開始就不同,就沒有這個競賽條件。
     ident = _source_ident(audio_path)
-    fp8 = ident["fingerprint"][:8]
-    cache = stems_dir / f"{audio_path.stem}__{model_name}__{fp8}"
-    side = cache / "_source.json"
-    have_all = cache.is_dir() and all((cache / f"{s}.flac").exists() for s in sources)
+    fp = ident["fingerprint"]
+    cache = stems_dir / _cache_name(audio_path, model_name, fp)
+    # ⛔ 命中一定要驗**完整**指紋,不能只看資料夾在不在(名字會碰撞、也可能被手動搬動)
+    have_all = _cache_is_valid(cache, sources, fp)
 
     if not have_all:
-        # 相容舊版留下的共用名資料夾(她本機有 7.4GB,不強迫重跑數小時的 Demucs)。
-        # 有身分紀錄就驗;沒有(更舊的版本)就沿用並補寫,提醒一次。
-        legacy = stems_dir / f"{audio_path.stem}__{model_name}"
+        legacy = stems_dir / f"{audio_path.stem}__{model_name}"       # 舊版共用名
         if legacy.is_dir() and all((legacy / f"{s}.flac").exists() for s in sources):
-            rec = {}
-            lside = legacy / "_source.json"
-            if lside.exists():
-                try:
-                    rec = json.loads(lside.read_text(encoding="utf-8"))
-                except Exception:
-                    rec = {}
-            if not lside.exists():
-                print(f"      ⚠ 舊版快取沒有來源紀錄,沿用並補寫身分:{legacy.name}", flush=True)
-                try:
-                    lside.write_text(json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
-                except Exception:
-                    pass
-                cache, side, have_all = legacy, lside, True
-            elif rec.get("fingerprint") == ident["fingerprint"]:
-                cache, side, have_all = legacy, lside, True
+            if _cache_is_valid(legacy, sources, fp):
+                cache, have_all = legacy, True         # 身分相符 → 安全沿用
+            elif not (legacy / "_source.json").exists():
+                # ⛔ 沒有身分紀錄的舊快取**不可以自動採信、更不可以蓋章成本首的身分**:
+                #    它有可能是另一首同名歌的分軌,一旦認領就把錯的分軌變成「正確快取」,
+                #    之後所有分數都錯而且再也查不出來。預設重跑分軌(慢但正確)。
+                #    確知那些舊快取是對的,才用環境變數明確授權沿用。
+                if _TRUST_LEGACY:
+                    print(f"      ⚠ 依 SONG_JURY_TRUST_LEGACY_STEMS=1 沿用無身分的舊快取:"
+                          f"{legacy.name}(風險自負)", flush=True)
+                    try:
+                        (legacy / "_source.json").write_text(
+                            json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
+                    except Exception:
+                        pass
+                    cache, have_all = legacy, True
+                else:
+                    print(f"      ⚠ 舊快取 {legacy.name} 沒有來源紀錄,無法證明是這首歌的 → 重新分軌。"
+                          f"(確定那些舊快取正確的話,設 SONG_JURY_TRUST_LEGACY_STEMS=1 可沿用)",
+                          flush=True)
             # 指紋不符 → 那份是別首歌的,維持用帶指紋的新資料夾(have_all 仍為 False)
 
     if have_all:
@@ -148,7 +182,9 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
     # ⛔ 不可以直接往正式資料夾邊算邊寫:同一首歌被兩個程序同時跑時(批次 + 手動、
     #    或評審團同時要編曲與和聲),讀取端會看到「檔案數量夠了但內容還沒寫完」的半成品。
     #    改名在同一個檔案系統上是原子操作 → 讀取端只會看到「還沒有」或「完整的」。
-    tmp = stems_dir / f".tmp_{cache.name}_{os.getpid()}"
+    # ⛔ 暫存名要帶 UUID,不能只用 PID:同一個程序裡的兩個執行緒 PID 相同,
+    #    會共用同一個暫存夾互相覆寫。
+    tmp = stems_dir / f".tmp_{cache.name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     if tmp.exists():
         shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True, exist_ok=True)
@@ -162,9 +198,18 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
             json.dumps(ident, ensure_ascii=False, indent=1), encoding="utf-8")
         try:
             os.replace(tmp, cache)          # 原子發佈
-        except OSError:
-            # 目標已存在 = 另一個程序先發佈了同一首歌(資料夾名含指紋,所以內容等價)
-            shutil.rmtree(tmp, ignore_errors=True)
+        except OSError as e:
+            # ⛔ 只可以吞「目標已存在」這一種:權限不足、磁碟滿、路徑太長都必須拋出來,
+            #    否則使用者會以為快取寫好了,下一輪又整首重跑,而且永遠查不出原因。
+            if not cache.exists():
+                raise
+            if _cache_is_valid(cache, sources, fp):
+                # 另一個程序先發佈了同一首歌(名字含完整指紋,內容等價)→ 丟掉自己的暫存
+                shutil.rmtree(tmp, ignore_errors=True)
+            else:
+                # 目標存在但殘缺(上一輪中途被砍)→ 用自己這份完整的取代它,否則永遠修不好
+                shutil.rmtree(cache, ignore_errors=True)
+                os.replace(tmp, cache)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)   # 中途炸掉不留半成品
         raise

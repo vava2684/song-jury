@@ -39,9 +39,27 @@ MUTATIONS = [
 
     ("快取夾名不帶指紋(同名不同曲會共用同一份分軌 → 分數全錯)",
      "分軌快取.py",
-     'cache = stems_dir / f"{audio_path.stem}__{model_name}__{fp8}"',
-     'cache = stems_dir / f"{audio_path.stem}__{model_name}"',
+     'return f"{audio_path.stem[:40]}__{model_name}__{fingerprint}"',
+     'return f"{audio_path.stem[:40]}__{model_name}"',
      "tests/test_stem_cache.py::test_撞名時不會讀到另一首歌的分軌"),
+
+    ("快取夾名只用指紋前 8 碼(32 位元,約 7 萬個檔案就碰撞)",
+     "分軌快取.py",
+     'return f"{audio_path.stem[:40]}__{model_name}__{fingerprint}"',
+     'return f"{audio_path.stem[:40]}__{model_name}__{fingerprint[:8]}"',
+     "tests/test_stem_cache.py::test_快取夾名用完整指紋而不是前幾碼"),
+
+    ("命中快取不驗完整身分(只信資料夾名)",
+     "分軌快取.py",
+     'return rec.get("fingerprint") == fingerprint',
+     'return True',
+     "tests/test_stem_cache.py::test_命中快取一定要驗完整身分"),
+
+    ("自動採信無身分的舊快取(把別首歌的分軌蓋章成本首的)",
+     "分軌快取.py",
+     "                if _TRUST_LEGACY:",
+     "                if True:",
+     "tests/test_stem_cache.py::test_無身分的舊快取預設不採信"),
 
     ("批次不看 returncode(程式炸掉但檔案已寫出 → 誤判成功)",
      "批次評測.py",
@@ -116,15 +134,33 @@ def run_pytest(target):
        打包檢查會誠實跳過),退出碼一樣是 0 → 會被誤判成「變異沒被抓到」。
        skipped 不等於通過,也不等於失敗 —— 它代表這次根本沒驗到,必須另外標示。
     """
-    r = subprocess.run([PY, "-m", "pytest", target, "-q", "--no-header", "-x",
-                        "-p", "no:cacheprovider"],
+    # ⛔ 不可以靠解析主控台文字:pytest.ini 的 addopts 已有 -q,再加一個就變 -qq,
+    #    單一被跳過的測試只印 `s [100%]`,正則永遠找不到「1 skipped」→ skip 被誤判成
+    #    「沒抓到」。改讀 JUnit XML,結構化資料不受輸出格式影響。
+    import tempfile
+    import xml.etree.ElementTree as ET
+    with tempfile.TemporaryDirectory() as td:
+        xml = Path(td) / "r.xml"
+        subprocess.run([PY, "-m", "pytest", target, "--no-header",
+                        "-p", "no:cacheprovider", f"--junit-xml={xml}"],
                        cwd=REPO, capture_output=True, text=True,
                        encoding="utf-8", errors="replace",
                        env={**__import__("os").environ, "PYTHONUTF8": "1"})
-    out = (r.stdout or "") + (r.stderr or "")
-    failed = " failed" in out or "error" in out.lower() and r.returncode != 0
-    ran = not re.search(r"\b\d+ skipped\b", out) or re.search(r"\b\d+ (passed|failed)\b", out)
-    return bool(failed), bool(ran)
+        if not xml.exists():
+            return False, False        # 連 XML 都沒產出 = 這次沒驗到
+        root = ET.parse(xml).getroot()
+        cases = root.iter("testcase")
+        n_fail = n_skip = n_pass = 0
+        for c in cases:
+            kinds = {ch.tag for ch in c}
+            if kinds & {"failure", "error"}:
+                n_fail += 1
+            elif "skipped" in kinds:
+                n_skip += 1
+            else:
+                n_pass += 1
+    # 有任何一條真的 failed → 抓到了;全部都是 skipped(沒有 pass 也沒有 fail)→ 沒驗到
+    return n_fail > 0, (n_fail + n_pass) > 0
 
 
 def main():
@@ -172,8 +208,11 @@ def main():
         rm = subprocess.run(["git", "rm", "--cached", "-q", "--", fname],
                             cwd=REPO, capture_output=True, text=True)
         if rm.returncode != 0:
-            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⚠ 跳過:{fname} 本來就不在 index 裡")
-            bad.append(desc)
+            # ⛔ 這是「這個環境驗不了」(ZIP 沒有 .git),不是「測試沒抓到」——
+            #    算進 bad 會讓 ZIP 版永遠報 4 條缺陷沒抓到,那是假警報。
+            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}")
+            print(f"        → 這個環境沒有 git index(ZIP 版),打包類變異只能在 clone 裡驗")
+            skipped.append(desc)
             continue
         try:
             failed, ran = run_pytest(target)

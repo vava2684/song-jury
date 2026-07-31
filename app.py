@@ -52,19 +52,36 @@ _JOB_TIMEOUT = int(os.environ.get("SONG_JURY_WEB_TIMEOUT", "7200"))
 
 
 def _run(cmd, timeout=None):
-    """跑子程序;逾時就把**整棵程序樹**殺掉(只殺父程序的話,Demucs/torch 的子程序會留著吃 GPU)。"""
+    """跑子程序;逾時就把**整棵程序樹**殺掉。
+
+    ⛔ 一定要用 Popen 自己保管 PID:`subprocess.TimeoutExpired` **沒有 .pid 欄位**
+       (實測屬性只有 cmd/output/stderr/timeout),舊寫法 getattr(e,"pid",0) 等於
+       `taskkill /PID 0` —— 父程序被 run() 收掉,但 Demucs/torch 的子孫程序留在背景吃 GPU。
+    """
+    lim = timeout or _JOB_TIMEOUT
+    p = subprocess.Popen(cmd, cwd=str(BASE), env=ENV,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", errors="replace")
     try:
-        return subprocess.run(cmd, cwd=str(BASE), env=ENV, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace",
-                              timeout=timeout or _JOB_TIMEOUT)
-    except subprocess.TimeoutExpired as e:
-        if _WIN:      # taskkill /T 會連子孫程序一起收掉
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(getattr(e, "pid", 0))],
-                           capture_output=True)
+        out, err = p.communicate(timeout=lim)
+        return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)
+    except subprocess.TimeoutExpired:
+        if _WIN:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+        else:
+            import signal
+            try:      # POSIX:殺整個程序群組
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except Exception:
+                p.kill()
+        try:
+            out, err = p.communicate(timeout=10)
+        except Exception:
+            out, err = "", ""
         return subprocess.CompletedProcess(
-            cmd, 1, stdout=(e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
-            stderr=f"逾時:超過 {timeout or _JOB_TIMEOUT} 秒仍未完成,已中止。"
-                   f"(可設環境變數 SONG_JURY_WEB_TIMEOUT 調整)")
+            cmd, 1, stdout=out,
+            stderr=(err or "") + f"\n逾時:超過 {lim} 秒仍未完成,已中止整棵程序樹。"
+                                 f"(可設環境變數 SONG_JURY_WEB_TIMEOUT 調整)")
 
 
 # ── Ollama(本機免費 AI)────────────────────────────────────────
