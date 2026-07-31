@@ -80,6 +80,73 @@ def test_不可外洩版權音檔與金鑰():
     assert bad == [], f"這些不該進 repo:{bad}"
 
 
+# 哪支程式跑在哪個環境 → 它的頂層第三方相依必須由那個環境的 requirements 宣告。
+# ⚠️ 一定要**分環境**檢查,不可以把所有 requirements 併成一池:
+#    真實事故就是 requests 只寫在 requirements-web.txt(網頁版),
+#    而 Gemini曲評.py 跑在 .venv —— 併成一池的話這個 bug 檢查不出來。
+環境相依 = {
+    "requirements.txt": ["評審團", "song_scorer", "Gemini曲評", "情感弧線", "報告轉PDF",
+                         "轉PNG", "顯示規則", "批次評測", "曲評測清單", "brand_logo",
+                         "setup_nrcvad", "make_demo_song"],
+    "requirements-demucs.txt": ["分軌快取", "編曲層次", "和聲分析", "伴奏混音"],
+    "requirements-audition.txt": ["演唱聽感", "真實距離"],
+    "requirements-web.txt": ["app"],
+}
+# 套件名 ≠ import 名
+別名 = {"pillow": "pil", "praat_parselmouth": "parselmouth", "python_dotenv": "dotenv"}
+
+
+def _declared(*req_files):
+    out = set()
+    for fn in req_files:
+        p = REPO / fn
+        if not p.exists():
+            continue
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            ln = ln.split("#")[0].strip()
+            if not ln or ln.startswith("-"):
+                continue
+            name = re.split(r"[<>=!\[;]", ln)[0].strip().lower().replace("-", "_")
+            out.add(name)
+            if name in 別名:
+                out.add(別名[name])
+    return out
+
+
+@pytest.mark.parametrize("req_file", list(環境相依))
+def test_每個環境的第三方相依都由該環境的requirements宣告(req_file):
+    """🔴 真實事故:Gemini曲評.py 頂層 import requests,但 requests 只寫在
+    requirements-web.txt。作者本機靠別的套件間接帶進來所以沒事,
+    別人照 README 裝完,Gemini 曲評直接 ModuleNotFoundError —— CI 才抓出來。
+
+    ⛔ 「我本機跑得動」不是相依有沒有宣告的證據;靠別人的相依樹更不算。"""
+    import sys as _sys
+    stdlib = set(getattr(_sys, "stdlib_module_names", ()))
+    local = {p.stem for p in REPO.glob("*.py")}
+    # 網頁版是疊在 .venv 上跑的,所以它可以用 requirements.txt 宣告過的東西
+    reqs = (req_file, "requirements.txt") if req_file == "requirements-web.txt" else (req_file,)
+    declared = _declared(*reqs)
+
+    missing = []
+    for mod in 環境相依[req_file]:
+        p = REPO / f"{mod}.py"
+        if not p.exists():
+            continue
+        for node in ast.parse(p.read_text(encoding="utf-8")).body:   # 只看頂層
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                names = [node.module.split(".")[0]]
+            for n in names:
+                if n in stdlib or n in local:
+                    continue
+                if n.lower().replace("-", "_") in declared:
+                    continue
+                missing.append(f"{mod}.py 頂層 import {n},但 {req_file} 沒宣告它")
+    assert not missing, "\n".join(sorted(set(missing)))
+
+
 def test_評審團py頂層只用標準庫():
     """演唱聽感.py / 真實距離.py 跑在 .venv-audition,卻要 import 評審團 的 iter_windows。
     評審團.py 頂層一旦多一個重相依,那兩支就會在別的 venv 裡爆掉。"""

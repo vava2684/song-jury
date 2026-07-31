@@ -9,6 +9,9 @@ praat-parselmouth   # 選用:song_scorer --vocal 的嗓音品質(jitter/shimmer/
 reportlab           # 報告轉PDF
 pypdfium2           # 轉PNG(PDF→影像)
 Pillow              # 轉PNG(多頁拼長圖)
+requests            # Gemini曲評.py 呼叫 API 用
+                    # ⚠️ 曾經只寫在 requirements-web.txt,作者本機靠別的套件間接帶進來所以沒事,
+                    #    別人裝完 Gemini 曲評直接 ModuleNotFoundError。CI 才抓出來的。
 yt-dlp              # YouTube 連結輸入(另需系統 ffmpeg)
                     # ⚠️ 必須裝在 .venv:評審團.py 是用「跑自己的那個直譯器」呼叫
                     #    sys.executable -m yt_dlp,裝到別的 venv 等於沒裝。

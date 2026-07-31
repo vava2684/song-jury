@@ -60,6 +60,11 @@ MUTATIONS = [
      '"完整評測": True,',
      "tests/test_pillars.py::test_缺柱時完整評測必為False且列出缺柱"),
 
+    ("第三方相依沒宣告(作者本機間接裝了所以沒事,別人一裝就炸)",
+     "requirements.txt",
+     "requests            # Gemini曲評.py 呼叫 API 用",
+     "# requests 忘了寫",
+     "tests/test_packaging.py::test_每個環境的第三方相依都由該環境的requirements宣告"),
 ]
 
 # 打包類的變異不能靠改字串 —— 檔案一旦已被 git 追蹤,改 .gitignore 是不會讓它消失的
@@ -99,17 +104,20 @@ def main():
     bad = []
     for i, (desc, fname, old, new, target) in enumerate(MUTATIONS, 1):
         p = REPO / fname
-        src = p.read_text(encoding="utf-8")
+        # ⛔ 一定要用二進位讀寫:read_text/write_text 在 Windows 會做換行轉換,
+        #    「還原」時會把 LF 檔案寫成 CRLF,把原始碼弄髒(自己踩過)。
+        raw = p.read_bytes()
+        src = raw.decode("utf-8")
         if old not in src:
             print(f"\n[{i}/{len(MUTATIONS)}] ⚠ 跳過:在 {fname} 找不到要變異的字串")
             print(f"        ({desc})  ← 程式改過了?請更新這條變異")
             bad.append(desc)
             continue
-        p.write_text(src.replace(old, new, 1), encoding="utf-8")
+        p.write_bytes(src.replace(old, new, 1).encode("utf-8"))
         try:
             rc = run_pytest(target)
         finally:
-            p.write_text(src, encoding="utf-8")       # 一定要還原
+            p.write_bytes(raw)                        # 一定要逐位元還原
         if rc != 0:
             print(f"\n[{i}/{len(MUTATIONS)}] ✅ 抓到了:{desc}")
         else:
@@ -144,11 +152,13 @@ def main():
             print(f"     · {b}")
         return 1
     print(f"  ✅ {len(MUTATIONS) + len(GIT_MUTATIONS)} 條真實缺陷全部會被測試抓到")
-    # 最後再確認一次:所有檔案都還原乾淨了
-    r = subprocess.run(["git", "status", "--porcelain"], cwd=REPO,
-                       capture_output=True, text=True, encoding="utf-8")
-    dirty = [ln for ln in r.stdout.splitlines()
-             if any(f in ln for f in [m[1] for m in MUTATIONS])]
+    # 最後再確認一次:所有檔案都還原乾淨了。
+    # ⚠️ 要用 `git diff --name-only`(工作區 vs index),不是 `git status --porcelain` ——
+    #    後者會把「跑之前就已經 stage 的正常修改」也一起列出來,變成誤報(自己踩過)。
+    r = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--name-only"],
+                       cwd=REPO, capture_output=True, text=True, encoding="utf-8")
+    touched = {m[1] for m in MUTATIONS}
+    dirty = [ln.strip() for ln in r.stdout.splitlines() if ln.strip() in touched]
     if dirty:
         print(f"  ⚠️ 變異後沒還原乾淨:{dirty}")
         return 1

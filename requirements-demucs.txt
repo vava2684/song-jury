@@ -27,3 +27,4 @@ torchaudio==2.6.0
 
 demucs==4.0.1
 soundfile==0.14.0
+numpy               # 分軌快取.py 頂層就 import 它(demucs 會帶,但不可以靠別人的相依樹)
