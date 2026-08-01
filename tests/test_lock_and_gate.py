@@ -13,6 +13,8 @@ import json
 import math
 import subprocess
 import sys
+from pathlib import Path
+
 import pytest
 from conftest import load, REPO
 
@@ -28,6 +30,7 @@ G = load("Gemini曲評")
 _CHILD_HOLD = r"""
 import sys, time, importlib.util
 from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))   # 評審團 import 狀態目錄 要找得到
 spec = importlib.util.spec_from_file_location("J", sys.argv[1])
 J = importlib.util.module_from_spec(spec); sys.modules["J"] = J
 spec.loader.exec_module(J)
@@ -77,18 +80,38 @@ def test_持有程序被強制殺掉後立刻可以再拿鎖(tmp_path):
 def test_釋放鎖不刪鎖檔(tmp_path):
     """⛔ POSIX 上「unlink 再重建」會讓兩個工作鎖在不同 inode 上,互斥失效 ——
     flock 的經典陷阱。鎖檔一律留著。
-    🔴 Codex R9:鎖檔改集中放 BASE/_locks/(不再放歌旁邊 —— 歌在唯讀資料夾/
-    網路磁碟時,開鎖檔就失敗)。"""
+    🔴 Codex R9:鎖檔集中管理,不放歌旁邊(歌在唯讀資料夾/網路磁碟時開鎖檔就失敗);
+    🔴 Codex R10:再從 BASE/_locks 移到**使用者全域狀態目錄**(BASE 跟著副本走,
+    兩份 ZIP 副本會各鎖各的)。"""
+    import os as _os
     song = tmp_path / "song.wav"
     song.write_bytes(b"x")
     lockf = J._lock_path_for(song)
-    assert lockf.parent == J.BASE / "_locks", \
-        f"🔴 鎖檔要集中在 BASE/_locks,不是 {lockf.parent}"
+    assert lockf.parent == Path(_os.environ["SONG_JURY_STATE_DIR"]) / "_locks", \
+        f"🔴 鎖檔要在全域狀態目錄的 _locks,不是 {lockf.parent}"
     with J._job_lock(song):
         assert lockf.exists()
     assert lockf.exists(), "🔴 鎖檔被刪了 —— unlink+重建會破壞 flock 互斥"
     with J._job_lock(song):        # 而且要能立刻重新取得
         pass
+
+
+def test_鎖的位置跟工具副本無關(tmp_path, monkeypatch):
+    """🔴 Codex R10:鎖放 BASE/_locks → 電腦上同時存在兩份 ZIP 副本(新舊版並存、
+    App 與 CLI 來自不同資料夾)時,各副本各鎖各的,對同一首歌照樣雙雙進鎖;
+    Gemini 冷卻/租約也各一套,同一把 key 被兩個副本同時轟。
+    鎖的身分必須只由「這台機器 + 歌的絕對路徑」決定,跟 BASE 無關。"""
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    monkeypatch.setattr(J, "BASE", tmp_path / "copyA")
+    p1 = J._lock_path_for(song)
+    monkeypatch.setattr(J, "BASE", tmp_path / "copyB")
+    p2 = J._lock_path_for(song)
+    assert p1 == p2, "🔴 不同副本(BASE)算出不同鎖檔 → 互斥只在單一副本內成立"
+    assert str(tmp_path / "copyA") not in str(p1) and str(tmp_path / "copyB") not in str(p2), \
+        "鎖檔不可以在任何副本(BASE)底下"
+    # Gemini 冷卻狀態同理:不可放在 repo(副本)底下
+    assert G.STATE_FILE.parent != REPO, "🔴 Gemini 狀態檔還在副本目錄裡"
 
 
 # ── 數值閘門 ────────────────────────────────────────────────────────

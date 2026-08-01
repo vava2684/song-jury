@@ -116,11 +116,24 @@ def ollama_judge(model, prompt):
 
 # ── 成績單整理 ─────────────────────────────────────────────────
 def _score_table(merged):
-    p = merged["layer1_physical"]
-    se = merged["layer2_songeval_1to5"]
-    ab = merged["layer2_audiobox_1to10"]
-    rows = [["🎚 物理技術(總分/100)", f'{p["scores"]["total"]}({p["scores"]["grade"]})']]
-    for k, v in p.get("mix_detail", {}).items():
+    # ⛔ 巢狀容器不可假定型別:引擎異常時 scores 可能是 []、mix_detail 可能是 list
+    #    (Codex R10 探針:scores: [] → TypeError)。昂貴評測已寫進 JSON,
+    #    顯示層不可以再把它炸掉 —— 全部先投影成 dict、數字驗過才格式化。
+    import math as _math
+    def _d(v):
+        return v if isinstance(v, dict) else {}
+    def _num(v):
+        ok = isinstance(v, (int, float)) and not isinstance(v, bool) and _math.isfinite(v)
+        return v if ok else None
+    p = _d(merged.get("layer1_physical"))
+    se = {k: _num(v) for k, v in _d(merged.get("layer2_songeval_1to5")).items()
+          if _num(v) is not None}
+    ab = {k: _num(v) for k, v in _d(merged.get("layer2_audiobox_1to10")).items()
+          if _num(v) is not None}
+    sc = _d(p.get("scores"))
+    rows = [["🎚 物理技術(總分/100)", f'{sc.get("total", "—")}({sc.get("grade", "—")})']]
+    for k, v in _d(p.get("mix_detail")).items():
+        v = _d(v)
         rows.append([f"　・{k}", f'{v.get("score","")}｜{v.get("comment","")}'])
     se_lab = {"Coherence": "整體連貫性", "Musicality": "整體音樂性", "Memorability": "記憶點",
               "Clarity": "結構清晰度", "Naturalness": "人聲自然度"}

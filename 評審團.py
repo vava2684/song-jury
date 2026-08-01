@@ -34,6 +34,9 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 BASE = Path(__file__).parent.resolve()
 ENV = {**os.environ, "PYTHONUTF8": "1"}
 
+# 鎖檔的全域位置(⛔ 不放 BASE:兩份 ZIP 副本會各鎖各的,互斥失效 —— Codex R10)
+from 狀態目錄 import state_root
+
 # Windows:子程序不要各自彈出主控台黑框(一次評測會開好幾個子程序)。Linux 無此旗標 → 空 dict。
 _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {}
 
@@ -324,6 +327,15 @@ def _text_or_empty(v):
        正式報告都發布完了,摘要在最後一刻 AttributeError('list' has no 'replace')
        讓整個程序以失敗收場(Codex 完整 _evaluate 探針重現)。"""
     return v if isinstance(v, str) else ""
+
+
+def _dict_or_empty(v):
+    """只有 dict 才拿去 .get()/.items();其他型別(引擎異常吐 list/字串)回空 dict。
+
+    ⛔ `x.get("k") or {}` 擋不住非空 list:arrangement={"arrangement": ["bad"]} 時
+       `or` 短路不了,後面 a.get() 直接 AttributeError —— 而那時正式報告已經發布,
+       炸的只是摘要,批次/網頁版卻因 returncode 拒收整次昂貴評測(Codex R10)。"""
+    return v if isinstance(v, dict) else {}
 
 
 def _fmt(v, nd=1):
@@ -829,12 +841,16 @@ def resolve_input(arg):
 
 
 def _lock_path_for(song: Path) -> Path:
-    """這首歌的工作鎖檔位置:BASE/_locks/job_<絕對路徑雜湊>.lock。
+    """這首歌的工作鎖檔位置:<使用者全域狀態目錄>/_locks/job_<絕對路徑雜湊>.lock。
 
     ⛔ 不放在歌曲旁邊:歌可能在不支援檔案鎖的網路磁碟(NFS/SMB)上,
        鎖 backend 一壞就得在「fail-open(取消互斥)」與「擋住使用者」之間二選一。
-       放在工具自己的本機目錄,兩難消失。鎖檔 0 byte、永不刪(flock inode 陷阱)。"""
-    d = BASE / "_locks"
+    ⛔ 也不放在 BASE(工具資料夾)底下:電腦上同時存在兩份 ZIP 副本
+       (新舊版並存、App 與 CLI 來自不同資料夾)時,各副本各鎖各的,
+       對同一首歌照樣雙雙進鎖(Codex R10 實測)。鎖要鎖「這台機器上的這首歌」,
+       所以位置必須跟副本無關 —— 見 狀態目錄.py。
+       鎖檔 0 byte、永不刪(flock inode 陷阱)。"""
+    d = state_root() / "_locks"
     d.mkdir(exist_ok=True)
     h = hashlib.sha256(str(song.resolve()).encode("utf-8")).hexdigest()[:16]
     return d / f"job_{h}.lock"
@@ -1175,101 +1191,112 @@ def _evaluate(song: Path):
     }
     out_path = song.with_name(song.stem + "_評審團.json")
     _write_report(merged, out_path)   # 清洗非有限值 + allow_nan=False + 原子發布
+    # ⛔ 以下全部是「顯示」:報告已原子發布並通過清洗,摘要再怎麼炸都不可以
+    #    讓程序以失敗收場(returncode≠0 會害批次/網頁版拒收整次昂貴評測)。
+    #    型別防線(_dict_or_empty/_fmt/_text_or_empty)是第一道;這層 try 是
+    #    最後的保險絲 —— 兩道都在,缺一不可(Codex R10)。
+    try:
 
-    se_avg = (sum(songeval.values()) / len(songeval)) if songeval else None   # SongEval 沒裝時為 None
-    print()
-    print("=" * 54)
-    print("  評審團總表(九柱制,重構庭 2026-07-25 定版)")
-    print("=" * 54)
-    for pname in ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動"):
-        pd = pillar_detail.get(pname) or {}
-        sc = pd.get("score")
-        tail = f"(缺:{'/'.join(pd['missing'])})" if pd.get("missing") else ""
-        print(f"【{pname}柱 {PILLAR_W[pname]:>4.1f}%】 {sc if sc is not None else '—'} / 100 {tail}")
-    # ⛔ 缺柱時**不可以把合成分印得像一個正常分數**。
-    #    九柱制的滿分定義是「九根柱子都在」;少一根就是換了一把尺,那個數字不能拿去跟別人比,
-    #    也不能拿去排行。這裡把「不完整」講在分數同一行,而不是塞在下面的小字裡。
-    _lost_p = _pt["缺柱"]
-    _lost_w = _pt["缺柱權重合計"]
-    if _song_side is not None and not _lost_p:
-        print(f"【曲側合成】 {_song_side} / 100(八柱加權;詞柱 25.3% 由報告階段依四把尺合成)")
-    elif _song_side is not None:
+        se_avg = (sum(songeval.values()) / len(songeval)) if songeval else None   # SongEval 沒裝時為 None
         print()
-        print("!" * 54)
-        print(f"  ⛔ 這不是一份完整評測 —— 缺了 {len(_lost_p)} 根柱、合計 {_lost_w}% 權重")
-        print(f"     缺柱:{'、'.join(_lost_p)}")
-        print(f"     下面這個 {_song_side} 是「只用剩下幾根柱重新歸一化」算出來的,")
-        print("     ⛔ 不可與完整評測互比、不可拿去排行、不可當作品的評測結果。")
-        print("     → 把安裝補齊(重跑安裝檔或 install 腳本 -CheckOnly 看缺什麼)再評一次。")
-        print("!" * 54)
-        print(f"【曲側合成(不完整・僅供除錯)】 {_song_side} / 100")
-    _pai = _g(realdist, "sonics_p_ai")
-    if _pai is not None:
-        print(f"【AI 感(顯示軸,不入分)】 P(AI)={_pai:.2f}(新版 SUNO 漏抓~31%,判「真」不保證非 AI)")
-    print(f"【凍結中】 演唱.rhythm(T2b 10:3)・和聲.non_diatonic(9:4)—— 過考+單格重開才復權")
-    print(f"【物理技術(舊制參考)】 {physical['scores']['total']} / 100(等級 {physical['scores']['grade']})")
+        print("=" * 54)
+        print("  評審團總表(九柱制,重構庭 2026-07-25 定版)")
+        print("=" * 54)
+        for pname in ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動"):
+            pd = pillar_detail.get(pname) or {}
+            sc = pd.get("score")
+            tail = f"(缺:{'/'.join(pd['missing'])})" if pd.get("missing") else ""
+            print(f"【{pname}柱 {PILLAR_W[pname]:>4.1f}%】 {sc if sc is not None else '—'} / 100 {tail}")
+        # ⛔ 缺柱時**不可以把合成分印得像一個正常分數**。
+        #    九柱制的滿分定義是「九根柱子都在」;少一根就是換了一把尺,那個數字不能拿去跟別人比,
+        #    也不能拿去排行。這裡把「不完整」講在分數同一行,而不是塞在下面的小字裡。
+        _lost_p = _pt["缺柱"]
+        _lost_w = _pt["缺柱權重合計"]
+        if _song_side is not None and not _lost_p:
+            print(f"【曲側合成】 {_song_side} / 100(八柱加權;詞柱 25.3% 由報告階段依四把尺合成)")
+        elif _song_side is not None:
+            print()
+            print("!" * 54)
+            print(f"  ⛔ 這不是一份完整評測 —— 缺了 {len(_lost_p)} 根柱、合計 {_lost_w}% 權重")
+            print(f"     缺柱:{'、'.join(_lost_p)}")
+            print(f"     下面這個 {_song_side} 是「只用剩下幾根柱重新歸一化」算出來的,")
+            print("     ⛔ 不可與完整評測互比、不可拿去排行、不可當作品的評測結果。")
+            print("     → 把安裝補齊(重跑安裝檔或 install 腳本 -CheckOnly 看缺什麼)再評一次。")
+            print("!" * 54)
+            print(f"【曲側合成(不完整・僅供除錯)】 {_song_side} / 100")
+        _pai = _g(realdist, "sonics_p_ai")
+        if _pai is not None:
+            print(f"【AI 感(顯示軸,不入分)】 P(AI)={_pai:.2f}(新版 SUNO 漏抓~31%,判「真」不保證非 AI)")
+        print(f"【凍結中】 演唱.rhythm(T2b 10:3)・和聲.non_diatonic(9:4)—— 過考+單格重開才復權")
+        _psc = _dict_or_empty(physical.get("scores"))
+        print(f"【物理技術(舊制參考)】 {_psc.get('total', '—')} / 100(等級 {_psc.get('grade', '—')})")
 
-    # 演唱各項照常列分;它是否併進上面那個總分,看 weighting.vocal_blended_into_total
-    vd = physical.get("vocal_detail") or {}
-    if vd:
-        print(f"【演唱表現】(人聲柱量測項;柱內權重=重構庭定版)")
-        for k, v in vd.items():
-            _s = _fmt(v.get("score") if isinstance(v, dict) else None)
-            if _s is not None:
-                print(f"  ・{VOCAL_LABELS.get(k, k)}:{_s}")
+        # 演唱各項照常列分;它是否併進上面那個總分,看 weighting.vocal_blended_into_total
+        # ⛔ 巢狀容器一律過 _dict_or_empty:`or {}` 擋不住引擎異常吐出的非空 list(Codex R10)
+        vd = _dict_or_empty(physical.get("vocal_detail"))
+        if vd:
+            print(f"【演唱表現】(人聲柱量測項;柱內權重=重構庭定版)")
+            for k, v in vd.items():
+                _s = _fmt(v.get("score") if isinstance(v, dict) else None)
+                if _s is not None:
+                    print(f"  ・{VOCAL_LABELS.get(k, k)}:{_s}")
 
-    if arrangement and not arrangement.get("degraded"):
-        a = arrangement.get("arrangement") or {}
-        lay = arrangement.get("layers") or {}
-        print("【編曲層次】(Demucs 六軌;能量成長/編制變化入結構編曲柱,其餘顯示)")
-        print(f"  ・樂器組合種類:{a.get('n_unique_configs')}")   # 段落數已廢(V3 11:2)=零顯示
-        print(f"  ・前奏→高潮成長:{a.get('intro_to_peak_growth')}  段間變化:{a.get('mean_arrangement_delta')}")
-        if lay:
-            print(f"  ・同時在響的軌數:{json.dumps(lay, ensure_ascii=False)[:70]}")
+        if arrangement and not arrangement.get("degraded"):
+            a = _dict_or_empty(arrangement.get("arrangement"))
+            lay = _dict_or_empty(arrangement.get("layers"))
+            print("【編曲層次】(Demucs 六軌;能量成長/編制變化入結構編曲柱,其餘顯示)")
+            print(f"  ・樂器組合種類:{a.get('n_unique_configs')}")   # 段落數已廢(V3 11:2)=零顯示
+            print(f"  ・前奏→高潮成長:{a.get('intro_to_peak_growth')}  段間變化:{a.get('mean_arrangement_delta')}")
+            if lay:
+                print(f"  ・同時在響的軌數:{json.dumps(lay, ensure_ascii=False)[:70]}")
 
-    if harmony and not harmony.get("degraded"):
-        hm = harmony.get("metrics") or {}
-        key = harmony.get("key") or {}
-        print(f"【和聲分析】(真和弦辨識;舊「和聲豐富度」仍在物理關內並存)")
-        print(f"  ・調性:{key.get('label')}  和弦段落:{harmony.get('n_chord_segments')}")
-        for k, v in hm.items():
-            _s = _fmt(v.get("score") if isinstance(v, dict) else None)
-            if _s is not None:
-                print(f"  ・{HARMONY_LABELS.get(k, k)}:{_s}")
+        if harmony and not harmony.get("degraded"):
+            hm = _dict_or_empty(harmony.get("metrics"))
+            key = _dict_or_empty(harmony.get("key"))
+            print(f"【和聲分析】(真和弦辨識;舊「和聲豐富度」仍在物理關內並存)")
+            print(f"  ・調性:{key.get('label')}  和弦段落:{harmony.get('n_chord_segments')}")
+            for k, v in hm.items():
+                _s = _fmt(v.get("score") if isinstance(v, dict) else None)
+                if _s is not None:
+                    print(f"  ・{HARMONY_LABELS.get(k, k)}:{_s}")
 
-    if se_avg is None:
-        print("【美學-SongEval】 缺席(沒安裝 SongEval;相關細項不計分,見文末未跑到清單)")
-    else:
-        print(f"【美學-SongEval】 平均 {se_avg:.2f} / 5")
-        for k, v in songeval.items():
-            print(f"  ・{SONGEVAL_LABELS.get(k, k)}:{v:.2f}")
-    if not audiobox:
-        print("【美學-Audiobox】 缺席(沒安裝 Audiobox;相關細項不計分)")
-    else:
-        print("【美學-Audiobox】(1–10)")
-        for k in ("PQ", "CE", "CU", "PC"):
-            if k in audiobox:
-                print(f"  ・{AUDIOBOX_LABELS[k]}:{audiobox[k]:.2f}")
+        if se_avg is None:
+            print("【美學-SongEval】 缺席(沒安裝 SongEval;相關細項不計分,見文末未跑到清單)")
+        else:
+            print(f"【美學-SongEval】 平均 {se_avg:.2f} / 5")
+            for k, v in songeval.items():
+                print(f"  ・{SONGEVAL_LABELS.get(k, k)}:{v:.2f}")
+        if not audiobox:
+            print("【美學-Audiobox】 缺席(沒安裝 Audiobox;相關細項不計分)")
+        else:
+            print("【美學-Audiobox】(1–10)")
+            for k in ("PQ", "CE", "CU", "PC"):
+                if k in audiobox:
+                    print(f"  ・{AUDIOBOX_LABELS[k]}:{audiobox[k]:.2f}")
 
-    if gemini and not gemini.get("degraded"):
-        dims = gemini.get("dimensions") or {}
-        print("【Gemini 曲評】(聽真音檔,每維引時間碼)")
-        for k, v in dims.items():
-            if isinstance(v, dict):
-                sc = _fmt(v.get("score"), 0)
-                cm = _text_or_empty(v.get("comment")).replace("\n", " ")
-                print(f"  ・{k}:{sc if sc is not None else '無法判'}　{cm[:52]}")
+        if gemini and not gemini.get("degraded"):
+            dims = gemini.get("dimensions") or {}
+            print("【Gemini 曲評】(聽真音檔,每維引時間碼)")
+            for k, v in dims.items():
+                if isinstance(v, dict):
+                    sc = _fmt(v.get("score"), 0)
+                    cm = _text_or_empty(v.get("comment")).replace("\n", " ")
+                    print(f"  ・{k}:{sc if sc is not None else '無法判'}　{cm[:52]}")
 
-    # ⛔ Music Flamingo 成績單區塊已移除(見上方 flamingo = None 處的判死依據)
+        # ⛔ Music Flamingo 成績單區塊已移除(見上方 flamingo = None 處的判死依據)
 
-    print(f"【詞曲文本】 把歌詞貼給 Claude 說「評詞」,依 rubrics\\ 四把尺評")
-    if notes:
+        print(f"【詞曲文本】 把歌詞貼給 Claude 說「評詞」,依 rubrics\\ 四把尺評")
+        if notes:
+            print("-" * 54)
+            print("⚠️ 本次未完全跑到的項目:")
+            for n in notes:
+                print(f"  ・{n}")
         print("-" * 54)
-        print("⚠️ 本次未完全跑到的項目:")
-        for n in notes:
-            print(f"  ・{n}")
-    print("-" * 54)
-    print(f"完整報告:{out_path}")
+        print(f"完整報告:{out_path}")
+    except Exception as e:                       # SystemExit 不在此列,照樣往外拋
+        print(f"\n⚠ 摘要顯示失敗({type(e).__name__}: {e})—— 這只是顯示問題,"
+              f"評測本身已完成且報告完整寫出。")
+        print(f"完整報告:{out_path}")
 
 
 if __name__ == "__main__":

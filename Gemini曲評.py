@@ -35,6 +35,7 @@ import base64
 import hashlib
 import json
 import contextlib
+import math
 import os
 import re
 import sys
@@ -52,7 +53,11 @@ import requests
 
 BASE = Path(__file__).parent.resolve()
 ENV_FILE = BASE / ".env"
-STATE_FILE = BASE / ".gemini_key_state.json"
+# ⛔ 冷卻狀態與金鑰租約不放 BASE:兩份 ZIP 副本會各自一套冷卻/租約,
+#    同一把 key 照樣被兩個副本同時轟(Codex R10)。金鑰是「這台機器」的資源,
+#    狀態就要放使用者全域目錄 —— 見 狀態目錄.py。(.env 留在 BASE:金鑰設定跟副本走)
+from 狀態目錄 import state_root
+STATE_FILE = state_root() / ".gemini_key_state.json"
 
 # ── 模型與可調門檻(啟發式起手值,非論文數據)────────────────────────────
 GEMINI_MUSIC_MODEL = "gemini-3.5-flash"   # 網頁版實測:2.5-flash 對新金鑰停用,3.5-flash 才吃音檔
@@ -188,10 +193,43 @@ def load_keys() -> list:
 
 
 def load_state() -> dict:
+    """讀冷卻狀態,**驗過 schema 才交出去**。
+
+    ⛔ 合法 JSON ≠ 合法狀態:頂層是 [] 時 state.get() 直接 AttributeError,
+       整個 Gemini subprocess 非零退出 → 評測缺柱(Codex R10 實測)。
+       record 不是 dict、cooldown_until 不是有限數字,也會在 is_cooling 炸。
+       壞檔隔離成 .corrupt(留證據)後回空狀態,不讓一個壞檔癱瘓整關。"""
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {}
+    except Exception:
+        _quarantine_state("JSON 解析失敗")
+        return {}
+    if not isinstance(raw, dict):
+        _quarantine_state(f"頂層是 {type(raw).__name__},應為 dict")
+        return {}
+    out = {}
+    for fp, rec in raw.items():
+        if not isinstance(rec, dict):
+            continue                       # 單筆壞 → 丟單筆就好,別整檔陪葬
+        cu = rec.get("cooldown_until", 0)
+        if isinstance(cu, bool) or not isinstance(cu, (int, float)) or not math.isfinite(cu):
+            continue
+        out[fp] = rec
+    return out
+
+
+def _quarantine_state(why: str):
+    """把壞掉的狀態檔改名成 .corrupt 隔離(留證據,且下次不會再讀到它)。"""
+    try:
+        bad = STATE_FILE.with_suffix(".json.corrupt")
+        bad.unlink(missing_ok=True)
+        STATE_FILE.rename(bad)
+        print(f"⚠ Gemini 狀態檔壞掉({why})→ 已隔離成 {bad.name},以空狀態繼續",
+              file=sys.stderr)
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
@@ -315,8 +353,9 @@ def _locked_update(mutator):
         return False
 
 
-def merge_cooldown(fp: str, record: dict):
-    """寫入/更新一把金鑰的冷卻。同一把取**較晚到期**的(寧可多冷卻,不誤放行)。"""
+def merge_cooldown(fp: str, record: dict) -> bool:
+    """寫入/更新一把金鑰的冷卻。同一把取**較晚到期**的(寧可多冷卻,不誤放行)。
+    回傳是否真的寫進磁碟了。"""
     def _m(cur):
         old = cur.get(fp)
         if isinstance(old, dict):
@@ -325,12 +364,13 @@ def merge_cooldown(fp: str, record: dict):
             if _o > _n:
                 return                 # 磁碟上那筆比較晚到期 → 保留它
         cur[fp] = record
-    _locked_update(_m)
+    return _locked_update(_m)
 
 
-def delete_cooldown(fp: str):
-    """金鑰確認是好的 → 把它的冷卻從磁碟上真的刪掉(merge 表達不了刪除)。"""
-    _locked_update(lambda cur: cur.pop(fp, None))
+def delete_cooldown(fp: str) -> bool:
+    """金鑰確認是好的 → 把它的冷卻從磁碟上真的刪掉(merge 表達不了刪除)。
+    寫入失敗頂多是「好金鑰多冷卻一陣」,方向安全,呼叫端不必特別處理。"""
+    return _locked_update(lambda cur: cur.pop(fp, None))
 
 
 def save_state(state: dict):
@@ -340,7 +380,13 @@ def save_state(state: dict):
             merge_cooldown(k, v)
 
 
-def cool_down(state: dict, key: str, seconds: float, reason: str):
+def cool_down(state: dict, key: str, seconds: float, reason: str) -> bool:
+    """標冷卻:記憶體 + 磁碟。回傳**磁碟有沒有真的寫成**。
+
+    ⛔ 寫入失敗(磁碟滿/狀態鎖壞)不可以裝作已冷卻:本程序自己的 state dict
+       記得住,但**其他評測工作看不到**,會立刻再轟這把剛被限流的 key
+       (Codex R10 注入 _locked_update→False 實測同 key 連打兩次)。
+       呼叫端要把失敗記進 attempts(cooldown_persist_error),不可只印「已冷卻」。"""
     fp = _fingerprint(key)
     rec = {
         "cooldown_until": time.time() + seconds,
@@ -348,7 +394,11 @@ def cool_down(state: dict, key: str, seconds: float, reason: str):
         "marked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     state[fp] = rec
-    merge_cooldown(fp, rec)
+    persisted = merge_cooldown(fp, rec)
+    if not persisted:
+        print(f"⚠ 金鑰 {fp} 的冷卻**寫不進磁碟**(狀態鎖失敗或磁碟問題)——"
+              f"本程序記得,但其他評測工作看不到,可能再打這把 key", file=sys.stderr)
+    return persisted
 
 
 def is_cooling(state: dict, key: str):
@@ -721,7 +771,10 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
                         time.sleep(min(delay + 2, MAX_SLEEP_SEC))
                         continue
                     # 等不起(或重試用完)→ 標冷卻,換下一把
-                    cool_down(state, key, max(delay, COOLDOWN_RATE_SEC), "429 額度/頻率上限")
+                    if not cool_down(state, key, max(delay, COOLDOWN_RATE_SEC), "429 額度/頻率上限"):
+                        # ⛔ 冷卻沒寫進磁碟就不可以只說「已冷卻」—— 其他工作看不到,
+                        #    會立刻再轟這把剛被限流的 key(Codex R10)。誠實留痕。
+                        meta["attempts"].append({"key": fp, "result": "cooldown_persist_error"})
                     if verbose:
                         print(f"  ↪ 金鑰 {fp}:429 且等不起 → 冷卻並換下一把", flush=True)
                     break
@@ -734,7 +787,8 @@ def call_gemini(audio_path: Path, out_lang: str, timeout: int, ignore_cooldown: 
                         meta["attempts"].append({"key": fp, "attempt": attempt + 1,
                                                  "result": "key_rejected", "http": r.status_code,
                                                  "error": emsg[:200]})
-                        cool_down(state, key, COOLDOWN_DEAD_SEC, f"HTTP {r.status_code} 金鑰無效/被拒")
+                        if not cool_down(state, key, COOLDOWN_DEAD_SEC, f"HTTP {r.status_code} 金鑰無效/被拒"):
+                            meta["attempts"].append({"key": fp, "result": "cooldown_persist_error"})
                         if verbose:
                             print(f"  ↪ 金鑰 {fp}:HTTP {r.status_code} 金鑰無效/被拒 → 冷卻 24h,換下一把", flush=True)
                         break

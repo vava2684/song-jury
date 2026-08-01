@@ -10,3 +10,4 @@
 pytest
 numpy               # 分軌快取.py 頂層
 requests            # Gemini曲評.py 頂層
+reportlab           # 報告轉PDF.py 頂層(諺文偵測/圖片縮放的純邏輯測試要 import 它)

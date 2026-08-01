@@ -174,6 +174,79 @@ MUTATIONS = [
      "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
+    # ── Codex 第十輪:鎖跨副本、狀態 schema、冷卻持久化、顯示層防炸 ──────
+    ("鎖位置退回 BASE(兩份 ZIP 副本各鎖各的,互斥只在單一副本內成立)",
+     "評審團.py",
+     '    d = state_root() / "_locks"',
+     '    d = BASE / "_locks"',
+     "tests/test_lock_and_gate.py::test_鎖的位置跟工具副本無關"),
+
+    ("狀態檔頂層不驗型別(合法 JSON 的 [] 讓 Gemini 整關炸掉)",
+     "Gemini曲評.py",
+     '    if not isinstance(raw, dict):\n        _quarantine_state(f"頂層是 {type(raw).__name__},應為 dict")\n        return {}',
+     '    if not isinstance(raw, dict):\n        return raw             # 變異:合法 JSON 就直接交出去',
+     "tests/test_state_and_cooldown.py::test_狀態檔頂層不是dict要隔離成corrupt不可炸"),
+
+    ("狀態檔單筆 record 不驗(cooldown_until 是字串時 is_cooling 炸)",
+     "Gemini曲評.py",
+     '        cu = rec.get("cooldown_until", 0)\n        if isinstance(cu, bool) or not isinstance(cu, (int, float)) or not math.isfinite(cu):\n            continue',
+     '        cu = rec.get("cooldown_until", 0)',
+     "tests/test_state_and_cooldown.py::test_狀態檔單筆壞只丟單筆不整檔陪葬"),
+
+    ("冷卻寫入失敗仍宣稱成功(其他工作立刻再轟已限流的 key)",
+     "Gemini曲評.py",
+     '    persisted = merge_cooldown(fp, rec)',
+     '    persisted = merge_cooldown(fp, rec) or True',
+     "tests/test_state_and_cooldown.py::test_冷卻寫入失敗不可宣稱已冷卻"),
+
+    ("429 現場吞掉持久化失敗(JSON 裡乾乾淨淨,像已冷卻)",
+     "Gemini曲評.py",
+     '                    if not cool_down(state, key, max(delay, COOLDOWN_RATE_SEC), "429 額度/頻率上限"):',
+     '                    if cool_down(state, key, max(delay, COOLDOWN_RATE_SEC), "429 額度/頻率上限") and False:',
+     "tests/test_state_and_cooldown.py::test_429冷卻寫入失敗要留cooldown_persist_error"),
+
+    ("諺文只認預組合音節(NFD 分解式韓文零警告變 □)",
+     "報告轉PDF.py",
+     '    return any(_is_hangul(c) for c in (text or ""))',
+     '    return any("\\uac00" <= c <= "\\ud7a3" for c in (text or ""))',
+     "tests/test_pdf_render.py::test_NFD分解式韓文也要觸發韓文字型"),
+
+    ("圖片只限寬不限高(1×10000 畸形圖毀掉整份 PDF)",
+     "報告轉PDF.py",
+     '    scale = min(maxw / iw, maxh / ih)',
+     '    scale = maxw / iw',
+     "tests/test_pdf_render.py::test_圖片要同時限寬限高等比縮放"),
+
+    ("網頁版成績表假定巢狀都是 dict(scores: [] → TypeError 拒收評測)",
+     "app.py",
+     '    def _d(v):\n        return v if isinstance(v, dict) else {}',
+     '    def _d(v):\n        return v',
+     "tests/test_rubric_pick.py::test_成績表對畸形巢狀容器不可炸"),
+
+    ("PS5.1 沒有的有限性方法又被用回去(完整安裝永遠 exit 1)",
+     "install.ps1",
+     '-not [double]::IsNaN([double]$tot) -and -not [double]::IsInfinity([double]$tot)',
+     '[double]::IsFinite([double]$tot)',
+     "tests/test_packaging.py::test_安裝腳本不可用PS51沒有的API或會寫BOM的寫法"),
+
+    ("安裝 log 退回固定共用檔(並行安裝互相 truncate)",
+     "install.sh",
+     'SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || SJ_STEP_LOG="${TMPDIR:-/tmp}/sj_step_$$.log"',
+     'SJ_STEP_LOG="/tmp/_sj_step.log"',
+     "tests/test_packaging.py::test_install_sh不可用固定tmp檔且要容忍BOM"),
+
+    ("金鑰自檢不剝 BOM(PS5.1 寫的 .env 在 WSL 被判沒金鑰)",
+     "install.sh",
+     r'''  _ENV_TEXT="$(sed "1s/^$(printf '\357\273\277')//" .env 2>/dev/null || cat .env)"''',
+     r'''  _ENV_TEXT="$(cat .env)"''',
+     "tests/test_packaging.py::test_install_sh不可用固定tmp檔且要容忍BOM"),
+
+    ("ffmpeg 從退出碼移除(缺它仍 exit 0=假完整)",
+     "install.ps1",
+     '$failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk) -or (-not $hasFfmpeg)',
+     '$failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk)',
+     "tests/test_packaging.py::test_安裝腳本把ffmpeg當完整安裝必要件"),
+
     # ── Codex 第九輪:鎖 fail-closed、bool 最後一條小路、酬載順序 ────────
     ("工作鎖壞掉照樣放行(fail-open 取消互斥保證)",
      "評審團.py",
@@ -235,8 +308,8 @@ MUTATIONS = [
 
     ("Gemini 刪除冷卻退化成 no-op(好金鑰永遠被當冷卻中)",
      "Gemini曲評.py",
-     '    _locked_update(lambda cur: cur.pop(fp, None))',
-     '    pass',
+     '    return _locked_update(lambda cur: cur.pop(fp, None))',
+     '    return True            # 變異:什麼都不刪',
      "tests/test_lock_and_gate.py::test_成功清除冷卻要真的從磁碟消失"),
 
     ("階段 JSON 頂層型別不驗(list 讓整份評測 AttributeError)",

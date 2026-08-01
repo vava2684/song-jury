@@ -5,6 +5,7 @@
 """
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -17,6 +18,37 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+def _is_hangul(ch):
+    """這個字是不是諺文(含 Jamo 字母與相容字母,不只預組合音節)。"""
+    return "가" <= ch <= "힣" or "ᄀ" <= ch <= "ᇿ" or "㄰" <= ch <= "㆏"
+
+
+def _contains_hangul(text) -> bool:
+    """報告裡有沒有諺文 —— 決定要不要註冊韓文字型。
+
+    ⛔ 不可以只看預組合音節 AC00-D7A3:NFD 分解式韓文(macOS 檔名、部分編輯器
+       貼上的文字)整段都是 Jamo(1100-11FF),舊判定看不到 → 韓文字型不註冊、
+       缺字檢查也漏掉(Jamo 被 _is_hangul 從主字型 need 集合剔除了)→
+       轉檔 exit 0、零警告,渲染出來整行 □□□□(Codex R10 實測)。"""
+    return any(_is_hangul(c) for c in (text or ""))
+
+
+def _fit_image(iw, ih, maxw, maxh):
+    """算圖片在頁面裡的顯示尺寸:寬**高**都限,等比縮放。回 (w, h) 或 None(略過)。
+
+    ⛔ 只限寬不限高:1×10000 的畸形圖(旋轉/損壞的引擎產圖)高度會算出
+       頁框的幾百倍,doc.build() 直接 LayoutError,一張圖毀掉整份 PDF
+       (Codex R10 實測)。長寬比荒謬(>20:1)的圖不是弧線圖,略過並警告。"""
+    try:
+        iw, ih = float(iw), float(ih)
+    except (TypeError, ValueError):
+        return None
+    if iw <= 0 or ih <= 0 or max(iw / ih, ih / iw) > 20:
+        return None
+    scale = min(maxw / iw, maxh / ih)
+    return iw * scale, ih * scale
+
 
 def _missing_glyphs(path: Path, idx, chars) -> set:
     """這個字型檔缺了 chars 裡的哪些字。回傳缺字集合(空集合=全有)。
@@ -60,12 +92,12 @@ def _register_cjk_fonts(sample_text: str = ""):
     #    ⛔ 不可以硬要一個字型全包:實測掃過 Windows 全部字型,**沒有任何一個同時涵蓋繁中與
     #       諺文**;硬選 Malgun 的話韓文好了但繁體字反過來缺(敘/概/獎/真…)。
     #       (Noto Sans CJK 有全涵蓋,但它是 CFF 輪廓,reportlab 明確不支援。)
-    def _is_hangul(ch):
-        return "가" <= ch <= "힣" or "ᄀ" <= ch <= "ᇿ" or "㄰" <= ch <= "㆏"
     need = {c for c in (sample_text or "評分") if _needs_cjk_font(c) and not _is_hangul(c)}
     if not need:
         need = set("評分")
-    has_hangul = any("\uac00" <= c <= "\ud7a3" for c in sample_text)
+    # \u26d4 \u8981\u7528 _contains_hangul(\u542b Jamo \u5b57\u6bcd),\u4e0d\u53ef\u53ea\u6383\u9810\u7d44\u5408\u97f3\u7bc0 AC00-D7A3 \u2014\u2014
+    #    NFD \u5206\u89e3\u5f0f\u97d3\u6587\u6703\u300cexit 0\u3001\u96f6\u8b66\u544a\u300d\u5730\u6574\u884c\u8b8a\u65b9\u584a(\u898b _contains_hangul \u8aaa\u660e)\u3002
+    has_hangul = _contains_hangul(sample_text)
 
     kr_reg = [(Path("C:/Windows/Fonts/malgun.ttf"), None),                     # Windows Malgun Gothic
               (Path("/System/Library/Fonts/AppleSDGothicNeo.ttc"), 0),         # macOS
@@ -161,7 +193,14 @@ def _register_cjk_fonts(sample_text: str = ""):
 # 先用預設(中文)註冊一次,讓下面的 ParagraphStyle 建得起來;
 # main() 讀到報告內容後會**再註冊一次**,依實際文字挑對的字型(例如韓文報告換成 Malgun)。
 # reportlab 允許同名重註冊,後者覆蓋前者。
-_register_cjk_fonts()
+# ⚠️ 匯入時找不到字型**不擋 import**(測試/工具鏈要能載入這個模組;
+#    ParagraphStyle 只存字型名字串,不驗存在)——真正轉檔時 main() 會再註冊,
+#    那裡照樣 SystemExit fail-loud,該炸的地方一個都沒少。
+try:
+    _register_cjk_fonts()
+except SystemExit as _e:
+    print(f"⚠ 匯入時找不到 CJK 字型(只影響現在 import,轉檔時會再檢查並擋下):{_e}",
+          file=sys.stderr)
 
 S_TITLE = ParagraphStyle("t", fontName="JhengHeiBd", fontSize=16, leading=22, spaceAfter=4, alignment=1)
 S_SUB = ParagraphStyle("sub", fontName="JhengHeiBd", fontSize=10, leading=15, spaceBefore=2, spaceAfter=8, alignment=1)
@@ -231,7 +270,9 @@ CANON_FOOTER_2 = "本報告為診斷性評審,供創作與製作決策參考;最
 
 def main():
     src = Path(sys.argv[1]).resolve()
-    text = src.read_text(encoding="utf-8")
+    # ⛔ 先 NFC 正規化:NFD 分解式韓文(macOS 檔名/部分編輯器)整段是 Jamo,
+    #    不組合回音節的話,即使字型對了,渲染仍可能逐字母拆開。統一成 NFC 一勞永逸。
+    text = unicodedata.normalize("NFC", src.read_text(encoding="utf-8"))
     # ⚠️ 字型要在**看過報告內容之後**才決定 —— 韓文報告需要有諺文字形的字型,
     #    在 import 時就鎖死會讓韓文整行變成方塊(繁中系統的預設字型一個諺文字形都沒有)。
     #    ⚠️ 落款是**程式自己生成的**,不在 .md 裡 —— 不一起算進去的話,
@@ -363,10 +404,16 @@ def main():
             from reportlab.lib.utils import ImageReader
             from reportlab.platypus import Image as RLImage
             iw, ih = ImageReader(str(arc)).getSize()
-            w = (A4[0] - 30 * mm) * (0.72 if heading == "多維雷達圖" else 1.0)
-            story.append(Spacer(1, 6))
-            story.append(Paragraph(f"<b>{heading}</b>", S_HEAD))
-            story.append(RLImage(str(arc), width=w, height=w * ih / iw))
+            maxw = (A4[0] - 30 * mm) * (0.72 if heading == "多維雷達圖" else 1.0)
+            # ⛔ 高度也要限(頁框內高再留標題/落款空間):只限寬的話,1×10000 的
+            #    畸形圖高度會爆出頁框,doc.build() LayoutError,一張圖毀掉整份 PDF。
+            fitted = _fit_image(iw, ih, maxw, A4[1] - 70 * mm)
+            if fitted is None:
+                print(f"⚠ {heading}內嵌略過(圖片尺寸異常 {iw}x{ih},長寬比不合理,不影響報告)")
+            else:
+                story.append(Spacer(1, 6))
+                story.append(Paragraph(f"<b>{heading}</b>", S_HEAD))
+                story.append(RLImage(str(arc), width=fitted[0], height=fitted[1]))
         except Exception as e:
             print(f"⚠ {heading}內嵌略過(圖檔異常，不影響報告):{e}")
 

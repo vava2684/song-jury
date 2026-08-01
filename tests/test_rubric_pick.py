@@ -53,6 +53,23 @@ def test_選對尺(A, 歌詞, 預期語言, 預期檔, 預期維度):
     assert ndim == 預期維度
 
 
+def test_成績表對畸形巢狀容器不可炸(A):
+    """🔴 Codex R10:引擎異常時 scores 可能是 []、mix_detail 可能是 list ——
+    _score_table 直接 p["scores"]["total"] 會 TypeError,昂貴評測已寫進 JSON,
+    App 卻在顯示層把它炸掉。全部要先投影成 dict、數字驗過才格式化。"""
+    rows = A._score_table({
+        "layer1_physical": {"scores": [], "mix_detail": ["bad"]},
+        "layer2_songeval_1to5": [],
+        "layer2_audiobox_1to10": {"PQ": "N/A", "CE": float("nan"), "CU": 8.4},
+    })
+    flat = " ".join(str(c) for r in rows for c in r)
+    assert "8.40" in flat, "合法數字還是要顯示出來"
+    assert "nan" not in flat.lower(), "NaN 不可以被格式化進表"
+    # 整份 merged 都是垃圾也不可以炸
+    rows2 = A._score_table({"layer1_physical": "oops"})
+    assert rows2, "至少要回一張(標示缺席的)表,不是例外"
+
+
 def test_四把尺都真的存在():
     for f in ("ZH_lyric_rubric_v5.md", "EN_lyric_rubric_v2.md",
               "JA_lyric_rubric_v3.md", "KO_lyric_rubric_v4.md"):

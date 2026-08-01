@@ -35,6 +35,8 @@
 #    新增任何 .py 前先問:有沒有別的檔 import 它 / subprocess 呼叫它?
 !分軌快取.py
 !伴奏混音.py
+# 狀態目錄:工作鎖/Gemini 冷卻的全域位置(評審團+Gemini曲評 共用底層,同上鐵則)
+!狀態目錄.py
 !Gemini曲評.py
 !演唱聽感.py
 !真實距離.py

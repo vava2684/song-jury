@@ -21,3 +21,16 @@ def load(module_name: str):
     sys.modules[module_name] = m
     spec.loader.exec_module(m)
     return m
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state_dir(tmp_path, monkeypatch):
+    """每條測試都把全域狀態目錄(工作鎖/Gemini 冷卻)導到自己的 tmp。
+
+    ⛔ 不隔離的話,鎖類測試會把鎖檔寫進使用者真正的 %LOCALAPPDATA%/song-jury
+       (鎖檔設計上**永不刪**,測試一跑就在別人機器上留垃圾);
+       子程序測試(_CHILD_HOLD)靠環境變數繼承,一樣被導進來。"""
+    monkeypatch.setenv("SONG_JURY_STATE_DIR", str(tmp_path / "_sj_state"))

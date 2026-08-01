@@ -40,10 +40,15 @@ bad()  { printf "      ${C_RED}X   %s${C_OFF}\n" "$1"; PROBLEMS+=("$1 —— $2"
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # 跑一步,炸了就記下來繼續
+# ⛔ log 不可用固定檔名(舊版共用一個 /tmp 下的固定 log):兩個安裝同時跑會互相
+#    truncate,失敗原因顯示成別人那一步的;固定名稱也有 symlink 風險(Codex R10)。
+#    mktemp 專屬檔 + trap 收尾。
+SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || SJ_STEP_LOG="${TMPDIR:-/tmp}/sj_step_$$.log"
+trap 'rm -f "$SJ_STEP_LOG"' EXIT
 try_step() {
   local what="$1"; shift
-  if "$@" >/tmp/_sj_step.log 2>&1; then return 0; fi
-  bad "$what" "$(tail -n 2 /tmp/_sj_step.log | tr '\n' ' ')"
+  if "$@" >"$SJ_STEP_LOG" 2>&1; then return 0; fi
+  bad "$what" "$(tail -n 2 "$SJ_STEP_LOG" | tr '\n' ' ')"
   return 1
 }
 
@@ -87,7 +92,9 @@ ensure_tool() {   # $1=指令 $2=套件名 $3=沒有它會怎樣 $4=fatal?
 }
 ensure_tool uv     uv     "建立 Python 環境用,沒有它什麼都裝不了" fatal || { echo; printf "${C_RED}✗ 沒有 uv 就無法繼續:https://github.com/astral-sh/uv${C_OFF}\n"; exit 1; }
 ensure_tool git    git    "取得 SongEval 原始碼用" fatal
-ensure_tool ffmpeg ffmpeg "YouTube 連結輸入會不可用(SUNO / 本機檔不受影響)" soft
+# ⛔ ffmpeg 不是「只影響 YouTube」:Gemini 內嵌上限約 20MB(base64 後),一般 WAV
+#    (4 分鐘 PCM ≈ 40MB)必超限,要靠它轉 320k;缺它=評 WAV 時 Gemini 六柱項全缺(Codex R10)
+ensure_tool ffmpeg ffmpeg "Gemini 聽大檔(一般 WAV)要靠它轉檔;沒有它會評不完整 + YouTube 連結不可用" soft
 
 # ── [2] Gemini 金鑰 ─────────────────────────────────────────────────
 # ⚠️ 這一步**故意排在所有下載之前**:原本放在最後,而橫幅又叫使用者「中途可以去泡杯茶」——
@@ -218,12 +225,19 @@ HAS_ENV=0;  test_import .venv librosa numpy soundfile pyloudnorm reportlab && HA
 HAS_ML=0;   test_import .venv-ml torch muq audiobox_aesthetics && HAS_ML=1
 HAS_SE=0;   [ -f SongEval/eval.py ] && [ "$HAS_ML" = 1 ] && HAS_SE=1
 HAS_AUD=0;  test_import .venv-audition torch s3prl muq && HAS_AUD=1
-# ⛔ 錨在行首(排除註解行),並排除 .env.example 的佔位字串
+# ⛔ 錨在行首(排除註解行),並排除 .env.example 的佔位字串。
+# ⛔ 第一行要先剝掉 UTF-8 BOM:Windows PowerShell 5.1 寫的 .env 開頭是 EF BB BF,
+#    行首錨 ^ 對不上 → 明明有金鑰卻被判沒有(Codex R10 實測)。printf 八進位跨平台。
 HAS_KEY=0
-if [ -f .env ] && grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*[^[:space:]]' .env \
-   && ! grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*.*(你的.*金鑰|^your|xxx)' .env; then
-  HAS_KEY=1
+if [ -f .env ]; then
+  _ENV_TEXT="$(sed "1s/^$(printf '\357\273\277')//" .env 2>/dev/null || cat .env)"
+  if printf '%s\n' "$_ENV_TEXT" | grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*[^[:space:]]' \
+     && ! printf '%s\n' "$_ENV_TEXT" | grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*.*(你的.*金鑰|^your|xxx)'; then
+    HAS_KEY=1
+  fi
 fi
+# ⛔ ffmpeg 是完整安裝的必要件:一般 WAV 超過 Gemini 內嵌上限,靠它轉檔才評得了
+HAS_FFMPEG=0; have ffmpeg && HAS_FFMPEG=1
 
 # ⛔ 不自己猜 demucs 在哪 —— 問評審團.py 自己解析出來的那條路徑(唯一真理來源),
 #    再實際 import 一次確認那個 python 真的有 demucs。
@@ -284,8 +298,15 @@ if [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ]; then
 elif [ "$PARTIAL" = 1 ]; then
   printf "      ${C_YEL}⚠️ 九根柱子都算得出分,但有柱子缺細項(上面黃字)——${C_OFF}\n"
   printf "      ${C_YEL}   柱內會重新歸一化,分數出得來但與完整安裝的結果有落差,建議補齊。${C_OFF}\n"
+elif [ "$HAS_FFMPEG" != 1 ]; then
+  printf "      ${C_RED}⛔ 缺 ffmpeg —— 一般 WAV(4 分鐘 PCM ≈ 40MB)超過 Gemini 內嵌上限,${C_OFF}\n"
+  printf "      ${C_RED}   沒有它轉檔,評 WAV 時 Gemini 餵的六個柱項全缺 → 不算完整安裝。${C_OFF}\n"
+  printf "      ${C_YEL}   → 用套件管理員裝 ffmpeg 後重跑 --check-only。${C_OFF}\n"
 else
   printf "      ${C_GREEN}✅ 九柱齊全、細項無缺 —— 這才是可以拿來評分的完整安裝。${C_OFF}\n"
+fi
+if [ "$HAS_FFMPEG" != 1 ] && [ "$(awk "BEGIN{print ($LOST>0)}")" != 1 ]; then
+  bad "ffmpeg 沒裝" "一般 WAV 超過 Gemini 內嵌上限,沒它轉檔會評不完整(視為安裝未完成)"
 fi
 
 # ── 冒煙測試 ────────────────────────────────────────────────────────
@@ -347,7 +368,8 @@ USAGE
 
 # ⛔ 退出碼一定要反映結果:失敗項不為零、九柱沒齊、或冒煙測試沒過 → exit 1。
 #    否則自動化/CI/包裝層看到 exit 0 會以為裝好了。
-if [ "${#PROBLEMS[@]}" -gt 0 ] || [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ] || [ "$SMOKE_OK" != 1 ]; then
+# ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段)
+if [ "${#PROBLEMS[@]}" -gt 0 ] || [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ] || [ "$SMOKE_OK" != 1 ] || [ "$HAS_FFMPEG" != 1 ]; then
   printf "${C_DIM}  (退出碼 1:安裝未完全成功)${C_OFF}\n"
   exit 1
 fi

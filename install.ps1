@@ -75,7 +75,10 @@ function Ensure-Tool($cmd, $wingetId, $whatFor, $fatal) {
 }
 $okUv     = Ensure-Tool "uv"     "astral-sh.uv"     "建立 Python 環境用,沒有它什麼都裝不了" $true
 $okGit    = Ensure-Tool "git"    "Git.Git"          "取得 SongEval 原始碼用" $true
-$okFfmpeg = Ensure-Tool "ffmpeg" "Gyan.FFmpeg"      "YouTube 連結輸入會不可用(SUNO / 本機檔不受影響)" $false
+# ⛔ ffmpeg 不是「只影響 YouTube」:Gemini 聽歌的內嵌上限約 20MB(base64 後),
+#    一般 WAV(4 分鐘 PCM ≈ 40MB)必超限,要靠 ffmpeg 轉 320k 才進得去 ——
+#    沒有它,評 WAV 時 Gemini 餵的六個柱項全缺,依九柱制就是不完整安裝(Codex R10)。
+$okFfmpeg = Ensure-Tool "ffmpeg" "Gyan.FFmpeg"      "Gemini 聽大檔(一般 WAV)要靠它轉檔;沒有它會評不完整 + YouTube 連結不可用" $false
 
 if (-not $okUv) {
     Write-Host "`n✗ 沒有 uv 就無法繼續。請到 https://github.com/astral-sh/uv 手動安裝後重跑。" -ForegroundColor Red
@@ -102,7 +105,12 @@ if (Test-Path ".env") {
     try { $key = Read-Host "  貼上金鑰後按 Enter(沒有的話直接按 Enter 先跳過,裝完再補)" }
     catch { Warn "沒有互動輸入,跳過金鑰" }
     if (-not [string]::IsNullOrWhiteSpace($key)) {
-        "GEMINI_API_KEYS=$($key.Trim())" | Out-File -FilePath ".env" -Encoding utf8 -NoNewline
+        # ⛔ 不可用 Out-File -Encoding utf8:PowerShell 5.1 會寫出帶 BOM 的 UTF-8,
+        #    之後把專案搬去 WSL/Linux 時,install.sh 錨在行首的 grep 對不上第一行
+        #    (前三個 byte 是 EF BB BF)→ 自檢誤報「沒有金鑰」(Codex R10 實測)。
+        #    用 .NET API 寫「無 BOM」的 UTF-8,5.1 與 7 都一致。
+        [System.IO.File]::WriteAllText((Join-Path $ROOT ".env"),
+            "GEMINI_API_KEYS=$($key.Trim())", (New-Object System.Text.UTF8Encoding($false)))
         Ok "金鑰已寫入 .env(這個檔被 .gitignore 擋著,不會被上傳)"
     } else {
         # ⛔ 不複製 .env.example:那裡面的「你的第一把金鑰」是佔位字串,複製過去會被程式
@@ -237,6 +245,9 @@ if (Test-Path ".env") {
         }
     }
 }
+# ⛔ ffmpeg 是完整安裝的必要件:一般 WAV 超過 Gemini 內嵌上限,靠它轉檔才評得了
+#    (缺它=評 WAV 時 Gemini 六柱項全缺=不完整)。-CheckOnly 也要驗。
+$hasFfmpeg = Have "ffmpeg"
 
 # 每根柱子:名稱 / 權重 / 完整需要什麼 / 缺了會怎樣
 $sev = ($hasMl -and $hasSongEval)
@@ -289,8 +300,15 @@ if ($lost -gt 0) {
 } elseif ($partial.Count -gt 0) {
     Write-Host "      ⚠️ 九根柱子都算得出分,但有柱子缺細項(上面黃字)——" -ForegroundColor Yellow
     Write-Host "         柱內會重新歸一化,分數出得來但與完整安裝的結果有落差,建議補齊。" -ForegroundColor Yellow
+} elseif (-not $hasFfmpeg) {
+    Write-Host "      ⛔ 缺 ffmpeg —— 一般 WAV(4 分鐘 PCM ≈ 40MB)超過 Gemini 內嵌上限," -ForegroundColor Red
+    Write-Host "         沒有它轉檔,評 WAV 時 Gemini 餵的六個柱項全缺 → 不算完整安裝。" -ForegroundColor Red
+    Write-Host "         → winget install Gyan.FFmpeg(或手動裝好加入 PATH)後重跑 -CheckOnly。" -ForegroundColor Yellow
 } else {
     Write-Host "      ✅ 九柱齊全、細項無缺 —— 這才是可以拿來評分的完整安裝。" -ForegroundColor Green
+}
+if (-not $hasFfmpeg -and $lost -eq 0) {
+    Bad "ffmpeg 沒裝" "一般 WAV 超過 Gemini 內嵌上限,沒它轉檔會評不完整(視為安裝未完成)"
 }
 
 # ── 冒煙測試 ────────────────────────────────────────────────────────
@@ -318,7 +336,12 @@ if ($hasEnv) {
             # ⛔ 不可以只檢查「非空」:字串 "N/A"、NaN、負數、超過 100 都代表產出不對
             $tot = $j.scores.total
             $isNum = ($tot -is [double] -or $tot -is [int] -or $tot -is [decimal])
-            if ($isNum -and [double]::IsFinite([double]$tot) -and [double]$tot -ge 0 -and [double]$tot -le 100) {
+            # ⛔ 不可用 .NET Core 才有的「Double 有限性單一方法」:PowerShell 5.1
+            #    (.NET Framework)沒有 → 方法不存在直接拋例外,被 catch 誤報成
+            #    「JSON 讀不了」,完整安裝也永遠 exit 1(Codex R10 實測)。
+            #    改用 5.1 也有的 IsNaN/IsInfinity(test_packaging 有內容檢查釘住)。
+            if ($isNum -and -not [double]::IsNaN([double]$tot) -and -not [double]::IsInfinity([double]$tot) `
+                -and [double]$tot -ge 0 -and [double]$tot -le 100) {
                 Ok "冒煙測試通過:總分 $tot / 100"; $script:SmokeOk = $true
             } else {
                 Bad "冒煙測試的 scores.total 不是 0-100 的有限數字(拿到:$tot)" "產出格式不對"
@@ -364,7 +387,8 @@ if ($Host.Name -eq "ConsoleHost" -and -not $CheckOnly) {
 
 # ⛔ 退出碼一定要反映結果:失敗項不為零、九柱沒齊、或冒煙測試沒過 → exit 1。
 #    否則自動化/CI/包裝層看到 exit 0 會以為裝好了(Codex 實跑遇到 10 項失敗仍回 0)。
-$failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk)
+# ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段)
+$failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk) -or (-not $hasFfmpeg)
 if ($failed) {
     Write-Host "  (退出碼 1:安裝未完全成功)" -ForegroundColor DarkGray
     exit 1

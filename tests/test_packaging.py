@@ -260,3 +260,39 @@ def test_每個requirements檔都被安裝腳本用到():
         if r in 可選:
             continue
         assert r in ps1 and r in sh, f"{r} 沒有被兩個安裝腳本用到"
+
+
+def test_安裝腳本不可用PS51沒有的API或會寫BOM的寫法():
+    """🔴 Codex R10 三條 PS5.1 地雷,全部用內容檢查釘死:
+    · [double]::IsFinite 是 .NET Core 才有 → 5.1 直接拋例外,完整安裝也 exit 1;
+    · Out-File -Encoding utf8 在 5.1 會寫 BOM → 搬去 WSL 後 install.sh 的
+      行首 grep 對不上第一行,誤報「沒有金鑰」。"""
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    assert "IsFinite" not in ps1, \
+        "🔴 [double]::IsFinite 回來了 —— PowerShell 5.1(.NET Framework)沒有這個方法"
+    assert "IsNaN" in ps1 and "IsInfinity" in ps1, "有限性檢查不可以整個拿掉"
+    assert not re.search(r"Out-File[^\n]*\.env|\.env[^\n]*Out-File", ps1), \
+        "🔴 .env 不可用 Out-File 寫(PS5.1 會帶 BOM);用 [IO.File]::WriteAllText + UTF8Encoding($false)"
+    assert "UTF8Encoding" in ps1, ".env 要用無 BOM 的 UTF-8 寫"
+
+
+def test_install_sh不可用固定tmp檔且要容忍BOM():
+    """🔴 Codex R10:固定 /tmp/_sj_step.log 兩個安裝並行會互相 truncate + symlink 風險;
+    行首 grep 金鑰要先剝 BOM(PS5.1 寫的 .env 開頭是 EF BB BF)。"""
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    assert "/tmp/_sj_step.log" not in sh, "🔴 固定共用 log 檔回來了"
+    assert "mktemp" in sh, "step log 要用 mktemp 建專屬檔"
+    assert r"\357\273\277" in sh, "🔴 金鑰自檢沒剝 BOM —— PS5.1 寫的 .env 會被誤判成沒金鑰"
+
+
+def test_安裝腳本把ffmpeg當完整安裝必要件():
+    """🔴 Codex R10:Gemini 內嵌上限約 20MB(base64 後),一般 WAV 必超限,
+    要靠 ffmpeg 轉檔 —— 缺它=評 WAV 時 Gemini 六柱項全缺,不可標成
+    「本機檔不受影響」,也不可讓完整安裝在缺 ffmpeg 時 exit 0。"""
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    assert "本機檔不受影響" not in ps1 and "本機檔不受影響" not in sh, \
+        "🔴 誤導文案回來了:ffmpeg 缺席時本機 WAV 會評不完整"
+    # ⚠️ 要釘在「退出碼那一行」:hasFfmpeg 在顯示區也有出現,只 grep 全文會被顯示區騙過
+    assert re.search(r"\$failed\s*=.*\$hasFfmpeg", ps1),         "install.ps1 的退出碼($failed)要把 ffmpeg 算進去"
+    assert re.search(r"\{#PROBLEMS\[@\]\}.*HAS_FFMPEG", sh),         "install.sh 的退出碼(exit 1 條件)要把 ffmpeg 算進去"
