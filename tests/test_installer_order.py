@@ -24,6 +24,14 @@ def _run(cmd, cwd):
                           text=True, encoding="utf-8", errors="replace", timeout=180)
 
 
+def _diag(msg, r):
+    """失敗訊息一定要帶 returncode 與 stderr —— 只印 stdout 的話,
+    shell 根本沒跑起來時會得到一則空訊息,完全查不下去(CI 上實際踩到)。"""
+    return (f"{msg}:rc={r.returncode}\n"
+            f"OUT={r.stdout[-600:]}\n"
+            f"ERR={r.stderr[-600:]}")
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="PowerShell 版")
 @pytest.mark.skipif(not (shutil.which("pwsh") or shutil.which("powershell")),
                     reason="沒有 PowerShell")
@@ -60,14 +68,10 @@ def test_ps1的驗證順序_裁判先看到報告清理在最後(tmp_path):
     r = _run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)], tmp_path)
 
     witness = (tmp_path / "WITNESS.txt")
-    assert witness.exists(), f"裁判沒被呼叫到:rc={r.returncode}
-OUT={r.stdout[-600:]}
-ERR={r.stderr[-600:]}"
+    assert witness.exists(), _diag("裁判沒被呼叫到", r)
     assert witness.read_text(encoding="utf-8") == "SEEN", \
         "🔴 裁判被呼叫時報告已經被清掉了 —— 清理排在驗證之前(成功路徑必定假陰性)"
-    assert "VERIFYOK=True" in r.stdout, f"成功路徑不該判失敗:rc={r.returncode}
-OUT={r.stdout[-600:]}
-ERR={r.stderr[-600:]}"
+    assert "VERIFYOK=True" in r.stdout, _diag("成功路徑不該判失敗", r)
     # 收工後所有 $vid 前綴的產物都要清乾淨(含中途寫出的 _評分.json)
     left = [p.name for p in tmp_path.glob("verify_*")]
     assert left == [], f"🔴 沒清乾淨:{left}"
@@ -100,12 +104,8 @@ def test_sh的驗證順序_裁判先看到報告清理在最後(tmp_path):
     r = _run(["bash", str(script)], tmp_path)
 
     witness = (tmp_path / "WITNESS.txt")
-    assert witness.exists(), f"裁判沒被呼叫到:rc={r.returncode}
-OUT={r.stdout[-600:]}
-ERR={r.stderr[-600:]}"
+    assert witness.exists(), _diag("裁判沒被呼叫到", r)
     assert witness.read_text(encoding="utf-8") == "SEEN", \
         "🔴 裁判被呼叫時報告已經被清掉了"
-    assert "VERIFYOK=1" in r.stdout, f"成功路徑不該判失敗:rc={r.returncode}
-OUT={r.stdout[-600:]}
-ERR={r.stderr[-600:]}"
+    assert "VERIFYOK=1" in r.stdout, _diag("成功路徑不該判失敗", r)
     assert [p.name for p in tmp_path.glob("verify_*")] == []
