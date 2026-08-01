@@ -48,19 +48,38 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def validate(path: Path, newer_than: float = None) -> str:
-    """回空字串=通過;否則回第一個不合格的原因(講人話)。"""
+def validate(path: Path, newer_than: float = None, require_contract: bool = False) -> str:
+    """回空字串=通過;否則回第一個不合格的原因(講人話)。
+
+    require_contract=True:報告**必須**自報 scoring_contract。
+    ⛔ 安裝證據(-VerifyModels)與比較器一律用 strict —— 舊格式相容是給
+       「以前產出的報告」用的,不可以套在「本輪剛產生的新產物」上,
+       否則產出端一旦迴歸成不寫契約,VerifyModels 照樣印 VERIFY_OK
+       (Codex R16-5 探針)。"""
     if not path.exists():
         return f"檔案不存在:{path}"
     if newer_than is not None and path.stat().st_mtime <= newer_than:
         return "檔案不是本輪新產物(mtime 早於驗證開始時間)—— 讀到舊報告了"
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        return f"讀不到檔案:{type(e).__name__}"
+    return validate_data(raw, path.name, require_contract=require_contract)
+
+
+def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = False) -> str:
+    """驗**已經讀進記憶體的那一份 bytes**(給比較器用)。
+
+    ⛔ 為什麼要拆出來(Codex R16-6):比較器舊版先 validate(path) 再自己
+       read_text() 第二次 —— 兩次之間檔案被換掉的話,排名用的是沒被驗過的內容。
+       只讀一次 bytes、在記憶體裡驗同一份,TOCTOU 窗口就不存在。"""
     def _reject_const(x):
         # ⛔ json.loads 預設吃 NaN/Infinity —— 那不是合法 JSON,別人的解析器會炸,
         #    而且 NaN 混進柱分還會一路無聲汙染(Codex R13)。這裡直接拒收。
         raise ValueError(f"非標準 JSON 常數:{x}")
 
     try:
-        d = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_const)
+        d = json.loads(raw.decode("utf-8"), parse_constant=_reject_const)
     except ValueError as e:
         return f"JSON 不合格:{e}"
     except Exception as e:
@@ -76,6 +95,9 @@ def validate(path: Path, newer_than: float = None) -> str:
     #    兩種都不該由這支替它背書(Codex R15)。
     cname = d.get("scoring_contract") or pt.get("scoring_contract")
     if cname is None:
+        if require_contract:
+            return ("報告沒有 scoring_contract —— 這個模式要求版本證據"
+                    "(舊格式相容只給既有報告用,不給本輪新產物/比較用)")
         # 舊格式(這個欄位 2026-08-01 才加)→ 用預設契約驗,但要**講出來**:
         # 這份報告沒有版本證據,只是「看起來像」預設契約。
         cname = DEFAULT_CONTRACT
@@ -165,7 +187,7 @@ def main(argv) -> int:
     newer = None
     if "--newer-than" in argv:
         newer = float(argv[argv.index("--newer-than") + 1])
-    why = validate(Path(argv[1]), newer)
+    why = validate(Path(argv[1]), newer, require_contract="--require-contract" in argv)
     if why:
         print(f"VERIFY_BAD {why}")
         return 1

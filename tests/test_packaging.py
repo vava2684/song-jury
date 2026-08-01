@@ -10,7 +10,9 @@
 """
 import ast
 import re
+import shutil
 import subprocess
+import sys
 import pytest
 from conftest import REPO
 
@@ -66,6 +68,28 @@ def test_每個被subprocess呼叫的腳本都在repo裡():
             if m.group(1) not in tracked:
                 missing.append(f"{f} 會執行 {m.group(1)},但它沒進 repo")
     assert not missing, "\n".join(missing)
+
+
+def test_安裝腳本呼叫的py也要在repo裡():
+    """🔴 真的踩到(2026-08-02):`完整驗證.py` 是 install.ps1 / install.sh 直接跑的,
+    但白名單 .gitignore 忘了放行 —— 它**不被任何 .py import**,所以上面那兩層
+    掃 import / 掃 `BASE / "X.py"` 的檢查完全看不到它。別人 clone 下來
+    `-VerifyModels` 第一步就找不到檔。
+
+    ⛔ 白名單制的破口從來不是「常用的那些檔」,是這種**只有 shell 會叫**的檔。"""
+    tracked = _tracked()
+    local = {p.name for p in REPO.glob("*.py")}
+    missing = []
+    for f in ("install.ps1", "install.sh", "一鍵安裝.bat", "run_web.ps1", "run_web.sh"):
+        p = REPO / f
+        if not p.exists():
+            continue
+        src = p.read_text(encoding="utf-8", errors="replace")
+        for m in re.finditer(r"[\w一-鿿]+\.py", src):
+            name = m.group(0)
+            if name in local and name not in tracked:
+                missing.append(f"{f} 會執行 {name},但它沒進 repo(.gitignore 漏放行)")
+    assert not missing, "\n".join(sorted(set(missing)))
 
 
 def test_規則與尺都隨包():
@@ -320,13 +344,17 @@ def test_安裝腳本真的驗金鑰有效性且有完整驗證開關():
     sh = (REPO / "install.sh").read_text(encoding="utf-8")
     for name, src in (("install.ps1", ps1), ("install.sh", sh)):
         assert "金鑰驗證.py" in src, f"🔴 {name} 沒有呼叫 金鑰驗證.py(逐把驗、三態)"
-        assert "驗證報告.py" in src, f"🔴 {name} 的 VerifyModels 沒有獨立 JSON 裁判(空 JSON 也會過)"
+        # ⚠️ R16 起裁判是由 完整驗證.py 呼叫的(整段流程收進 python,
+        #    因為 shell 對真 Ctrl+C 不可靠)—— shell 只負責看退出碼。
+        assert "完整驗證.py" in src, f"🔴 {name} 的 VerifyModels 沒有走共用流程"
         assert "generativelanguage" not in src,             f"🔴 {name} 又內嵌探針了 —— 只驗第一把/429 洗白的老路;一律走 金鑰驗證.py"
     assert "VerifyModels" in ps1, "install.ps1 少了 -VerifyModels 完整驗證開關"
     assert "--verify-models" in sh, "install.sh 少了 --verify-models 完整驗證開關"
     # 真探針本體要在 金鑰驗證.py 裡
     kp = (REPO / "金鑰驗證.py").read_text(encoding="utf-8")
     assert "generativelanguage.googleapis.com" in kp
+    # 獨立裁判仍然要被呼叫,只是呼叫者換成 helper
+    assert "驗證報告 import" in (REPO / "完整驗證.py").read_text(encoding="utf-8")
 
 
 
@@ -427,14 +455,15 @@ def test_範例歌的實際位元率要跟README對得上():
 def test_VerifyModels要有外層timeout():
     """🔴 Codex R15:`& python 評審團.py` 沒有任何外層 timeout —— 模型載入真的
     deadlock 時只能靠人工中斷,而硬 kill 不保證跑得到 finally(清理與環境還原)。"""
+    # ⭐ R16 起整段流程收進 完整驗證.py(PowerShell 對真 Ctrl+C 不可靠進 finally)
+    helper = (REPO / "完整驗證.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("SONG_JURY_VERIFY_TIMEOUT"' in helper,         "完整驗證.py 沒有真的讀 SONG_JURY_VERIFY_TIMEOUT"
+    assert "run_tree" in helper, "jury 沒有用可殺整棵樹的 runner 包住"
+    assert "return 124" in helper and "return 130" in helper,         "逾時(124)與使用者中斷(130)要有各自的退出碼"
     for name in ("install.ps1", "install.sh"):
         src = (REPO / name).read_text(encoding="utf-8")
-        # ⚠️ 不可以只 grep 變數名 —— 註解裡也寫著它,程式改壞照樣命中(裝飾品)。
-        knob = ("$env:SONG_JURY_VERIFY_TIMEOUT" if name.endswith(".ps1")
-                else "${SONG_JURY_VERIFY_TIMEOUT:-")
-        assert knob in src, f"{name} 沒有真的讀 SONG_JURY_VERIFY_TIMEOUT"
-        assert "run_tree" in src, f"{name} 的 jury 沒有用可殺整棵樹的 runner 包住"
-        assert "124" in src, f"{name} 沒有處理逾時的專用退出碼"
+        assert "完整驗證.py" in src, f"{name} 沒有呼叫共用的驗證流程"
+        assert "124" in src and "130" in src, f"{name} 沒有分開處理逾時與中斷"
 
 
 def test_比較器要隨包且被文件指到():
@@ -444,3 +473,91 @@ def test_比較器要隨包且被文件指到():
     assert "比較.py" in tracked, "🔴 比較.py 沒進 repo"
     for doc in ("README.md", "SKILL.md"):
         assert "比較.py" in (REPO / doc).read_text(encoding="utf-8"), f"{doc} 沒有指到比較器"
+
+
+def test_一鍵安裝bat要保住子程序退出碼():
+    """🔴 Codex R16-11:`if errorlevel 1 pause` 是最後一行 → .bat 回的是 pause
+    自己的碼(0),安裝器的 1/3/5 全被洗成成功。必須存 %errorlevel% 再 exit /b。"""
+    bat = (REPO / "一鍵安裝.bat").read_text(encoding="utf-8", errors="replace")
+    assert 'set "rc=%errorlevel%"' in bat, "🔴 沒有保存 child 的退出碼"
+    assert "exit /b %rc%" in bat, "🔴 沒有把保存的退出碼傳出去"
+    # 順序也要對:保存必須緊接在呼叫之後、pause 之前
+    # ⚠️ 要抓**真正那一行**:註解裡也有 "pause" 這個字(自己踩到)
+    i_call = bat.rfind("install.ps1")
+    i_save = bat.find('set "rc=%errorlevel%"')
+    i_pause = bat.find('if not "%rc%"=="0" pause')
+    assert i_call < i_save < i_pause, "保存要在呼叫之後、pause 之前"
+
+
+def _pwsh():
+    return shutil.which("pwsh") or (shutil.which("powershell")
+                                    if sys.platform == "win32" else None)
+
+
+def test_安裝器要擋下未知參數_真的跑一次():
+    """🔴 Codex R16-11:未知 switch 被靜默忽略 —— 把 -VerifyModels 拼錯的人
+    會拿到普通安裝的綠燈,卻以為做過完整模型驗證(最危險的假證據)。
+
+    ⚠️ 這條**實際執行安裝器**(擋參數在最前面,不會裝任何東西)——
+    只 grep 字串的版本被變異驗證證明是裝飾品:把守門條件改成 `if ($false)`
+    照樣全綠。
+
+    ⚠️ 拼錯的樣本要選**真的不認得**的:PowerShell 會做參數前綴比對,
+    `-VerifyModel` 其實會正常綁到 `-VerifyModels`(那不是 bug)。
+    ⚠️ 同時帶 -CheckOnly -NoAutoTools:萬一守門真的壞了(變異注入時),
+    這條測試也只會走「什麼都不裝的自我檢查」,不會在誰的機器上亂裝東西。"""
+    ran = []
+    exe = _pwsh()
+    if exe:
+        r = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", str(REPO / "install.ps1"),
+                            "-CheckOnly", "-NoAutoTools", "-VerifyModles"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=600, cwd=str(REPO))
+        assert r.returncode == 64, f"🔴 install.ps1 沒擋下拼錯的參數(拿到 {r.returncode})"
+        ran.append("ps1")
+    bash = shutil.which("bash")
+    if bash:
+        r = subprocess.run([bash, str(REPO / "install.sh"),
+                            "--check-only", "--no-auto-tools", "--verify-modles"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=600, cwd=str(REPO))
+        assert r.returncode == 64, f"🔴 install.sh 沒擋下拼錯的參數(拿到 {r.returncode})"
+        ran.append("sh")
+    if not ran:
+        pytest.skip("這台機器沒有 pwsh 也沒有 bash,兩支安裝器都跑不起來")
+
+
+# 總結區的每個退出碼,各自該由哪個旗標守門(⛔ 值就是契約,不可以改成常數真值)
+_PS1_GUARDS = {"5": "PolicyError", "1": "$failed", "3": "KeyUnverified"}
+_SH_GUARDS = {"5": "POLICY_ERROR", "1": "PROBLEMS", "3": "KEY_UNVERIFIED"}
+
+
+def _guard_of(text, exit_line):
+    """往回找 exit 這一行所屬的那個 if 條件。"""
+    i = text.index(exit_line)
+    j = max(text.rfind("if (", 0, i), text.rfind("if [", 0, i))
+    return text[j:i]
+
+
+def test_安裝器要原樣傳出政策錯誤碼5():
+    """🔴 Codex R16-11:PolicyError 被 Problems 洗成 1 —— 自動化分不出
+    「沒裝好」與「安全設定壞了(去申請新 key 沒有用)」。
+
+    ⚠️ 不能只 grep「有沒有 exit 5」:變異驗證把守門改成 `if ($false)` 時
+    字串全都還在,測試照樣綠。這裡驗的是**每個退出碼被哪個旗標守著**。"""
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    tail = ps1[ps1.index("$failed = "):]
+    for code, flag in _PS1_GUARDS.items():
+        guard = _guard_of(tail, f"exit {code}")
+        assert flag in guard, f"🔴 install.ps1 的 exit {code} 沒有被 {flag} 守著:{guard!r}"
+    sh_tail = sh[sh.rindex("if [ \"$POLICY_ERROR\""):]
+    for code, flag in _SH_GUARDS.items():
+        guard = _guard_of(sh_tail, f"exit {code}")
+        assert flag in guard, f"🔴 install.sh 的 exit {code} 沒有被 {flag} 守著:{guard!r}"
+    # 順序:政策碼要排在一般失敗(exit 1)之前,否則永遠走不到
+    assert tail.index("exit 5") < tail.index("exit 1"), "exit 5 要排在 exit 1 之前"
+    assert sh_tail.index("exit 5") < sh_tail.index("exit 1"), "install.sh 同理"
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "| **5** |" in readme, "README 的退出碼表要列出 5"

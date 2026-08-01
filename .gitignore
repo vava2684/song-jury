@@ -46,6 +46,12 @@
 !金鑰政策.py
 # 比較器:PK 與抽卡的規則寫死在程式裡(不是「由 AI 臨場編排」)
 !比較.py
+# 分軌線體檢(install.ps1 / install.sh 都直接呼叫它;同樣是「只有 shell 會叫」那一類)
+!分軌線檢查.py
+# -VerifyModels 的整條流程(install.ps1 / install.sh 都直接呼叫它)
+# ⚠️ 這支是被 **shell 腳本**叫的,不是被 .py import —— 漏放行的話,
+#    「掃 .py 的 import」那層檢查完全看不到,別人 clone 下來 -VerifyModels 直接找不到檔
+!完整驗證.py
 !Gemini曲評.py
 !演唱聽感.py
 !真實距離.py

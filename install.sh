@@ -24,7 +24,9 @@ for a in "$@"; do
     --no-auto-tools)  NO_AUTO=1 ;;
     --check-only)     CHECK_ONLY=1 ;;
     --verify-models)  VERIFY_MODELS=1 ;;
-    *) echo "未知參數:$a"; exit 1 ;;
+    # ⛔ 未知參數用 sysexits 的 EX_USAGE(64),不要跟一般失敗(1)混在一起:
+    #    把 --verify-models 拼錯的人要一眼看出是打錯字,不是安裝壞了(Codex R16-11)
+    *) echo "未知參數:$a"; echo "   可用的是:--skip-ml --no-auto-tools --check-only --verify-models"; exit 64 ;;
   esac
 done
 
@@ -243,6 +245,7 @@ HAS_FFMPEG=0; have ffmpeg && HAS_FFMPEG=1
 #    而且 429/網路/TLS 全被洗成成功。三態:verified=綠燈資格;invalid=視同沒金鑰;
 #    cooling/unknown=「未能驗證」→ 最後 exit 3(獨立退出碼,跟缺柱 exit 1 分開)。
 KEY_UNVERIFIED=0
+POLICY_ERROR=0
 if [ -x .venv/bin/python ]; then PROBE_PY=.venv/bin/python
 elif have python3; then PROBE_PY=python3
 elif have python; then PROBE_PY=python
@@ -255,7 +258,8 @@ if [ -n "$PROBE_PY" ]; then
     3) KEY_UNVERIFIED=1; HAS_KEY=1
        warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 --check-only" ;;
     4) warn "找不到可用金鑰(.env 沒填、只有佔位字串,或環境變數名字用錯)" ;;
-    5) bad "Gemini 金鑰政策無效" "拒絕名單格式錯,或 .env 來源可疑(symlink/硬連結/父目錄連結)。⛔ 這不是「沒填金鑰」—— 去申請新 key 沒有用,請照上面的訊息修設定" ;;
+    5) POLICY_ERROR=1
+       bad "Gemini 金鑰政策無效" "拒絕名單格式錯,或 .env 來源可疑(symlink/硬連結/父目錄連結)。⛔ 這不是「沒填金鑰」—— 去申請新 key 沒有用,請照上面的訊息修設定" ;;
     *) KEY_UNVERIFIED=1; HAS_KEY=1; warn "金鑰驗證工具異常 —— 不給完整綠燈" ;;
   esac
 else
@@ -263,18 +267,25 @@ else
   warn "找不到任何 python 可跑金鑰驗證 —— 這台無法確認金鑰;裝完請重跑 --check-only"
 fi
 
-# ⛔ 不自己猜 demucs 在哪 —— 問評審團.py 自己解析出來的那條路徑(唯一真理來源),
-#    再實際 import 一次確認那個 python 真的有 demucs。
+# ⛔ 判斷全部交給 分軌線檢查.py(與 install.ps1 共用的唯一實作,有測試在守):
+#    ① 用哪支 python 由 評審團.py 決定(唯一真理來源),安裝器不自己猜;
+#    ② 不可以只驗 import demucs —— 和聲分析.py 要 librosa,只驗 demucs 會在缺 librosa 時
+#       印「九柱齊全」(Codex R13 的假陽性);
+#    ③ 失敗要**印出真正的原因**,而且暫時性失敗會自動再試一次 ——
+#       2026-08-02 實跑:自我檢查靜靜判「和聲缺項」exit 1,同一次執行接下來的
+#       --verify-models 卻用同一條線跑完九柱、拿到 VERIFY_OK。沒有原因的假警報最難修。
 HAS_DEMUCS=0
 if [ "$HAS_ENV" = 1 ]; then
-  DEMUCS_PY=$(PYTHONUTF8=1 .venv/bin/python -c "import 評審團 as J; print(J.DEMUCS_PY)" 2>/dev/null | tail -n 1)
-  # ⛔ 整條線一起驗:和聲分析.py 也在這個環境跑,它要 librosa。只驗 demucs 的話,
-  #    缺 librosa 時分軌成功、和聲柱(13.6%)整根降級,安裝器卻印「九柱齊全」(Codex R13)。
-  if [ -n "$DEMUCS_PY" ] && [ -x "$DEMUCS_PY" ]; then
-    if "$DEMUCS_PY" -c "import demucs, librosa, numpy, soundfile" >/dev/null 2>&1; then
-      HAS_DEMUCS=1
-    elif "$DEMUCS_PY" -c "import demucs" >/dev/null 2>&1; then
+  LINE_OUT=$(PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py 2>&1)
+  LINE_RC=$?
+  if [ "$LINE_RC" = 0 ]; then
+    HAS_DEMUCS=1
+  else
+    printf "${C_DIM}%s${C_OFF}\n" "$LINE_OUT"
+    if [ "$LINE_RC" = 1 ]; then
       bad "分軌環境缺依賴" "有 demucs 但缺 librosa/numpy/soundfile 其一 → 和聲柱會整根降級;請重跑安裝或 uv pip install -r requirements-demucs.txt"
+    else
+      bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "原因印在上面;剛裝完偶爾是暫時性的(防毒正在掃剛寫下去的幾 GB),重跑一次 --check-only 就知道"
     fi
   fi
 fi
@@ -386,57 +397,21 @@ fi
 VERIFY_OK=1
 if [ "$VERIFY_MODELS" = 1 ]; then
   if [ "$HAS_ENV" = 1 ]; then
-    # ⛔ 三件事缺一不可(Codex R12):
-    #    ① 唯一檔名 verify_<id>.wav → 分軌快取鍵含檔名,強迫 Demucs 真的重新推論,
-    #       不會沿用 demo_mix 的舊 stems;
-    #    ② 子環境用 env -u 清掉 SKIP_GEMINI/TRUST_LEGACY_STEMS ——
-    #       呼叫 shell 遺留的變數會讓驗證跳關或信任舊快取;也不動呼叫者的環境;
-    #    ③ 不信 exit 0:用 驗證報告.py 獨立解析 JSON —— stub 寫個 {} 也騙不過。
     # <verify-block-start>  ⚠️ 這對標記給 tests/test_installer_order.py 抽取用
-    VID="verify_$(date +%s)_$$"
-    printf "
-      ${C_DIM}--verify-models:實跑 評審團.py ${VID}.wav(唯一檔名,強迫全模型路徑;首次會下載數 GB)...${C_OFF}
-"
-    cp demo_mix.wav "${VID}.wav"
-    V_EPOCH=$(date +%s)
-    # ⛔ 清理用 trap:評測中途炸掉/Ctrl+C 時,已寫出的 _評分.json、_編曲層次.json、
-    #    _和聲分析.json、_伴奏節奏軌.wav… 都會留在專案裡(Codex R13 故障注入實測)。
-    #    清所有 $VID 前綴的產物,不是只清 wav 與最終報告。
-    _sj_verify_cleanup() { rm -rf "${VID}"* _stems/"${VID}"*; }
-    trap '_sj_verify_cleanup' EXIT INT TERM
-    # ⛔ 外層 timeout(Codex R15):模型載入 deadlock 時直接跑會永遠掛著。
-    #    用可殺整棵樹的 runner 包住;首次下載很久,預設給寬,可用
-    #    SONG_JURY_VERIFY_TIMEOUT 調整。
-    V_TIMEOUT="${SONG_JURY_VERIFY_TIMEOUT:-7200}"
-    env -u SONG_JURY_SKIP_GEMINI -u SONG_JURY_TRUST_LEGACY_STEMS         PYTHONUTF8=1 .venv/bin/python -c '
-import subprocess, sys
-sys.path.insert(0, ".")
-from 子程序 import run_tree
-try:
-    r = run_tree([sys.executable, "評審團.py", sys.argv[1]], timeout=float(sys.argv[2]))
-    sys.stdout.write(r.stdout or ""); sys.stderr.write(r.stderr or "")
-    sys.exit(r.returncode)
-except subprocess.TimeoutExpired:
-    print("⛔ 評審團逾時(已中止整棵程序樹)", file=sys.stderr)
-    sys.exit(124)
-' "${VID}.wav" "$V_TIMEOUT"
+    # ⛔ 整段流程(實跑→裁判→清理)交給 完整驗證.py:shell 的 `trap ... INT`
+    #    會把中斷吞掉繼續跑,自動化分不出「安裝失敗」與「使用者取消」(Codex R16-10)。
+    #    python 的 try/finally + 明確退出碼(130)兩邊語意一致。
+    PYTHONUTF8=1 .venv/bin/python 完整驗證.py
     VRC=$?
-    if [ "$VRC" -eq 124 ]; then
-      bad "完整驗證逾時(超過 ${V_TIMEOUT}s,已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設 SONG_JURY_VERIFY_TIMEOUT 加長再試"; VERIFY_OK=0
-    elif [ "$VRC" -eq 0 ]; then
-      if PYTHONUTF8=1 .venv/bin/python 驗證報告.py "${VID}_評審團.json" --newer-than "$V_EPOCH"; then
-        ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"
-      else
-        bad "完整驗證:評審團回報成功但 JSON 驗不過(見上一行 VERIFY_BAD)" "退出碼契約與產出內容不一致,不可採信"
-        VERIFY_OK=0
-      fi
-    elif [ "$VRC" -eq 2 ]; then
-      bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"; VERIFY_OK=0
-    else
-      bad "完整驗證沒過(退出碼 $VRC)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"; VERIFY_OK=0
-    fi
-    _sj_verify_cleanup                       # 正常路徑也清一次
-    trap 'rm -f "$SJ_STEP_LOG"' EXIT INT TERM   # 還原原本的 EXIT trap
+    case "$VRC" in
+      0)   ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)" ;;
+      2)   bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"; VERIFY_OK=0 ;;
+      124) bad "完整驗證逾時(已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設 SONG_JURY_VERIFY_TIMEOUT 加長再試"; VERIFY_OK=0 ;;
+      130) bad "完整驗證被使用者中斷(Ctrl+C)" "已中止並清理;要驗請重跑"; VERIFY_OK=0
+           printf "${C_DIM}  (使用者中斷 → 安裝器以 130 結束)${C_OFF}
+"; exit 130 ;;
+      *)   bad "完整驗證沒過(退出碼 $VRC)" "模型下載/載入/推論或 JSON 驗證其中一環失敗,原始輸出在上面"; VERIFY_OK=0 ;;
+    esac
     # <verify-block-end>
   else
     bad "--verify-models 需要 .venv 可用" "先完成安裝再驗"; VERIFY_OK=0
@@ -471,6 +446,12 @@ USAGE
 # ⛔ 退出碼一定要反映結果:失敗項不為零、九柱沒齊、或冒煙測試沒過 → exit 1。
 #    否則自動化/CI/包裝層看到 exit 0 會以為裝好了。
 # ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段);--verify-models 沒過同理
+# ⛔ 金鑰政策錯誤原樣傳出(5):跟「沒裝好(1)」是兩件事(Codex R16-11)
+if [ "$POLICY_ERROR" = 1 ]; then
+  printf "${C_DIM}  (退出碼 5:Gemini 金鑰政策無效 —— 修設定,不是重裝或換 key)${C_OFF}
+"
+  exit 5
+fi
 if [ "${#PROBLEMS[@]}" -gt 0 ] || [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ] || [ "$SMOKE_OK" != 1 ] || [ "$HAS_FFMPEG" != 1 ] || [ "$VERIFY_OK" != 1 ]; then
   printf "${C_DIM}  (退出碼 1:安裝未完全成功)${C_OFF}\n"
   exit 1

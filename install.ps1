@@ -13,7 +13,16 @@
 #  設計原則:**任何一步失敗都不中斷整個安裝**。失敗的記下來,最後一次告訴你
 #  哪幾根柱子會缺、怎麼補。半套能用,總比裝到一半炸掉什麼都沒有好。
 # ══════════════════════════════════════════════════════════════════════
-param([switch]$SkipML, [switch]$NoAutoTools, [switch]$CheckOnly, [switch]$VerifyModels)
+param([switch]$SkipML, [switch]$NoAutoTools, [switch]$CheckOnly, [switch]$VerifyModels,
+      [Parameter(ValueFromRemainingArguments = $true)]$Unknown)
+
+# ⛔ 未知參數一律擋下(Codex R16-11):舊版靜默忽略 —— 把 -VerifyModels 拼錯的人
+#    會拿到「普通安裝的綠燈」,還以為做過完整模型驗證,那是最危險的假證據。
+if ($Unknown) {
+    Write-Host "⛔ 不認得的參數:$($Unknown -join ' ')" -ForegroundColor Red
+    Write-Host "   可用的是:-SkipML  -NoAutoTools  -CheckOnly  -VerifyModels" -ForegroundColor Yellow
+    exit 64        # sysexits.h 的 EX_USAGE
+}
 
 $ROOT = $PSScriptRoot
 Set-Location $ROOT
@@ -208,23 +217,25 @@ Step "自我檢查 —— 實際確認九根柱子哪些可用"
 
 $hasEnvExe  = Test-Path ".venv\Scripts\python.exe"
 
-# ⛔ 不自己猜 demucs 在哪 —— 問評審團.py 自己解析出來的那條路徑(唯一真理來源),
-#    再實際 import 一次確認那個 python 真的有 demucs。猜的話會跟實際跑分不一致。
+# ⛔ 判斷全部交給 分軌線檢查.py(與 install.sh 共用的唯一實作,有測試在守):
+#    ① 用哪支 python 由 評審團.py 決定(唯一真理來源),安裝器不自己猜;
+#    ② 不可以只驗 import demucs —— 和聲分析.py 要 librosa,只驗 demucs 會在缺 librosa 時
+#       印「九柱齊全」(Codex R13 的假陽性);
+#    ③ 失敗要**印出真正的原因**,而且暫時性失敗會自動再試一次 ——
+#       2026-08-02 實跑:自我檢查靜靜判「和聲缺項」exit 1,同一次執行接下來的
+#       -VerifyModels 卻用同一條線跑完九柱、拿到 VERIFY_OK。沒有原因的假警報最難修。
 $hasDemucs = $false
 if ($hasEnvExe) {
     $env:PYTHONUTF8 = "1"
-    $demucsPy = (& .venv\Scripts\python.exe -c "import 評審團 as J; print(J.DEMUCS_PY)" 2>$null | Select-Object -Last 1)
-    if ($demucsPy -and (Test-Path $demucsPy)) {
-        # ⛔ 不可以只驗 import demucs:和聲分析.py 也在這個環境跑,它要 librosa。
-        #    只驗 demucs 的話,缺 librosa 時分軌成功、和聲柱(13.6%)整根降級,
-        #    安裝器卻印「九柱齊全」—— Codex R13 實測到的假陽性。整條線一起驗。
-        & $demucsPy -c "import demucs, librosa, numpy, soundfile" 2>$null
-        $hasDemucs = ($LASTEXITCODE -eq 0)
-        if (-not $hasDemucs) {
-            & $demucsPy -c "import demucs" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                Bad "分軌環境缺依賴" "有 demucs 但缺 librosa/numpy/soundfile 其一 → 和聲柱會整根降級;請重跑安裝或 uv pip install -r requirements-demucs.txt"
-            }
+    $lineOut = (& .venv\Scripts\python.exe 分軌線檢查.py 2>&1 | Out-String).TrimEnd()
+    $lineRc = $LASTEXITCODE
+    $hasDemucs = ($lineRc -eq 0)
+    if (-not $hasDemucs) {
+        Write-Host $lineOut -ForegroundColor DarkGray
+        if ($lineRc -eq 1) {
+            Bad "分軌環境缺依賴" "有 demucs 但缺 librosa/numpy/soundfile 其一 → 和聲柱會整根降級;請重跑安裝或 uv pip install -r requirements-demucs.txt"
+        } else {
+            Bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "原因印在上面;剛裝完偶爾是暫時性的(防毒正在掃剛寫下去的幾 GB),重跑一次 -CheckOnly 就知道"
         }
     }
 }
@@ -265,6 +276,7 @@ $hasFfmpeg = Have "ffmpeg"
 #    三態:verified=綠燈資格;invalid=視同沒金鑰;cooling/unknown=「未能驗證」,
 #    不給綠燈、最後 exit 3(獨立退出碼,跟「缺柱 exit 1」分開)。
 $script:KeyUnverified = $false
+$script:PolicyError = $false
 $probePy = if (Test-Path ".venv\Scripts\python.exe") { ".venv\Scripts\python.exe" }
            elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
            elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" }
@@ -285,7 +297,8 @@ if ($probePy) {
         3 { $script:KeyUnverified = $true; $hasKey = $true
             Warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 -CheckOnly" }
         4 { Warn "找不到可用金鑰(.env 沒填、只有佔位字串,或環境變數名字用錯)" }
-        5 { Bad "Gemini 金鑰政策無效" "拒絕名單格式錯,或 .env 來源可疑(symlink/硬連結/父目錄連結)。⛔ 這不是「沒填金鑰」—— 去申請新 key 沒有用,請照上面的訊息修設定" }
+        5 { $script:PolicyError = $true
+            Bad "Gemini 金鑰政策無效" "拒絕名單格式錯,或 .env 來源可疑(symlink/硬連結/父目錄連結)。⛔ 這不是「沒填金鑰」—— 去申請新 key 沒有用,請照上面的訊息修設定" }
         default { $script:KeyUnverified = $true; $hasKey = $true
                   Warn "金鑰驗證工具異常(退出碼 $krc)—— 不給完整綠燈" }
     }
@@ -412,79 +425,24 @@ if ($hasEnv) {
 $script:VerifyOk = $true
 if ($VerifyModels) {
     if ($hasEnv) {
-        # ⛔ 三件事缺一不可(Codex R12):
-        #    ① 唯一檔名 verify_<id>.wav → 分軌快取鍵含檔名,強迫 Demucs 真的重新推論,
-        #       不會沿用 demo_mix 的舊 stems;
-        #    ② 子環境清掉 SONG_JURY_SKIP_GEMINI / SONG_JURY_TRUST_LEGACY_STEMS ——
-        #       呼叫 shell 遺留的變數會讓驗證跳關或信任舊快取(驗完恢復,不動呼叫者);
-        #    ③ 不信 exit 0:用 驗證報告.py 獨立解析 JSON(完整評測/缺柱/曲側合成/
-        #       八柱鍵/本輪新產物)—— stub 寫個 {} 也騙不過。
         # <verify-block-start>  ⚠️ 這對標記給 tests/test_installer_order.py 抽取用
-        $vid = "verify_" + [guid]::NewGuid().ToString("N").Substring(0, 8)
-        Write-Host "`n      -VerifyModels:實跑 評審團.py $vid.wav(唯一檔名,強迫全模型路徑;首次會下載數 GB)..." -ForegroundColor DarkGray
-        Copy-Item "demo_mix.wav" "$vid.wav"
-        $vEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        # ⛔ 順序:**先存原值再設定**。舊碼先 $env:PYTHONUTF8="1" 才存 $oldUtf8,
-        #    於是「原值」永遠是 1 —— 使用者在自己的 PowerShell 直接跑 ./install.ps1
-        #    之後,環境被永久改成 1(Codex R15 探針:STATE False|1)。
-        $oldSkip = $env:SONG_JURY_SKIP_GEMINI; $oldTrust = $env:SONG_JURY_TRUST_LEGACY_STEMS
-        $oldUtf8 = $env:PYTHONUTF8
-        $env:PYTHONUTF8 = "1"
-        Remove-Item Env:SONG_JURY_SKIP_GEMINI -EA SilentlyContinue
-        Remove-Item Env:SONG_JURY_TRUST_LEGACY_STEMS -EA SilentlyContinue
-        # ⛔ 順序鐵則(Codex R14 抓到的迴歸,而且是我上一輪加清理時自己造成的):
-        #    「跑評審團 → 依退出碼叫裁判」必須在**同一個 try 裡跑完**,
-        #    清理只能在最外層 finally。舊版把清理放在 finally、裁判放在 finally 之後
-        #    → 成功路徑必定先被刪掉報告,裁判永遠 VERIFY_BAD 檔案不存在,
-        #    完整驗證的成功路徑變成必定假陰性。
-        try {
-            # ⛔ 外層 timeout(Codex R15):jury/模型載入真的 deadlock 時,直接
-            #    `& python 評審團.py` 會永遠掛著,只能靠人工中斷 —— 而硬 kill
-            #    不保證跑得到 finally。用可殺整棵樹的 runner(子程序.run_tree)包住,
-            #    首次下載很久,所以預設給得寬(可用 SONG_JURY_VERIFY_TIMEOUT 調)。
-            $vTimeout = if ($env:SONG_JURY_VERIFY_TIMEOUT) { $env:SONG_JURY_VERIFY_TIMEOUT } else { "7200" }
-            & .venv\Scripts\python.exe -c @"
-import subprocess, sys
-sys.path.insert(0, '.')
-from 子程序 import run_tree
-try:
-    r = run_tree([sys.executable, '評審團.py', sys.argv[1]], timeout=float(sys.argv[2]))
-    sys.stdout.write(r.stdout or ''); sys.stderr.write(r.stderr or '')
-    sys.exit(r.returncode)
-except subprocess.TimeoutExpired:
-    print('⛔ 評審團逾時(已中止整棵程序樹)', file=sys.stderr)
-    sys.exit(124)
-"@ "$vid.wav" $vTimeout
-            $vrc = $LASTEXITCODE
-            if ($vrc -eq 124) {
-                Bad "完整驗證逾時(超過 $vTimeout 秒,已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設環境變數 SONG_JURY_VERIFY_TIMEOUT 加長再試"
-                $script:VerifyOk = $false
-            } elseif ($vrc -eq 0) {
-                & .venv\Scripts\python.exe 驗證報告.py "${vid}_評審團.json" --newer-than $vEpoch
-                if ($LASTEXITCODE -eq 0) {
-                    Ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"
-                } else {
-                    Bad "完整驗證:評審團回報成功但 JSON 驗不過(見上一行 VERIFY_BAD)" "退出碼契約與產出內容不一致,不可採信"
-                    $script:VerifyOk = $false
-                }
-            } elseif ($vrc -eq 2) {
-                Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
-                $script:VerifyOk = $false
-            } else {
-                Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"
-                $script:VerifyOk = $false
-            }
-        } finally {
-            # 還原呼叫者的環境(⛔ 連 PYTHONUTF8 都要還:安裝腳本不該把環境改動留給呼叫者)
-            if ($null -ne $oldSkip)  { $env:SONG_JURY_SKIP_GEMINI = $oldSkip }
-            if ($null -ne $oldTrust) { $env:SONG_JURY_TRUST_LEGACY_STEMS = $oldTrust }
-            if ($null -eq $oldUtf8) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
-            else { $env:PYTHONUTF8 = $oldUtf8 }
-            # 清所有 $vid 前綴的產物:中途炸掉時已寫出的 _評分.json / _編曲層次.json /
-            # _和聲分析.json / _伴奏節奏軌.wav… 都要清(Codex R13);Ctrl+C 也走這裡。
-            Get-ChildItem -File -Filter "$vid*" -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue
-            Get-ChildItem "_stems" -Directory -Filter "$vid*" -EA SilentlyContinue |
-                Remove-Item -Recurse -Force -EA SilentlyContinue
+        # ⛔ 整段流程(實跑→裁判→清理)交給 完整驗證.py:PowerShell 對真的 Ctrl+C
+        #    不可靠地進入 finally —— Codex R16 送 CTRL_C_EVENT 實測安裝器掛住、
+        #    內外層 finally 都沒跑、verify_* 殘留。python 的 try/finally 是語言保證,
+        #    而且中斷有明確退出碼(130),自動化分得出「失敗」與「使用者取消」。
+        # ⚠️ 環境隔離也在 helper 裡用 subprocess env 做,不動這個 shell 的環境。
+        & .venv\Scripts\python.exe 完整驗證.py
+        $vrc = $LASTEXITCODE
+        switch ($vrc) {
+            0   { Ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)" }
+            2   { Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
+                  $script:VerifyOk = $false }
+            124 { Bad "完整驗證逾時(已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設環境變數 SONG_JURY_VERIFY_TIMEOUT 加長再試"
+                  $script:VerifyOk = $false }
+            130 { Bad "完整驗證被使用者中斷(Ctrl+C)" "已中止並清理;要驗請重跑"
+                  $script:VerifyOk = $false }
+            default { Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論或 JSON 驗證其中一環失敗,原始輸出在上面"
+                      $script:VerifyOk = $false }
         }
         # <verify-block-end>
     } else {
@@ -526,6 +484,13 @@ if ($Host.Name -eq "ConsoleHost" -and -not $CheckOnly) {
 #    否則自動化/CI/包裝層看到 exit 0 會以為裝好了(Codex 實跑遇到 10 項失敗仍回 0)。
 # ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段);-VerifyModels 沒過同理
 $failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk) -or (-not $hasFfmpeg) -or (-not $script:VerifyOk)
+# ⛔ 金鑰政策錯誤要**原樣傳到最外層**(Codex R16-11):它被 Problems 洗成 1 的話,
+#    自動化分不出「安裝沒裝好」與「安全設定壞了(去申請新 key 沒有用)」。
+#    這一條要排在 $failed 之前 —— 政策壞掉時 Problems 一定非空。
+if ($script:PolicyError) {
+    Write-Host "  (退出碼 5:Gemini 金鑰政策無效 —— 修設定,不是重裝或換 key)" -ForegroundColor DarkGray
+    exit 5
+}
 if ($failed) {
     Write-Host "  (退出碼 1:安裝未完全成功)" -ForegroundColor DarkGray
     exit 1

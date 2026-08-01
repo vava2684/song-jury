@@ -80,13 +80,21 @@ def test_環境變數指定的直譯器最優先(tmp_path, monkeypatch):
 
 
 def test_安裝腳本自檢要驗整條線而不是只驗demucs():
-    """安裝器的自檢也要問同一個問題,否則 repo 修好了、安裝器還在說謊。"""
+    """安裝器的自檢也要問同一個問題,否則 repo 修好了、安裝器還在說謊。
+
+    ⭐ 2026-08-02 起兩支安裝器都改成呼叫 `分軌線檢查.py`(唯一實作):
+       兩邊各自抄一份探測邏輯 = 兩套真理,遲早只修到其中一邊。"""
     from conftest import REPO
     ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
     sh = (REPO / "install.sh").read_text(encoding="utf-8")
     for name, src in (("install.ps1", ps1), ("install.sh", sh)):
-        assert "import demucs, librosa, numpy, soundfile" in src, \
-            f"🔴 {name} 只驗 import demucs —— 缺 librosa 的環境會被判成和聲柱完整"
+        assert "分軌線檢查.py" in src, f"🔴 {name} 沒有呼叫共用的分軌線體檢"
+        assert "import demucs, librosa, numpy, soundfile" not in src, \
+            f"🔴 {name} 又自己抄了一份探測 —— 邏輯只能有一份"
+    # helper 自己不可以另抄一份模組清單(要跟評審團.py 同源)
+    helper = (REPO / "分軌線檢查.py").read_text(encoding="utf-8")
+    assert "DEMUCS_LINE_MODS" in helper and "from 評審團 import" in helper, \
+        "🔴 分軌線檢查.py 要跟評審團.py 共用模組清單,不可以另抄"
     # ⛔ 不可以整份 grep "librosa" —— 註解裡也寫著這個字,把宣告刪掉照樣命中(裝飾品)。
     #    要**解析成套件名**再看,那才是「有沒有真的宣告」。
     req = (REPO / "requirements-demucs.txt").read_text(encoding="utf-8")
@@ -96,3 +104,81 @@ def test_安裝腳本自檢要驗整條線而不是只驗demucs():
         if ln and not ln.startswith("-"):
             pkgs.add(re.split(r"[<>=!\[;]", ln)[0].strip().lower())
     assert "librosa" in pkgs, f"🔴 requirements-demucs.txt 沒宣告 librosa(宣告到的:{sorted(pkgs)})"
+
+
+# ── 分軌線體檢(分軌線檢查.py)的行為 ────────────────────────────────
+# 🔴 2026-08-02 實跑事故:自我檢查印「和聲 13.6% 缺項 → 評不出有效分數」exit 1,
+#    同一次執行接下來的 -VerifyModels 卻用**同一條線**跑完九柱、拿到 VERIFY_OK。
+#    兩個病灶:失敗完全沒說原因、剛裝完的暫時性失敗被當成永久結論。
+D = load("分軌線檢查")
+
+
+class _R:
+    def __init__(self, rc, err=""):
+        self.returncode, self.stdout, self.stderr = rc, "", err
+
+
+def test_暫時性失敗要再給一次機會(monkeypatch):
+    """剛裝完那一刻最容易假失敗(幾 GB 剛寫下去、防毒正在掃、第一次 import 建快取)。
+    一次失敗就定生死 = 拿最不穩的那一秒當永久結論。"""
+    calls = []
+
+    def fake(cmd, **kw):
+        calls.append(cmd)
+        return _R(0) if len(calls) > 1 else _R(1, "OSError: [WinError 5] 存取被拒")
+
+    monkeypatch.setattr(D.subprocess, "run", fake)
+    ok, why = D.probe("py", pause=0)
+    assert ok is True, f"🔴 第二次就成功了卻判死:{why}"
+    assert len(calls) == 2, "要真的重試,不是只把旗標打開"
+
+
+def test_失敗一定要講出真正的原因(monkeypatch):
+    """沒有原因的「你缺一根柱子」是最難修的訊息 —— 使用者無從查起。"""
+    monkeypatch.setattr(D.subprocess, "run",
+                        lambda cmd, **kw: _R(1, "ModuleNotFoundError: No module named 'librosa'"))
+    ok, why = D.probe("py", attempts=1, pause=0)
+    assert ok is False
+    assert "librosa" in why, f"🔴 原因被吞掉了:{why!r}"
+
+
+def test_逾時也要當成有原因的失敗(monkeypatch):
+    def boom(cmd, **kw):
+        raise D.subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(D.subprocess, "run", boom)
+    ok, why = D.probe("py", attempts=1, pause=0, timeout=1)
+    assert ok is False and "逾時" in why
+
+
+def test_只缺依賴回1_整條線壞掉回2(monkeypatch, tmp_path, capsys):
+    """兩種壞法要分得開:① 有 demucs 缺 librosa(分軌能跑、和聲柱死)
+    ② 連 demucs 都沒有(結構編曲柱 + 和聲柱一起死)。安裝器靠這個給不同建議。"""
+    fake_py = tmp_path / "python.exe"
+    fake_py.write_text("", encoding="utf-8")
+
+    def only_demucs(py, mods=D.DEMUCS_LINE_MODS, **kw):
+        return (tuple(mods) == ("demucs",), "缺 librosa")
+
+    monkeypatch.setattr(D, "probe", only_demucs)
+    assert D.main([str(fake_py)]) == 1
+    assert "DEMUCS_LINE_BAD" in capsys.readouterr().out
+
+    monkeypatch.setattr(D, "probe", lambda py, mods=D.DEMUCS_LINE_MODS, **kw: (False, "沒有 demucs"))
+    assert D.main([str(fake_py)]) == 2
+
+
+def test_找不到直譯器不可以靜靜當成沒事(capsys):
+    """⛔ 安裝器最怕的就是「沒有結論也沒有訊息」—— 那正是這次事故的樣子。"""
+    assert D.main(["Z:/沒有這支/python.exe"]) == 2
+    assert "DEMUCS_LINE_BAD" in capsys.readouterr().out
+
+
+def test_成功時要印出用的是哪支python(monkeypatch, tmp_path, capsys):
+    fake_py = tmp_path / "python.exe"
+    fake_py.write_text("", encoding="utf-8")
+    monkeypatch.setattr(D, "probe", lambda py, mods=D.DEMUCS_LINE_MODS, **kw: (True, ""))
+    assert D.main([str(fake_py)]) == 0
+    out = capsys.readouterr().out
+    assert "DEMUCS_LINE_OK" in out and str(fake_py) in out, \
+        "要講清楚是哪一支 —— 跟實際跑分用的必須是同一支"

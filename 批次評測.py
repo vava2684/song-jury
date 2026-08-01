@@ -20,6 +20,7 @@
     <結果夾>/鑑別力報告.md    給八家評審看的證據表
 """
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -29,6 +30,7 @@ from pathlib import Path
 from statistics import mean, pstdev
 
 from 子程序 import run_tree
+from 驗證報告 import REQUIRED_PILLARS, validate
 
 os.environ.setdefault("PYTHONUTF8", "1")
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -64,6 +66,29 @@ def collect_songs(target: Path):
     return out
 
 
+class ContractMismatch(RuntimeError):
+    """進度檔的批次契約與這次執行的模式不同 —— 兩把尺不可混在同一個 store。"""
+
+
+def _load_store(store: Path) -> dict:
+    """讀進度檔並**驗批次契約**。舊的裸 mapping 一律拒絕續跑(不知道是哪把尺)。"""
+    d = json.loads(store.read_text(encoding="utf-8"))
+    want = FULL_CONTRACT if FULL_MODE else LOCAL_CONTRACT
+    if not isinstance(d, dict) or "results" not in d or "batch_contract" not in d:
+        raise ContractMismatch(
+            f"{store.name} 是舊格式(沒有 batch_contract)—— 不知道裡面是哪一把尺的資料,"
+            f"不能續跑。請改個 --out 目錄重跑,或先把舊檔移走。")
+    got = d["batch_contract"]
+    if got != want:
+        raise ContractMismatch(
+            f"{store.name} 是 {got} 的資料,這次是 {want} —— ⛔ 兩把尺不可混用。"
+            f"(切到完整模式請用另一個 --out 目錄;混在一起的鑑別力表會是假結論)")
+    res = d["results"]
+    if not isinstance(res, dict):
+        raise ContractMismatch(f"{store.name} 的 results 不是 dict")
+    return res
+
+
 def _save_store(store: Path, results: dict):
     """原子寫入批次進度檔,並留一份上一版備份。
 
@@ -72,8 +97,14 @@ def _save_store(store: Path, results: dict):
        做法:寫暫存檔 → flush+fsync(確定真的落地)→ 舊檔轉備份 → os.replace 原子換上。
     """
     tmp = store.with_suffix(f".json.tmp{os.getpid()}")
+    # ⭐ 進度檔要自報自己是哪一種批次(Codex R16-8):
+    #    舊格式是 path→report 的裸 mapping,於是 full 模式 --skip-existing
+    #    會直接沿用 local-metrics 的舊結果(使用者以為補跑了 Gemini,其實沒有),
+    #    下游 曲評測清單.py 也會把兩把尺混在一張鑑別力表裡。
+    envelope = {"batch_contract": FULL_CONTRACT if FULL_MODE else LOCAL_CONTRACT,
+                "results": results}
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=1)
+        json.dump(envelope, f, ensure_ascii=False, indent=1)
         f.flush()
         os.fsync(f.fileno())
     # ⛔ 只有在主檔**確定解析得開**時才拿它去覆蓋備份。
@@ -94,6 +125,7 @@ def _save_store(store: Path, results: dict):
 # ⭐ 兩種批次契約,輸出會明寫是哪一種(Codex R15)
 FULL_MODE = os.environ.get("SONG_JURY_BATCH_GEMINI") == "1"
 LOCAL_CONTRACT = "local-metrics-v1"
+FULL_CONTRACT = "full-nine-pillars-v1"
 # 「只由 Gemini 供分」的柱:略過 Gemini 時它一定缺,那是**預期**而非安裝壞掉。
 # ⚠️ 其餘柱(和聲/結構編曲…)缺席一律是安裝問題,照樣拒收。
 GEMINI_ONLY_PILLARS = {"律動"}
@@ -153,13 +185,45 @@ def run_one(song: Path, timeout=3600):
     if FULL_MODE:
         if not _ok:
             return None, f"不完整評測,缺柱:{'、'.join(sorted(lost))}(補齊安裝後重跑)"
+        # ⛔ 「完整評測: true」只是產出端的自述 —— full 批次是正式資料入口,
+        #    必須過**獨立裁判**(Codex R16-7:stub 只寫 {"完整評測":true,"缺柱":[]}
+        #    就被收進表,八柱 score、items/missing、合成自洽、契約全沒驗)。
+        why = validate(out_json, require_contract=True)
+        if why:
+            return None, f"獨立裁判拒收:{why}"
+        d["_batch_contract"] = FULL_CONTRACT
         return d, ""
     extra = lost - GEMINI_ONLY_PILLARS
     if extra:
         return None, (f"缺了不該缺的柱:{'、'.join(sorted(extra))} —— 那是安裝問題,"
                       f"不是略過 Gemini 造成的(補齊安裝後重跑)")
+    why = _validate_local(d)
+    if why:
+        return None, f"local-metrics 契約不合格:{why}"
     d["_batch_contract"] = LOCAL_CONTRACT
     return d, ""
+
+
+def _validate_local(d: dict) -> str:
+    """local-metrics-v1 的最低要求:契約版本 + 在場柱的分數要是真數字。
+    ⛔ 不能只看「完整評測」與缺柱集合 —— 那組欄位全是產出端自述(Codex R16-7)。"""
+    if not d.get("scoring_contract"):
+        return "報告沒有 scoring_contract(這個 store 只收有版本證據的報告)"
+    pt = d.get("pillar_totals") or {}
+    柱分 = pt.get("柱分")
+    if not isinstance(柱分, dict):
+        return "柱分不是 dict"
+    lost = set(pt.get("缺柱") or [])
+    for name in REQUIRED_PILLARS:
+        if name in lost:
+            continue                      # 缺柱是預期的(只准 Gemini 造成的)
+        det = 柱分.get(name)
+        if not isinstance(det, dict):
+            return f"柱分[{name}] 不是 dict"
+        s = det.get("score")
+        if isinstance(s, bool) or not isinstance(s, (int, float))                 or not math.isfinite(s) or not (0 <= s <= 100):
+            return f"柱分[{name}].score 不是 0-100 的有限數字:{s!r}"
+    return ""
 
 
 def flatten(m: dict):
@@ -273,12 +337,14 @@ def main():
         #    整個批次當場退出,而且**永遠修不好**(每次重跑都撞同一個壞檔)。
         #    壞掉就退回備份;備份也壞就從頭跑,不要讓一個殘檔卡死整批。
         try:
-            results = json.loads(store.read_text(encoding="utf-8"))
+            results = _load_store(store)
+        except ContractMismatch as e:
+            sys.exit(f"⛔ {e}")
         except Exception as e:
             bak = store.with_suffix(".json.bak")
             print(f"⚠ 進度檔損壞({type(e).__name__}),嘗試用備份:{bak.name}", file=sys.stderr)
             try:
-                results = json.loads(bak.read_text(encoding="utf-8"))
+                results = _load_store(bak)
                 print("  ↳ 已用備份續跑", file=sys.stderr)
             except Exception:
                 results = {}

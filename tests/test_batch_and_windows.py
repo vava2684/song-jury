@@ -52,7 +52,16 @@ def _stub_run(monkeypatch, returncode, write_json=None):
     monkeypatch.setattr(B, "run_tree", fake)
 
 
-完整JSON = {"pillar_totals": {"完整評測": True, "缺柱": [], "曲側合成": 70.0}}
+_八柱 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")
+# ⚠️ R16 起批次會過獨立裁判(full)或 local 契約檢查 → fixture 要是「真的合格」的報告
+完整JSON = {
+    "scoring_contract": "2026-07-25-v1",
+    "pillar_totals": {
+        "完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
+        "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in _八柱},
+        "曲側含柱": list(_八柱),
+    },
+}
 不完整JSON = {"pillar_totals": {"完整評測": False, "缺柱": ["律動", "整體"], "曲側合成": 66.4}}
 
 
@@ -62,10 +71,16 @@ def test_這輪沒產出新檔時不可以讀到上一輪的舊JSON(monkeypatch,
     ⚠️ 這裡刻意用 returncode=0 —— 若用非 0,會被 returncode 檢查先攔下來,
     測到的就不是「有沒有刪舊檔」了(變異驗證抓到過我這個錯)。
     真實情境:評審團.py 吃 SUNO 連結時,輸出檔名跟著「下載後的歌名」走,
-    與批次算出來的路徑對不上 → 這輪其實沒產出,卻讀到上一輪的舊報告。"""
+    與批次算出來的路徑對不上 → 這輪其實沒產出,卻讀到上一輪的舊報告。
+
+    ⚠️ 舊產物要用「**完全合格**的報告」當 fixture:拿半殘 JSON 當舊檔的話,
+    後面的契約檢查會先把它擋掉 —— 刪舊檔那道拿掉了測試照樣綠(變異驗證抓到)。
+    真正危險的正是上一輪那份**看起來完美**的報告。"""
     song = tmp_path / "song.wav"; song.write_bytes(b"x")
+    舊 = json.loads(json.dumps(完整JSON, ensure_ascii=False))
+    舊["pillar_totals"]["曲側合成"] = 99.9          # 上一輪的分數,絕不能出現在這輪
     song.with_name("song_評審團.json").write_text(
-        json.dumps({"pillar_totals": {"完整評測": True, "曲側合成": 99.9}}), encoding="utf-8")
+        json.dumps(舊, ensure_ascii=False), encoding="utf-8")
     _stub_run(monkeypatch, returncode=0)           # 成功回報,但沒寫出這輪的檔
     d, err = B.run_one(song)
     assert d is None, "🔴 讀到舊 JSON 了 —— 批次表會出現上次的分數"
@@ -122,13 +137,14 @@ def test_損壞主檔不可以覆蓋好備份(tmp_path):
     store = tmp_path / "批次結果.json"
     bak = store.with_suffix(".json.bak")
     store.write_text("{壞掉的半截", encoding="utf-8")          # 主檔損壞
-    bak.write_text(json.dumps({"好資料": 1}), encoding="utf-8")  # 備份是好的
+    bak.write_text(json.dumps({"batch_contract": "local-metrics-v1",
+                               "results": {"好資料": 1}}), encoding="utf-8")  # 備份是好的
 
     B._save_store(store, {"新資料": 2})
 
-    assert json.loads(bak.read_text(encoding="utf-8")) == {"好資料": 1}, \
+    assert json.loads(bak.read_text(encoding="utf-8"))["results"] == {"好資料": 1}, \
         "🔴 好備份被損壞的主檔蓋掉了"
-    assert json.loads(store.read_text(encoding="utf-8")) == {"新資料": 2}
+    assert B._load_store(store) == {"新資料": 2}
 
 
 def test_不完整評測不可以進批次表(monkeypatch, tmp_path):
@@ -161,8 +177,11 @@ def test_預設批次收得到結果而不是每首都拒收(monkeypatch, tmp_pa
     改成 local-metrics 契約:只缺 Gemini 柱的結果照收,但明確標記契約。"""
     song = tmp_path / "song.wav"
     song.write_bytes(b"x")
-    只缺律動 = {"pillar_totals": {"完整評測": False, "缺柱": ["律動"],
-                                  "缺柱權重合計": 4.0, "柱分": {}}}
+    只缺律動 = {"scoring_contract": "2026-07-25-v1",
+                "pillar_totals": {"完整評測": False, "缺柱": ["律動"], "缺柱權重合計": 4.0,
+                                  "柱分": {k: {"score": 70.0} for k in
+                                           ("人聲", "和聲", "結構編曲", "聲學",
+                                            "旋律記憶", "真實風格", "整體")}}}
     monkeypatch.setattr(B, "FULL_MODE", False)
     _stub_run(monkeypatch, returncode=2, write_json=只缺律動)
     d, err = B.run_one(song)
@@ -186,9 +205,68 @@ def test_缺了安裝問題造成的柱仍要拒收(monkeypatch, tmp_path):
 def test_完整模式仍然要求九柱齊全(monkeypatch, tmp_path):
     song = tmp_path / "song.wav"
     song.write_bytes(b"x")
-    只缺律動 = {"pillar_totals": {"完整評測": False, "缺柱": ["律動"],
-                                  "缺柱權重合計": 4.0, "柱分": {}}}
+    只缺律動 = {"scoring_contract": "2026-07-25-v1",
+                "pillar_totals": {"完整評測": False, "缺柱": ["律動"], "缺柱權重合計": 4.0,
+                                  "柱分": {k: {"score": 70.0} for k in
+                                           ("人聲", "和聲", "結構編曲", "聲學",
+                                            "旋律記憶", "真實風格", "整體")}}}
     monkeypatch.setattr(B, "FULL_MODE", True)
     _stub_run(monkeypatch, returncode=2, write_json=只缺律動)
     d, err = B.run_one(song)
     assert d is None and "不完整" in err
+
+
+# ── Codex R16:full 要過獨立裁判;進度檔不可跨契約續跑 ──────────────────
+
+def test_full模式要過獨立裁判(monkeypatch, tmp_path):
+    """🔴 Codex R16-7:stub 只寫 {"完整評測":true,"缺柱":[]} 就被收進 full 表 ——
+    八柱 score、items/missing、合成自洽、契約全沒驗。「完整評測: true」只是
+    產出端的自述,正式資料入口必須過獨立裁判。"""
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    半殘 = {"pillar_totals": {"完整評測": True, "缺柱": []}}
+    monkeypatch.setattr(B, "FULL_MODE", True)
+    _stub_run(monkeypatch, returncode=0, write_json=半殘)
+    d, err = B.run_one(song)
+    assert d is None and "裁判" in err, f"半殘 JSON 混進 full 表了:{err!r}"
+    # 真正合格的報告才收,而且會標上 full 契約
+    _stub_run(monkeypatch, returncode=0, write_json=完整JSON)
+    d2, err2 = B.run_one(song)
+    assert d2 is not None and d2["_batch_contract"] == B.FULL_CONTRACT, err2
+
+
+def test_不同批次契約的進度檔不可續跑(monkeypatch, tmp_path):
+    """🔴 Codex R16-8:local 與 full 共用同一個進度檔,--skip-existing 會讓
+    full 直接沿用 local-metrics 的舊結果 —— 使用者以為補跑了 Gemini,其實沒有。"""
+    store = tmp_path / "批次結果.json"
+    monkeypatch.setattr(B, "FULL_MODE", False)
+    B._save_store(store, {"某首": {"x": 1}})
+    assert B._load_store(store) == {"某首": {"x": 1}}, "同契約要讀得回來"
+    monkeypatch.setattr(B, "FULL_MODE", True)
+    with pytest.raises(B.ContractMismatch) as ei:
+        B._load_store(store)
+    assert "兩把尺不可混用" in str(ei.value)
+
+
+def test_舊格式進度檔不可續跑(monkeypatch, tmp_path):
+    """裸 mapping(沒有 batch_contract)= 不知道是哪把尺的資料 → 拒絕續跑。"""
+    store = tmp_path / "批次結果.json"
+    store.write_text(json.dumps({"某首": {"x": 1}}), encoding="utf-8")
+    monkeypatch.setattr(B, "FULL_MODE", False)
+    with pytest.raises(B.ContractMismatch):
+        B._load_store(store)
+
+
+def test_下游分析拒絕沒有契約的store(tmp_path, monkeypatch):
+    """🔴 Codex R16-8:曲評測清單.py 直接 flatten 所有沒 error 的 value,
+    於是 local 與 full 的資料會被混進同一張鑑別力表 —— 兩把尺算出來的離散度
+    是假結論,而標題還寫「完整數據」。"""
+    import types
+    Q = load("曲評測清單")
+    out = tmp_path / "_批次結果"
+    out.mkdir()
+    (out / "批次結果.json").write_text(json.dumps({"某首": {"x": 1}}), encoding="utf-8")
+    monkeypatch.setattr(Q, "BASE", tmp_path)
+    with pytest.raises(SystemExit) as ei:
+        Q.main()
+    assert "batch_contract" in str(ei.value) or "舊格式" in str(ei.value)

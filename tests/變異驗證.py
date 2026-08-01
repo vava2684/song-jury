@@ -174,6 +174,85 @@ MUTATIONS = [
      "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
+    # ── Codex 第十六輪:比較器身分、並列傳遞性、契約 strict、批次污染、入口退出碼 ──
+    ("比較器用顯示名當鍵(不同資料夾的同名報告互相覆蓋)",
+     "比較.py",
+     '        "report_id": str(path.resolve()),',
+     '        "report_id": path.stem,   # 變異:用會撞名的顯示名',
+     "tests/test_compare.py::test_不同資料夾的同名報告不可互相覆蓋"),
+
+    ("同一份報告可以重複上場(A 對 A 被當成合法 PK)",
+     "比較.py",
+     '    _reject_duplicates(paths)\n    items = [load_report(p) for p in paths]\n    if len(items) < 2:\n        raise CompareError("PK 至少要兩首")',
+     '    items = [load_report(p) for p in paths]\n    if len(items) < 2:\n        raise CompareError("PK 至少要兩首")',
+     "tests/test_compare.py::test_同一份報告不可以重複上場"),
+
+    ("並列退回相鄰比較(三首以上鏈式擴張成全部第一名)",
+     "比較.py",
+     '        tie = head is not None and (head - it["composite"]) < TIE_THRESHOLD',
+     '        tie = i > 0 and (ordered[i - 1]["composite"] - it["composite"]) < TIE_THRESHOLD',
+     "tests/test_compare.py::test_三首以上的並列不可以鏈式擴張"),
+
+    ("冠軍退回單一 max(同分被偽裝成唯一冠軍)",
+     "比較.py",
+     '    best = max(key(i) for i in items)\n    names = [i["song"] for i in items if key(i) == best]',
+     '    best = max(key(i) for i in items)\n    names = [max(items, key=key)["song"]]',
+     "tests/test_compare.py::test_柱冠軍與最佳take同分時要全部列出"),
+
+    ("比較器驗完再讀第二次(TOCTOU:排名用到沒驗過的內容)",
+     "比較.py",
+     '    d = json.loads(raw.decode("utf-8"))',
+     '    d = json.loads(path.read_text(encoding="utf-8"))   # 變異:第二次讀檔',
+     "tests/test_compare.py::test_驗過的內容就是排名用的內容_TOCTOU"),
+
+    ("比較器不要求契約(舊格式混進來,尺是用猜的)",
+     "比較.py",
+     '    why = validate_data(raw, path.name, require_contract=True)',
+     '    why = validate_data(raw, path.name)',
+     "tests/test_compare.py::test_舊格式報告不可以進比較"),
+
+    ("安裝證據接受缺契約的報告(產出端迴歸也照樣 VERIFY_OK)",
+     "驗證報告.py",
+     '        if require_contract:',
+     '        if False:',
+     "tests/test_installer_order.py::test_jury回0但報告缺契約要被裁判擋下"),
+
+    ("批次 full 不過獨立裁判(半殘 JSON 冒充九柱完整)",
+     "批次評測.py",
+     '        why = validate(out_json, require_contract=True)',
+     '        why = ""',
+     "tests/test_batch_and_windows.py::test_full模式要過獨立裁判"),
+
+    ("進度檔不驗批次契約(--skip-existing 跨契約偷用舊結果)",
+     "批次評測.py",
+     '    got = d["batch_contract"]\n    if got != want:',
+     '    got = d["batch_contract"]\n    if False:',
+     "tests/test_batch_and_windows.py::test_不同批次契約的進度檔不可續跑"),
+
+    ("鑑別力分析吃舊格式 store(兩把尺混一張表)",
+     "曲評測清單.py",
+     '    if not isinstance(d, dict) or "batch_contract" not in d or "results" not in d:',
+     '    if False:',
+     "tests/test_batch_and_windows.py::test_下游分析拒絕沒有契約的store"),
+
+    ("一鍵安裝.bat 又被 pause 洗掉退出碼",
+     "一鍵安裝.bat",
+     'set "rc=%errorlevel%"',
+     'set "rc=0"   REM 變異:不保存 child 的退出碼',
+     "tests/test_packaging.py::test_一鍵安裝bat要保住子程序退出碼"),
+
+    ("install.ps1 又靜默忽略未知參數(拼錯 -VerifyModels 拿到假綠燈)",
+     "install.ps1",
+     'if ($Unknown) {',
+     'if ($false) {',
+     "tests/test_packaging.py::test_安裝器要擋下未知參數_真的跑一次"),
+
+    ("金鑰政策錯誤被洗成一般失敗(自動化分不出安全問題)",
+     "install.ps1",
+     'if ($script:PolicyError) {',
+     'if ($false) {',
+     "tests/test_packaging.py::test_安裝器要原樣傳出政策錯誤碼5"),
+
     # ── Codex 第十五輪:schema 必填、契約版本、政策唯一來源、比較器規則 ────
     ("裁判又讓 items/missing 可省略(不完整 schema 被蓋章)",
      "驗證報告.py",
@@ -219,7 +298,7 @@ MUTATIONS = [
 
     ("PK 不要求指定語言(跨語言尺被硬比)",
      "比較.py",
-     '    if not lang:',
+     '    if lang not in LANGS:',
      '    if False:',
      "tests/test_compare.py::test_PK要指定語言"),
 
@@ -231,13 +310,13 @@ MUTATIONS = [
 
     ("比較器不過獨立裁判(不完整報告混進排名)",
      "比較.py",
-     '    why = validate(path)',
+     '    why = validate_data(raw, path.name, require_contract=True)',
      '    why = ""',
      "tests/test_compare.py::test_不完整的報告不可以進比較"),
 
     ("並列門檻拆掉(0.3 分的差距被當成真的高下)",
      "比較.py",
-     '        tie = i > 0 and (ordered[i - 1]["composite"] - it["composite"]) < TIE_THRESHOLD',
+     '        tie = head is not None and (head - it["composite"]) < TIE_THRESHOLD',
      '        tie = False',
      "tests/test_compare.py::test_差距很小要標並列不是硬排名次"),
 
@@ -247,25 +326,23 @@ MUTATIONS = [
      '    extra = lost',
      "tests/test_batch_and_windows.py::test_預設批次收得到結果而不是每首都拒收"),
 
+    # ⭐ R16 起這兩條的家從 install.ps1 搬進 完整驗證.py(shell 只看退出碼),
+    #    也因此不再需要 win32 標記 —— 三個平台每次都驗得到。
     ("VerifyModels 拿掉外層 timeout(模型 deadlock 就永遠掛著)",
-     "install.ps1",
-     # ⚠ 要**整行**拿掉:只改前半的話,同一行後段與訊息裡的變數名還在,
-     #   grep 型的測試照樣命中(裝飾品)。
-     '            $vTimeout = if ($env:SONG_JURY_VERIFY_TIMEOUT) { $env:SONG_JURY_VERIFY_TIMEOUT } else { "7200" }',
-     '            $vTimeout = "7200"   # 變異:拿掉可設定的逾時',
-     "tests/test_packaging.py::test_VerifyModels要有外層timeout",
-     "win32"),
+     "完整驗證.py",
+     '                    default=float(os.environ.get("SONG_JURY_VERIFY_TIMEOUT", "7200")))',
+     '                    default=7200.0)   # 變異:逾時寫死、外部關不掉',
+     "tests/test_installer_order.py::test_逾時要回124且殺乾淨"),
 
     # ── Codex 第十四輪:驗證順序、失敗路徑殺樹、裁判自洽、政策 fail-closed ──
     # ⚠ 要注入的是**順序錯誤**(清理跑在裁判之前),不是「不叫裁判」——
     #   後者是另一種缺陷,描述與注入不一致就等於沒驗到那個 bug(Codex R15)。
     ("VerifyModels 先清理才叫裁判(成功路徑必定假陰性)",
-     "install.ps1",
-     '            if ($vrc -eq 124) {',
-     '            Get-ChildItem -File -Filter "$vid*" -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue\n'
-     '            if ($vrc -eq 124) {',
-     "tests/test_installer_order.py::test_ps1的驗證順序_裁判先看到報告清理在最後",
-     "win32"),
+     "完整驗證.py",
+     '        why = validate(report, newer_than=started, require_contract=True)',
+     '        _cleanup(vid)   # 變異:清理跑到裁判前面\n'
+     '        why = validate(report, newer_than=started, require_contract=True)',
+     "tests/test_installer_order.py::test_成功路徑_裁判看得到報告且收工後全清乾淨"),
 
     # ⚠ 殺樹在 Windows 上有兩道:主動 kill_tree + 最外層 finally 的 job.close()
     #   (KILL_ON_JOB_CLOSE)。只拔一道會被另一道救回 → 兩道一起拔才是真 fail-open。
@@ -396,8 +473,8 @@ MUTATIONS = [
 
     ("報告解析吃 NaN/Infinity(非標準 JSON 混進來)",
      "驗證報告.py",
-     '        d = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_const)',
-     '        d = json.loads(path.read_text(encoding="utf-8"))',
+     '        d = json.loads(raw.decode("utf-8"), parse_constant=_reject_const)',
+     '        d = json.loads(raw.decode("utf-8"))',
      "tests/test_keyprobe_and_verify.py::test_非標準JSON常數要被拒收"),
 
     ("Windows 退回 taskkill(自行 DETACHED 的孫程序逃掉繼續吃 GPU)",
@@ -772,6 +849,27 @@ MUTATIONS = [
      'if not isinstance(_pt, dict):\n        return None, "結果缺少 pillar_totals(舊格式或產出不完整),拒收"',
      'if not isinstance(_pt, dict):\n        return d, ""',
      "tests/test_batch_and_windows.py::test_缺少完整性欄位時必須拒收"),
+    # ── 2026-08-02 自己實跑 -VerifyModels 抓到的:自我檢查說「和聲缺項」exit 1,
+    #    同一次執行的九柱實跑卻用同一條線拿到 VERIFY_OK ──────────────────
+    ("分軌線體檢不重試(剛裝完的暫時性失敗被當成永久結論)",
+     "分軌線檢查.py",
+     "def probe(py, mods=DEMUCS_LINE_MODS, attempts=2, timeout=PROBE_TIMEOUT,",
+     "def probe(py, mods=DEMUCS_LINE_MODS, attempts=1, timeout=PROBE_TIMEOUT,",
+     "tests/test_demucs_resolve.py::test_暫時性失敗要再給一次機會"),
+
+    ("分軌線體檢失敗不說原因(使用者只看到『你缺一根柱子』,無從查起)",
+     "分軌線檢查.py",
+     '        tail = ((r.stderr or r.stdout or "").strip().splitlines() or ["(沒有輸出)"])[-1]\n'
+     '        why = f"退出碼 {r.returncode}:{tail[:300]}"',
+     '        why = ""   # 變異:原因被吞掉',
+     "tests/test_demucs_resolve.py::test_失敗一定要講出真正的原因"),
+
+    ("分軌線壞掉時不分「缺依賴」與「整條線死」(安裝器給不出對的建議)",
+     "分軌線檢查.py",
+     "    return 1 if has_demucs else 2",
+     "    return 2",
+     "tests/test_demucs_resolve.py::test_只缺依賴回1_整條線壞掉回2"),
+
 ]
 
 # 打包類的變異不能靠改字串 —— 檔案一旦已被 git 追蹤,改 .gitignore 是不會讓它消失的
@@ -784,6 +882,12 @@ GIT_MUTATIONS = [
     ("白名單漏放行 伴奏混音.py(評審團會 subprocess 呼叫它)",
      "伴奏混音.py",
      "tests/test_packaging.py::test_每個被subprocess呼叫的腳本都在repo裡"),
+    ("白名單漏放行 分軌線檢查.py(安裝器自檢第一步就找不到檔)",
+     "分軌線檢查.py",
+     "tests/test_packaging.py::test_安裝腳本呼叫的py也要在repo裡"),
+    ("白名單漏放行 完整驗證.py(只有 shell 腳本會叫它 → 掃 import 的檢查看不到)",
+     "完整驗證.py",
+     "tests/test_packaging.py::test_安裝腳本呼叫的py也要在repo裡"),
     ("四把尺其中一把沒進 repo(詞柱評不出來)",
      "rubrics/JA_lyric_rubric_v3.md",
      "tests/test_packaging.py::test_規則與尺都隨包"),
@@ -794,7 +898,11 @@ GIT_MUTATIONS = [
 
 
 def run_pytest(target):
-    """回 (是否有測試真的 failed, 是否有測試真的跑到)。
+    """回 (是否有測試真的 failed, 是否有測試真的跑到, 選到幾條測試)。
+
+    🔴 2026-08-02 踩到:測試改名後,變異裡的目標 id 選不到任何測試 →
+       XML 是空的 → 舊版把它算成「被 skip」(平台限制)。結果是**改名等於
+       靜靜關掉一條驗證**,而報表看起來一切正常。選到 0 條要當硬錯誤。
 
     ⛔ 不可以只看 pytest 的退出碼:目標測試若被 **skip**(例如 ZIP 環境沒有 .git,
        打包檢查會誠實跳過),退出碼一樣是 0 → 會被誤判成「變異沒被抓到」。
@@ -813,7 +921,7 @@ def run_pytest(target):
                        encoding="utf-8", errors="replace",
                        env={**__import__("os").environ, "PYTHONUTF8": "1"})
         if not xml.exists():
-            return False, False        # 連 XML 都沒產出 = 這次沒驗到
+            return False, False, 0     # 連 XML 都沒產出 = 這次沒驗到
         root = ET.parse(xml).getroot()
         cases = root.iter("testcase")
         n_fail = n_skip = n_pass = 0
@@ -826,7 +934,7 @@ def run_pytest(target):
             else:
                 n_pass += 1
     # 有任何一條真的 failed → 抓到了;全部都是 skipped(沒有 pass 也沒有 fail)→ 沒驗到
-    return n_fail > 0, (n_fail + n_pass) > 0
+    return n_fail > 0, (n_fail + n_pass) > 0, n_fail + n_pass + n_skip
 
 
 def main():
@@ -835,10 +943,13 @@ def main():
     print("=" * 66)
 
     # 先確認乾淨狀態全綠,否則後面的結果沒有意義
-    _failed, _ = run_pytest("tests")
+    _failed, _, _n = run_pytest("tests")
     if _failed:
         print("\n✗ 乾淨狀態下測試就沒過,先修好再跑變異驗證。")
         return 1
+
+    # ⭐ 還原基準:跑之前先把每個會被動到的檔案存成 bytes(見最後的還原檢查)
+    BEFORE = {m[1]: (REPO / m[1]).read_bytes() for m in MUTATIONS}
 
     bad, skipped = [], []
     for i, item in enumerate(MUTATIONS, 1):
@@ -877,9 +988,14 @@ def main():
             mutated = mutated.replace("\n", "\r\n")
         p.write_bytes(mutated.encode("utf-8"))
         try:
-            failed, ran = run_pytest(target)
+            failed, ran, picked = run_pytest(target)
         finally:
             p.write_bytes(raw)                        # 一定要逐位元還原
+        if picked == 0:
+            print(f"\n[{i}/{len(MUTATIONS)}] ❌ 選不到測試:{target}")
+            print(f"        → 測試改名或刪掉了?這條變異等於被靜靜關掉({desc})")
+            bad.append(desc + "(目標測試不存在)")
+            continue
         if failed:
             print(f"\n[{i}/{len(MUTATIONS)}] ✅ 抓到了:{desc}")
         elif not ran:
@@ -904,10 +1020,13 @@ def main():
             skipped.append(("zip", desc))
             continue
         try:
-            failed, ran = run_pytest(target)
+            failed, ran, picked = run_pytest(target)
         finally:
             subprocess.run(["git", "add", "--", fname], cwd=REPO, capture_output=True)
-        if failed:
+        if picked == 0:
+            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ 選不到測試:{target}")
+            bad.append(desc + "(目標測試不存在)")
+        elif failed:
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ✅ 抓到了:{desc}")
         elif not ran:
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}(被 skip,不是通過)")
@@ -943,13 +1062,11 @@ def main():
                   f"或看 CI 的 ubuntu 變異工作(那裡每次都會驗)。")
     else:
         print(f"  ✅ {total} 條真實缺陷全部會被測試抓到")
-    # 最後再確認一次:所有檔案都還原乾淨了。
-    # ⚠️ 要用 `git diff --name-only`(工作區 vs index),不是 `git status --porcelain` ——
-    #    後者會把「跑之前就已經 stage 的正常修改」也一起列出來,變成誤報(自己踩過)。
-    r = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--name-only"],
-                       cwd=REPO, capture_output=True, text=True, encoding="utf-8")
-    touched = {m[1] for m in MUTATIONS}
-    dirty = [ln.strip() for ln in r.stdout.splitlines() if ln.strip() in touched]
+    # 最後再確認一次:所有被動過的檔案都逐位元還原了。
+    # ⛔ 不可以拿 git(diff 或 status)當標準:開發中的工作區本來就有未提交的修改,
+    #    那不是變異殘留 —— 用 git 比會**每次都誤報**,誤報看久了就沒人看了(自己踩過)。
+    #    唯一正確的基準是「這支程式跑之前的那份 bytes」,所以開頭先自己存一份。
+    dirty = sorted(n for n, b in BEFORE.items() if (REPO / n).read_bytes() != b)
     if dirty:
         print(f"  ⚠️ 變異後沒還原乾淨:{dirty}")
         return 1

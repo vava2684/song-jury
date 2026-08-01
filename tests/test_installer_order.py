@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-"""-VerifyModels 的執行順序:裁判必須看得到報告,清理只能在最後。
+"""-VerifyModels 的流程契約:裁判看得到報告、清理在最後、中斷有自己的退出碼。
 
-🔴 Codex R14:`finally` 裡的清理排在 `驗證報告.py` **之前** —— 真實
--VerifyModels 已九柱跑完、jury exit 0,裁判卻拿到「檔案不存在」,
-安裝器 exit 1。完整驗證的成功路徑變成必定假陰性。
-203 條測試 + 90 條變異全綠也沒守住,因為當時只驗字樣、沒驗真實執行順序。
-
-這支用真的 shell(PowerShell / bash)跑安裝器的那段邏輯骨架,
-用 stub 取代評審團與裁判,觀察:① 裁判被呼叫時報告還在;② 收工後全清乾淨。
+🔴 Codex R14:清理排在裁判之前 → 成功路徑必定假陰性。
+🔴 Codex R16-9/10:整段寫在 shell 裡時,Windows 真 Ctrl+C 不可靠進入 finally
+   (實測掛住 15 秒、finally 沒跑、verify_* 殘留);POSIX 的 trap 又把中斷吞掉
+   當成一般失敗。→ R16 起整段收進 完整驗證.py,shell 只看退出碼。
+   這支改成驗那個 helper 的真實行為(stub 評審團,不跑真模型)。
 """
 import os
 import shutil
@@ -18,97 +16,120 @@ import pytest
 
 from conftest import REPO
 
+_STUB_OK = """import sys, json, pathlib
+p = pathlib.Path(sys.argv[1])
+P8 = ("人聲","和聲","結構編曲","聲學","旋律記憶","真實風格","整體","律動")
+pt = {"完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
+      "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in P8},
+      "曲側含柱": list(P8)}
+p.with_name(p.stem + "_評審團.json").write_text(
+    json.dumps({"scoring_contract": "2026-07-25-v1", "pillar_totals": pt}, ensure_ascii=False),
+    encoding="utf-8")
+(p.parent / (p.stem + "_評分.json")).write_text("mid", encoding="utf-8")
+sys.exit(0)
+"""
 
-def _run(cmd, cwd):
-    return subprocess.run(cmd, cwd=str(cwd), capture_output=True,
-                          text=True, encoding="utf-8", errors="replace", timeout=180)
 
-
-def _diag(msg, r):
-    """失敗訊息一定要帶 returncode 與 stderr —— 只印 stdout 的話,
-    shell 根本沒跑起來時會得到一則空訊息,完全查不下去(CI 上實際踩到)。"""
-    return (f"{msg}:rc={r.returncode}\n"
-            f"OUT={r.stdout[-600:]}\n"
-            f"ERR={r.stderr[-600:]}")
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell 版")
-@pytest.mark.skipif(not (shutil.which("pwsh") or shutil.which("powershell")),
-                    reason="沒有 PowerShell")
-def test_ps1的驗證順序_裁判先看到報告清理在最後(tmp_path):
-    """把 install.ps1 的 VerifyModels 區塊原文抽出來跑,jury/裁判都換成 stub。"""
-    src = (REPO / "install.ps1").read_text(encoding="utf-8")
-    # 用安裝腳本裡的標記抽取(切點寫死行為文字會隨改碼漂掉,抽到半截 if/else)
-    i = src.index("# <verify-block-start>")
-    j = src.index("# <verify-block-end>")
-    # 直譯器換成本測試的 python:單純複製 python.exe 到假 venv 是跑不起來的
-    # (缺 DLL/stdlib);這條測的是**順序**,不是路徑字面。
-    block = src[i:j].replace(r".venv\Scripts\python.exe", f'"{sys.executable}"')
-    # stub:jury 寫出報告並 exit 0;裁判把「我看到報告了嗎」寫進見證檔
-    (tmp_path / "評審團.py").write_text(
-        "import sys, pathlib\n"
-        "p = pathlib.Path(sys.argv[1]).with_name(pathlib.Path(sys.argv[1]).stem + '_評審團.json')\n"
-        "p.write_text('{\"ok\": 1}', encoding='utf-8')\n"
-        "pathlib.Path('mid_評分.json').write_text('x', encoding='utf-8')\n"
-        "sys.exit(0)\n", encoding="utf-8")
-    (tmp_path / "驗證報告.py").write_text(
-        "import sys, pathlib\n"
-        "seen = pathlib.Path(sys.argv[1]).exists()\n"
-        "pathlib.Path('WITNESS.txt').write_text('SEEN' if seen else 'GONE', encoding='utf-8')\n"
-        "sys.exit(0 if seen else 1)\n", encoding="utf-8")
+def _stub_env(tmp_path, jury_src):
+    """把 helper 需要的東西擺進 tmp:stub 評審團 + demo 音檔 + 共用模組。"""
+    (tmp_path / "評審團.py").write_text(jury_src, encoding="utf-8")
     (tmp_path / "demo_mix.wav").write_bytes(b"RIFF0000")
-    # verify 區塊現在用 子程序.run_tree 包 jury(外層 timeout)→ stub 目錄要有它
-    shutil.copy(REPO / "子程序.py", tmp_path / "子程序.py")
+    for mod in ("子程序.py", "驗證報告.py", "完整驗證.py"):
+        shutil.copy(REPO / mod, tmp_path / mod)
+    return tmp_path
 
-    ps = shutil.which("pwsh") or shutil.which("powershell")
-    script = tmp_path / "run.ps1"
-    script.write_text(
-        "function Ok($m){Write-Host \"OK $m\"}\n"
-        "function Bad($m,$w){Write-Host \"BAD $m\"}\n"
-        "$script:VerifyOk = $true\n" + block +
-        "\nWrite-Host \"VERIFYOK=$($script:VerifyOk)\"\n", encoding="utf-8")
-    r = _run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)], tmp_path)
 
-    witness = (tmp_path / "WITNESS.txt")
-    assert witness.exists(), _diag("裁判沒被呼叫到", r)
-    assert witness.read_text(encoding="utf-8") == "SEEN", \
-        "🔴 裁判被呼叫時報告已經被清掉了 —— 清理排在驗證之前(成功路徑必定假陰性)"
-    assert "VERIFYOK=True" in r.stdout, _diag("成功路徑不該判失敗", r)
-    # 收工後所有 $vid 前綴的產物都要清乾淨(含中途寫出的 _評分.json)
+def _run_helper(tmp_path, extra_env=None, timeout=90):
+    env = {**os.environ, "PYTHONUTF8": "1", "SONG_JURY_VERIFY_TIMEOUT": "60"}
+    env.update(extra_env or {})
+    return subprocess.run([sys.executable, "完整驗證.py"], cwd=str(tmp_path),
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=timeout, env=env)
+
+
+def test_成功路徑_裁判看得到報告且收工後全清乾淨(tmp_path):
+    """🔴 R14 的順序迴歸:清理若排在裁判之前,成功路徑必定 VERIFY_BAD。"""
+    _stub_env(tmp_path, _STUB_OK)
+    r = _run_helper(tmp_path)
+    assert r.returncode == 0, f"成功路徑應該 exit 0:\n{r.stdout}\n{r.stderr}"
+    assert "VERIFY_OK" in r.stdout, r.stdout
     left = [p.name for p in tmp_path.glob("verify_*")]
-    assert left == [], f"🔴 沒清乾淨:{left}"
+    assert left == [], f"🔴 沒清乾淨(含中途的 _評分.json):{left}"
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="bash 版")
-def test_sh的驗證順序_裁判先看到報告清理在最後(tmp_path):
-    src = (REPO / "install.sh").read_text(encoding="utf-8")
-    i = src.index("# <verify-block-start>")
-    j = src.index("# <verify-block-end>")
-    block = src[i:j].replace(".venv/bin/python", f'"{sys.executable}"')
-    (tmp_path / "評審團.py").write_text(
-        "import sys, pathlib\n"
-        "p = pathlib.Path(sys.argv[1]).with_name(pathlib.Path(sys.argv[1]).stem + '_評審團.json')\n"
-        "p.write_text('{\"ok\": 1}', encoding='utf-8')\n"
-        "pathlib.Path('mid_評分.json').write_text('x', encoding='utf-8')\n"
-        "sys.exit(0)\n", encoding="utf-8")
-    (tmp_path / "驗證報告.py").write_text(
-        "import sys, pathlib\n"
-        "seen = pathlib.Path(sys.argv[1]).exists()\n"
-        "pathlib.Path('WITNESS.txt').write_text('SEEN' if seen else 'GONE', encoding='utf-8')\n"
-        "sys.exit(0 if seen else 1)\n", encoding="utf-8")
-    (tmp_path / "demo_mix.wav").write_bytes(b"RIFF0000")
-    shutil.copy(REPO / "子程序.py", tmp_path / "子程序.py")
-
-    script = tmp_path / "run.sh"
-    script.write_text(
-        "ok(){ echo \"OK $1\"; }\nbad(){ echo \"BAD $1\"; }\n"
-        "VERIFY_OK=1\nC_DIM=''; C_OFF=''\n" + block +
-        "\necho \"VERIFYOK=$VERIFY_OK\"\n", encoding="utf-8")
-    r = _run(["bash", str(script)], tmp_path)
-
-    witness = (tmp_path / "WITNESS.txt")
-    assert witness.exists(), _diag("裁判沒被呼叫到", r)
-    assert witness.read_text(encoding="utf-8") == "SEEN", \
-        "🔴 裁判被呼叫時報告已經被清掉了"
-    assert "VERIFYOK=1" in r.stdout, _diag("成功路徑不該判失敗", r)
+def test_缺柱要回2且不留殘檔(tmp_path):
+    stub = _STUB_OK.replace('"完整評測": True, "缺柱": []',
+                            '"完整評測": False, "缺柱": ["律動"]') \
+                   .replace("sys.exit(0)", "sys.exit(2)")
+    _stub_env(tmp_path, stub)
+    r = _run_helper(tmp_path)
+    assert r.returncode == 2, f"缺柱要回 2:\n{r.stdout}"
     assert [p.name for p in tmp_path.glob("verify_*")] == []
+
+
+def test_jury回0但報告缺契約要被裁判擋下(tmp_path):
+    """🔴 Codex R16-5:安裝證據要求版本證據 —— 舊格式相容不可以套在本輪新產物上,
+    否則產出端一旦迴歸成不寫契約,VerifyModels 照樣印 VERIFY_OK。"""
+    stub = _STUB_OK.replace('{"scoring_contract": "2026-07-25-v1", "pillar_totals": pt}',
+                            '{"pillar_totals": pt}')
+    _stub_env(tmp_path, stub)
+    r = _run_helper(tmp_path)
+    assert r.returncode == 1, f"缺契約要被擋:\n{r.stdout}"
+    assert "VERIFY_BAD" in r.stdout and "scoring_contract" in r.stdout
+
+
+def test_逾時要回124且殺乾淨(tmp_path):
+    _stub_env(tmp_path, "import time\ntime.sleep(120)\n")
+    r = _run_helper(tmp_path, {"SONG_JURY_VERIFY_TIMEOUT": "3"})
+    assert r.returncode == 124, f"逾時要回 124:\n{r.stdout}\n{r.stderr}"
+    assert [p.name for p in tmp_path.glob("verify_*")] == []
+
+
+def test_中斷要回130且清乾淨(tmp_path):
+    """🔴 Codex R16-9/10:中斷必須跟「失敗」分開(130),而且清理一定要跑。
+    ⚠️ 真 console 事件在 CI 上不可移植 —— 這裡注入 KeyboardInterrupt 驗同一條
+       語意契約(退出碼 + 清理),那正是把流程搬進 python 才拿得到的保證。"""
+    _stub_env(tmp_path, _STUB_OK)
+    (tmp_path / "probe.py").write_text(
+        "import sys\n"
+        "sys.path.insert(0, '.')\n"
+        "import 完整驗證 as H\n"
+        "def boom(*a, **k):\n"
+        "    raise KeyboardInterrupt()\n"
+        "H.run_tree = boom\n"
+        "sys.exit(H.main([]))\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, "probe.py"], cwd=str(tmp_path),
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=60,
+                       env={**os.environ, "PYTHONUTF8": "1"})
+    assert r.returncode == 130, f"中斷要回 130(拿到 {r.returncode}):\n{r.stdout}\n{r.stderr}"
+    assert [p.name for p in tmp_path.glob("verify_*")] == [], "中斷也要清乾淨"
+
+
+def test_子環境要清掉跳關變數且不動呼叫者(tmp_path):
+    """⛔ 呼叫 shell 若殘留 SONG_JURY_SKIP_GEMINI,驗證就不是真的全模型跑。
+    helper 用 subprocess env 拿掉它們,而且不改自己的 os.environ。"""
+    stub = ("import os, sys, pathlib\n"
+            "pathlib.Path('SEEN.txt').write_text(\n"
+            "    repr(sorted(k for k in os.environ if k.startswith('SONG_JURY_'))),\n"
+            "    encoding='utf-8')\n"
+            "sys.exit(1)\n")
+    _stub_env(tmp_path, stub)
+    r = _run_helper(tmp_path, {"SONG_JURY_SKIP_GEMINI": "1",
+                               "SONG_JURY_TRUST_LEGACY_STEMS": "1"})
+    seen = (tmp_path / "SEEN.txt").read_text(encoding="utf-8")
+    assert "SKIP_GEMINI" not in seen and "TRUST_LEGACY" not in seen, \
+        f"🔴 跳關變數被帶進評測子程序:{seen}"
+    assert r.returncode == 1
+
+
+def test_安裝器只呼叫helper不再自己編排順序():
+    """R16 起 shell 不該再有自己的 jury→validator→cleanup 邏輯 ——
+    那正是 Windows Ctrl+C 不可靠的來源。"""
+    for name in ("install.ps1", "install.sh"):
+        src = (REPO / name).read_text(encoding="utf-8")
+        assert "完整驗證.py" in src, f"{name} 沒有呼叫共用 helper"
+        assert "驗證報告.py" not in src, \
+            f"🔴 {name} 又自己叫裁判了 —— 順序與中斷處理要留在 helper 裡"
+        for code in ("124", "130"):
+            assert code in src, f"{name} 沒有分開處理退出碼 {code}"

@@ -78,7 +78,22 @@ def main():
     if not store.exists():
         sys.exit("找不到 _批次結果/批次結果.json")
     d = json.loads(store.read_text(encoding="utf-8"))
-    rows = [B.flatten(v) for v in d.values() if "error" not in v]
+    # ⛔ 只吃**單一已知契約**的 store(Codex R16-8):舊版直接 flatten 所有沒 error
+    #    的 value,於是 local-metrics 與 full 九柱的資料會被混進同一張鑑別力表 ——
+    #    兩把尺算出來的離散度是假結論,而標題還寫「完整數據」。
+    if not isinstance(d, dict) or "batch_contract" not in d or "results" not in d:
+        sys.exit("⛔ 批次結果.json 是舊格式(沒有 batch_contract)——"
+                 "不知道是哪一把尺的資料,拒絕分析。請用新版 批次評測.py 重跑。")
+    contract = d["batch_contract"]
+    if contract not in (B.LOCAL_CONTRACT, B.FULL_CONTRACT):
+        sys.exit(f"⛔ 不認得的批次契約:{contract!r}")
+    results = d["results"]
+    mixed = {v.get("_batch_contract") for v in results.values()
+             if isinstance(v, dict) and "error" not in v} - {None}
+    if len(mixed) > 1:
+        sys.exit(f"⛔ 這個 store 裡混了多種契約:{sorted(mixed)} —— 不可一起算鑑別力")
+    rows = [B.flatten(v) for v in results.values() if "error" not in v]
+    print(f"批次契約:{contract}(這份表只在這把尺內有意義)")
 
     stats = {}
     for k in sorted({k for r in rows for k in r}):
