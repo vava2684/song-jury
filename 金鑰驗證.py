@@ -33,30 +33,20 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
+from 金鑰政策 import effective_keys
+
+
 def parse_keys(env_path: Path) -> list:
-    """讀 .env 撈出所有金鑰。規則與 Gemini曲評.load_keys 對齊(佔位字串不算);
-    這裡刻意不 import 它 —— 本工具要在「連 .venv 都還沒建」的機器上用任何 python3 跑。"""
-    if not env_path.exists():
-        return []
-    text = env_path.read_text(encoding="utf-8-sig")   # utf-8-sig:剝 PS5.1 寫的 BOM
-    keys = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
-            continue
-        for name in ("GEMINI_API_KEYS", "GEMINI_API_KEY"):
-            if line.startswith(name + "="):
-                v = line.split("=", 1)[1].strip().strip('"').strip("'")
-                keys.extend(k.strip() for k in v.split(","))
-    def _placeholder(k):
-        return (any(ord(c) > 127 for c in k) or len(k) < 20
-                or k.lower().startswith(("your", "xxx", "todo", "<")))
-    seen, out = set(), []
-    for k in keys:
-        if k and k not in seen and not _placeholder(k):
-            seen.add(k)
-            out.append(k)
-    return out
+    """讀出**執行期真正會用的那組金鑰**(順序即嘗試順序)。
+
+    ⛔ 這裡絕不可以自己再解析一次 .env:驗證器與執行期各解析各的,就會
+       「驗 A、跑 B」——`.env=A` 但 process env 有 B/C 時驗證形同虛設,
+       `KEYS = A`(等號旁有空白)更是一邊讀得到一邊讀不到(Codex R13)。
+       唯一真理來源是 金鑰政策.effective_keys,兩邊共用。"""
+    keys, notes = effective_keys(env_path)
+    for n in notes:
+        print(n)
+    return keys
 
 
 def probe_key(key: str):

@@ -174,11 +174,84 @@ MUTATIONS = [
      "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
+    # ── Codex 第十三輪:和聲柱假陽性、產線隔離、柱值裁判、脫離程序 ────────
+    ("分軌線只驗 demucs 不驗 librosa(缺 librosa 時和聲柱整根降級卻報九柱齊全)",
+     "評審團.py",
+     'DEMUCS_LINE_MODS = ("demucs", "librosa", "numpy", "soundfile")',
+     'DEMUCS_LINE_MODS = ("demucs",)',
+     "tests/test_demucs_resolve.py::test_整條線的模組清單要含librosa"),
+
+    ("requirements-demucs 又漏 librosa(全新安裝的和聲柱直接死)",
+     "requirements-demucs.txt",
+     'librosa==0.11.0',
+     '# 這一行被拿掉了(變異)',
+     "tests/test_demucs_resolve.py::test_安裝腳本自檢要驗整條線而不是只驗demucs"),
+
+    ("venv 預篩只看一種 layout(Windows 專案 venv 永遠選不到,改用全域 conda)",
+     "評審團.py",
+     '        for root in (py.parent.parent, py.parent):',
+     '        for root in (py.parent,):',
+     "tests/test_demucs_resolve.py::test_專案venv要贏過全域conda"),
+
+    ("process env 的一般金鑰又被借走(拿別條產線的付費額度)",
+     "金鑰政策.py",
+     '    for name in GENERIC_ENVS:\n        if os.environ.get(name) and not os.environ.get(PRIMARY_ENV):',
+     '    for name in GENERIC_ENVS:\n        if os.environ.get(name):\n            raw = raw or [(os.environ[name], "環境變數")]\n        if False:',
+     "tests/test_key_policy.py::test_process環境的一般金鑰不被借用"),
+
+    ("拒絕名單失效(明知不可用的金鑰照樣拿去打)",
+     "金鑰政策.py",
+     '        if key_fingerprint(k) in denied:',
+     '        if False:',
+     "tests/test_key_policy.py::test_拒絕名單用完整SHA256硬擋"),
+
+    (".env 鍵名不 strip(`KEYS = A` 驗證器讀不到、執行期讀得到)",
+     "金鑰政策.py",
+     '        out[k.strip()] = v.strip().strip(\'"\').strip("\'")',
+     '        out[k] = v.strip().strip(\'"\').strip("\'")',
+     "tests/test_key_policy.py::test_等號兩邊有空白也讀得到"),
+
+    ("多把與單把相加(沒被驗過的金鑰偷渡進真正的呼叫)",
+     "金鑰政策.py",
+     '                raw = [(k.strip(), f".env {name}") for k in val.split(",")]\n                break',
+     '                raw = raw + [(k.strip(), f".env {name}") for k in val.split(",")]',
+     "tests/test_key_policy.py::test_多把存在時不可把單把也追加進來"),
+
+    ("驗證報告只驗柱名存在(柱值 None/{}/NaN/true/999 全部 PASS)",
+     "驗證報告.py",
+     '        s = det.get("score")\n        if isinstance(s, bool) or not isinstance(s, (int, float)):',
+     '        s = det.get("score")\n        if False:',
+     "tests/test_keyprobe_and_verify.py::test_柱值畸形也要被打回"),
+
+    ("報告解析吃 NaN/Infinity(非標準 JSON 混進來)",
+     "驗證報告.py",
+     '        d = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_const)',
+     '        d = json.loads(path.read_text(encoding="utf-8"))',
+     "tests/test_keyprobe_and_verify.py::test_非標準JSON常數要被拒收"),
+
+    ("Windows 退回 taskkill(自行 DETACHED 的孫程序逃掉繼續吃 GPU)",
+     "子程序.py",
+     '            job = _WinJob()',
+     '            raise RuntimeError("變異:不建 Job Object")',
+     "tests/test_run_tree.py::test_Windows下脫離又被孤兒化的後代也要被殺掉"),
+
     # ── Codex 第十二輪:程序樹、逐把驗金鑰、獨立 JSON 裁判、目錄防線 ──────
+    # ⚠ 殺樹有兩道:主動 kill_tree + job.close() 的 KILL_ON_JOB_CLOSE 兜底。
+    #   只拔一道會被另一道救回(跟 R12 的 symlink 同型),要兩道一起拔才是真 fail-open。
     ("逾時只殺直屬子程序(Demucs/torch 孫程序活著繼續吃 GPU)",
      "子程序.py",
-     '        kill_tree(p)',
-     '        pass  # 變異:不殺樹,只收直屬',
+     '        kill_tree(p, job)\n'
+     '        try:\n'
+     '            out, err = p.communicate(timeout=10)   # 回收,不留殭屍\n'
+     '        except Exception:\n'
+     '            out, err = "", ""\n'
+     '        if job is not None:\n'
+     '            job.close()',
+     '        p.kill()   # 變異:只殺直屬,不殺樹也不關 job\n'
+     '        try:\n'
+     '            out, err = p.communicate(timeout=10)\n'
+     '        except Exception:\n'
+     '            out, err = "", ""',
      "tests/test_run_tree.py::test_逾時要殺整棵樹_孫程序不可存活寫檔"),
 
     ("金鑰驗證退回只驗第一把(第一好第二壞=假陽性)",
@@ -613,8 +686,8 @@ def main():
             print(f"\n[{i}/{len(MUTATIONS)}] ✅ 抓到了:{desc}")
         elif not ran:
             print(f"\n[{i}/{len(MUTATIONS)}] ⏭ 無法驗證:{desc}")
-            print(f"        → {target} 在這個環境被 skip,這次沒驗到(不是通過)")
-            skipped.append(desc)
+            print(f"        → {target} 在這個平台被 skip,這次沒驗到(不是通過)")
+            skipped.append(("platform", desc))
         else:
             print(f"\n[{i}/{len(MUTATIONS)}] ❌ 沒抓到:{desc}")
             print(f"        → {target} 在缺陷存在時仍然通過,這條測試是裝飾品")
@@ -630,7 +703,7 @@ def main():
             #    算進 bad 會讓 ZIP 版永遠報 4 條缺陷沒抓到,那是假警報。
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}")
             print(f"        → 這個環境沒有 git index(ZIP 版),打包類變異只能在 clone 裡驗")
-            skipped.append(desc)
+            skipped.append(("zip", desc))
             continue
         try:
             failed, ran = run_pytest(target)
@@ -640,7 +713,7 @@ def main():
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ✅ 抓到了:{desc}")
         elif not ran:
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}(被 skip,不是通過)")
-            skipped.append(desc)
+            skipped.append(("platform", desc))
         else:
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ 沒抓到:{desc}")
             print(f"        → {target} 在缺陷存在時仍然通過,這條測試是裝飾品")
@@ -655,10 +728,21 @@ def main():
     total = len(MUTATIONS) + len(GIT_MUTATIONS)
     if skipped:
         # ⛔ 有沒驗到的就不可以宣稱「全部抓到」——那是把 skip 當成通過,正是這支要防的事
+        # ⛔ 跳過的原因不同,能做的事也不同 —— 混成一句「請在 git clone 跑」會誤導:
+        #    在精確 clone 的 Windows 上跳過的是**平台**限制,重跑一百次也一樣(Codex R13)。
         print(f"  ⚠️ {total - len(skipped)}/{total} 條抓到;另有 {len(skipped)} 條在這個環境無法驗證:")
-        for s_ in skipped:
-            print(f"     ⏭ {s_}")
-        print("     (要完整驗證請在 git clone 的目錄跑,ZIP 版沒有 .git)")
+        for why, s_ in skipped:
+            print(f"     ⏭ [{why}] {s_}")
+        by = {}
+        for why, s_ in skipped:
+            by.setdefault(why, []).append(s_)
+        if "zip" in by:
+            print(f"     · zip({len(by['zip'])} 條):這個目錄沒有 .git(ZIP 版)——"
+                  f"要驗打包自足性請改用 git clone。")
+        if "platform" in by:
+            print(f"     · platform({len(by['platform'])} 條):這幾條要 POSIX 語意"
+                  f"(symlink/權限位元),Windows 上驗不了 —— 到 WSL 跑,"
+                  f"或看 CI 的 ubuntu 變異工作(那裡每次都會驗)。")
     else:
         print(f"  ✅ {total} 條真實缺陷全部會被測試抓到")
     # 最後再確認一次:所有檔案都還原乾淨了。

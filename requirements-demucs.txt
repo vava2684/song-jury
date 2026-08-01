@@ -28,3 +28,7 @@ torchaudio==2.6.0
 demucs==4.0.1
 soundfile==0.14.0
 numpy               # 分軌快取.py 頂層就 import 它(demucs 會帶,但不可以靠別人的相依樹)
+# ⛔ 和聲分析.py 就是在這個環境裡跑,它 import librosa(chroma_cqt / beat_track / resample)。
+#    漏宣告的後果實測過:全新安裝的 .venv-demucs 沒有 librosa → 和聲柱(13.6%)整根
+#    降級缺席,安裝器卻照樣印「九柱齊全」—— 最高風險的安裝假陽性(Codex R13)。
+librosa==0.11.0

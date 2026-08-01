@@ -128,76 +128,27 @@ def _parse_env_file(path: Path) -> dict:
     return out
 
 
-# song-jury 專用的 Gemini 金鑰檔。
-#
-# ⛔⛔ 2026-07-20 移除 vava-gemini.env(她:「你把 VAVA 的用炸了」)
-#     原本它被放在池子最後當「最後備援」,想法是前面用完才退到它。
-#     實際問題:**那是個沒有煞車的備援** —— 本機 SKILL 一次批次評測會打幾十次
-#     (2026-07-20 跑了 29 首 SUNO + 10 首得獎歌 = 39 次),前面兩把一旦撞額度,
-#     整批就會安靜地灌進海巡新聞那條產線的金鑰,把她 0800/1800 的學習任務餓死。
-#     ⛔ 更糟的是**當時沒有記錄用了哪把**,事後完全無法查證有沒有燒到她的 ——
-#        「查不出來」本身就是不可接受的。
-#
-# ⭐ 規則:song-jury 只准用 song-jury 自己的金鑰。額度不夠就讓它降級(degraded),
-#    ⛔ 絕不准借用別條產線的金鑰 —— 借到就是把別人的服務弄掛。
-#    要加金鑰請加進 評分\.env 的 GEMINI_API_KEYS(逗號分隔多把)。
-# ⛔⛔ 2026-07-20 二度收緊:連 vava-gemini-songjury.env 也移除。
-#     查證結果(她指出後才發現):
-#       vava-gemini-songjury.env 的金鑰(末四碼 zxhg)與
-#       線上網站 song-jury-hf\.env 的 GEMINI_API_KEY(末四碼 ubA)**是同一個帳號**。
-#     → 同帳號共用同一份額度,所以本機批次評測(一次幾十次呼叫)吃的是
-#       **線上 meowfullhouse.com 付費服務的額度**,被餓到的是網站的真實使用者。
-#     ⭐ 三條產線的金鑰必須完全隔離,不准互相借:
-#         線上網站   = ubA / zxhg(同帳號,付費)
-#         VAVA 海巡  = BIOw(~/.config/vava-gemini.env)
-#         本機 SKILL = 評分\.env 的 GEMINI_API_KEYS(她另外一把)
-#     額度不夠就讓它 degraded,⛔ 絕不准往別條線借。要加請加進 評分\.env 的 GEMINI_API_KEYS。
-EXTRA_KEY_FILES = []
+# ⭐ 產線隔離是**程式規則**,不是註解(實作在 金鑰政策.py):
+#    · 專用變數 SONG_JURY_GEMINI_API_KEYS 最優先;
+#    · process env 裡的一般 GEMINI_API_KEY(S) 不採用 —— 那多半是別條產線 export 的,
+#      借用等於拿別人的付費額度(這個專案真的發生過:一次批次幾十發灌到別條產線,
+#      把別人的服務餓死,而且當下沒有記錄用了哪把,事後查不出來);
+#    · SONG_JURY_DENY_KEY_SHA256 可用**完整金鑰的 SHA-256** 硬擋特定金鑰(fail-closed)。
+#    要給 song-jury 用的金鑰請寫進本專案 .env 的 GEMINI_API_KEYS(逗號分隔多把)。
+#    額度不夠就讓它 degraded —— ⛔ 絕不往別條產線借。
+from 金鑰政策 import effective_keys
 
 
 def load_keys() -> list:
-    """回金鑰清單(去重、保序)。優先序:環境變數 > 本機 .env > WSL 的既有金鑰檔;
-    GEMINI_API_KEYS(多把) > GEMINI_API_KEY(單把)。"""
-    envf = _parse_env_file(ENV_FILE)
+    """回這次真正會用的金鑰清單(順序即嘗試順序)。
 
-    def _get(name):
-        return (os.environ.get(name) or envf.get(name) or "").strip()
-
-    raw = _get("GEMINI_API_KEYS")
-    keys = [k.strip() for k in raw.split(",")] if raw else []
-    single = _get("GEMINI_API_KEY")
-    if single:
-        keys.append(single)
-    for p in EXTRA_KEY_FILES:                     # 撿 WSL 那邊既有的,當後補
-        d = _parse_env_file(p)
-        for name in ("GEMINI_API_KEYS", "GEMINI_API_KEY"):
-            v = (d.get(name) or "").strip()
-            if v:
-                keys.extend(k.strip() for k in v.split(","))
-    # ⛔ 濾掉 .env.example 的佔位字串:有人把範例檔複製成 .env 卻沒改,
-    #    這些字會被當成三把真金鑰拿去打 Google API,錯誤訊息又很難懂。
-    #    真金鑰是純 ASCII 的長字串,所以「含非 ASCII」或「太短」一律不算。
-    def _looks_placeholder(k: str) -> bool:
-        if any(ord(c) > 127 for c in k):          # 含中文 → 一定是佔位字串
-            return True
-        if len(k) < 20:                            # Google API key 遠比這長
-            return True
-        return k.lower().startswith(("your", "xxx", "todo", "<"))
-
-    seen, out, skipped = set(), [], 0
-    for k in keys:
-        if not k or k in seen:
-            continue
-        seen.add(k)
-        if _looks_placeholder(k):
-            skipped += 1
-            continue
-        out.append(k)
-    if skipped and not out:
-        print(f"⚠ .env 裡只有 {skipped} 個佔位字串,不是真金鑰 —— "
-              f"請把 GEMINI_API_KEYS 換成 https://aistudio.google.com/apikey 申請到的值",
-              file=sys.stderr)
-    return out
+    ⛔ 解析與優先序全部交給 金鑰政策.effective_keys —— 驗證器(金鑰驗證.py)
+       用同一個函式,所以「-CheckOnly 驗過的」與「評歌時用的」必定是同一組
+       (Codex R13:兩邊各自解析 → 驗 A 用 B,驗證形同虛設)。"""
+    keys, notes = effective_keys(ENV_FILE)
+    for n in notes:
+        print(n, file=sys.stderr)
+    return keys
 
 
 def _sanitize_records(raw: dict) -> dict:

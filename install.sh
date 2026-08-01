@@ -274,7 +274,15 @@ fi
 HAS_DEMUCS=0
 if [ "$HAS_ENV" = 1 ]; then
   DEMUCS_PY=$(PYTHONUTF8=1 .venv/bin/python -c "import 評審團 as J; print(J.DEMUCS_PY)" 2>/dev/null | tail -n 1)
-  if [ -n "$DEMUCS_PY" ] && [ -x "$DEMUCS_PY" ] && "$DEMUCS_PY" -c "import demucs" >/dev/null 2>&1; then HAS_DEMUCS=1; fi
+  # ⛔ 整條線一起驗:和聲分析.py 也在這個環境跑,它要 librosa。只驗 demucs 的話,
+  #    缺 librosa 時分軌成功、和聲柱(13.6%)整根降級,安裝器卻印「九柱齊全」(Codex R13)。
+  if [ -n "$DEMUCS_PY" ] && [ -x "$DEMUCS_PY" ]; then
+    if "$DEMUCS_PY" -c "import demucs, librosa, numpy, soundfile" >/dev/null 2>&1; then
+      HAS_DEMUCS=1
+    elif "$DEMUCS_PY" -c "import demucs" >/dev/null 2>&1; then
+      bad "分軌環境缺依賴" "有 demucs 但缺 librosa/numpy/soundfile 其一 → 和聲柱會整根降級;請重跑安裝或 uv pip install -r requirements-demucs.txt"
+    fi
+  fi
 fi
 
 LOST=0
@@ -396,6 +404,11 @@ if [ "$VERIFY_MODELS" = 1 ]; then
 "
     cp demo_mix.wav "${VID}.wav"
     V_EPOCH=$(date +%s)
+    # ⛔ 清理用 trap:評測中途炸掉/Ctrl+C 時,已寫出的 _評分.json、_編曲層次.json、
+    #    _和聲分析.json、_伴奏節奏軌.wav… 都會留在專案裡(Codex R13 故障注入實測)。
+    #    清所有 $VID 前綴的產物,不是只清 wav 與最終報告。
+    _sj_verify_cleanup() { rm -rf "${VID}"* _stems/"${VID}"*; }
+    trap '_sj_verify_cleanup' EXIT INT TERM
     env -u SONG_JURY_SKIP_GEMINI -u SONG_JURY_TRUST_LEGACY_STEMS         PYTHONUTF8=1 .venv/bin/python 評審團.py "${VID}.wav"
     VRC=$?
     if [ "$VRC" -eq 0 ]; then
@@ -410,9 +423,8 @@ if [ "$VERIFY_MODELS" = 1 ]; then
     else
       bad "完整驗證沒過(退出碼 $VRC)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"; VERIFY_OK=0
     fi
-    # 善後:測試音檔、報告、它的分軌快取都清掉,不留垃圾
-    rm -f "${VID}.wav" "${VID}_評審團.json"
-    rm -rf _stems/"${VID}"*
+    _sj_verify_cleanup                       # 正常路徑也清一次
+    trap 'rm -f "$SJ_STEP_LOG"' EXIT INT TERM   # 還原原本的 EXIT trap
   else
     bad "--verify-models 需要 .venv 可用" "先完成安裝再驗"; VERIFY_OK=0
   fi

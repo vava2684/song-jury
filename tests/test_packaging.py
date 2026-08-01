@@ -390,3 +390,30 @@ def test_SKILL有實作退出碼契約():
     assert "$juryRc = $LASTEXITCODE" in s, "SKILL 沒保存評審團的退出碼"
     assert "退出碼契約" in s and "不可排行" in s, "SKILL 沒寫 0/2/其他 的處置規則"
     assert "pillar_totals.完整評測" in s, "SKILL 要求二次確認 JSON 完整性"
+
+
+def test_範例歌的實際位元率要跟README對得上():
+    """🔴 Codex R13:README 寫「64 kbps」,ffprobe 實測 177–183 kbps ——
+    我沒量就寫了。文件與實體資產不一致會讓讀者對聲學柱分數做出錯誤推論。
+    有 ffprobe 就真的量;沒有就退回檔案大小的合理性(擋掉整批被換成低碼率檔)。"""
+    import json as _json
+    import shutil
+    import subprocess as _sp
+    ex = REPO / "examples"
+    mp3s = sorted(ex.glob("*.mp3"))
+    assert len(mp3s) == 4
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "64kbps" not in readme and "64 kbps" not in readme,         "🔴 README 又寫回 64 kbps —— 實測是 ~180 kbps VBR"
+    if shutil.which("ffprobe"):
+        rates = []
+        for p in mp3s:
+            r = _sp.run(["ffprobe", "-v", "quiet", "-print_format", "json",
+                         "-show_format", str(p)], capture_output=True)
+            rates.append(int(_json.loads(r.stdout.decode("utf-8", "replace"))["format"]["bit_rate"]) / 1000)
+        lo, hi = min(rates), max(rates)
+        assert 150 <= lo and hi <= 210, f"位元率跑出 README 宣稱的 177–183 區間:{rates}"
+        assert "177" in readme and "183" in readme, "README 要寫出實測到的區間"
+    else:
+        for p in mp3s:
+            mb = p.stat().st_size / 1024 / 1024
+            assert 2.5 <= mb <= 12, f"{p.name} 大小 {mb:.1f}MB 不像 ~180kbps 的 3–5 分鐘歌"

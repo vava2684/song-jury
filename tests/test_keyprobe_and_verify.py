@@ -149,6 +149,30 @@ def test_各種殘缺都要被打回(tmp_path, 壞法):
     assert V.validate(_full_report(tmp_path, **壞法)) != "", f"沒擋住:{壞法}"
 
 
+@pytest.mark.parametrize("柱值", [None, {}, {"score": True}, {"score": 999},
+                                   {"score": -1}, {"score": "80"}, {"score": None}])
+def test_柱值畸形也要被打回(tmp_path, 柱值):
+    """🔴 Codex R13 五連探針:柱名都在、柱值卻是 None/{}/true/999 —— 舊裁判全部 PASS。
+    每一柱的 score 都要是非 bool、有限、0-100 的數字,才算「九柱真的算出來了」。
+    (NaN 那個形態由 test_非標準JSON常數要被拒收 顧,它更早在解析層就被擋掉。)"""
+    pt_柱分 = {k: {"score": 70.0} for k in
+               ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")}
+    pt_柱分["和聲"] = 柱值
+    why = V.validate(_full_report(tmp_path, 柱分=pt_柱分))
+    assert why != "", f"🔴 柱值 {柱值!r} 被當成有效柱分"
+    assert "和聲" in why, f"要指出是哪一柱壞掉:{why}"
+
+
+def test_非標準JSON常數要被拒收(tmp_path):
+    """🔴 json.loads 預設吃 NaN/Infinity —— 那不是合法 JSON,別人的解析器會炸,
+    NaN 混進柱分還會無聲汙染。裁判要用 parse_constant 直接拒收。"""
+    p = tmp_path / "x_評審團.json"
+    p.write_text('{"pillar_totals": {"完整評測": true, "缺柱": [], "曲側合成": NaN,'
+                 ' "柱分": {}}}', encoding="utf-8")
+    why = V.validate(p)
+    assert why != "" and "JSON" in why, f"🔴 NaN 被吃進來了:{why!r}"
+
+
 def test_舊檔不可冒充本輪新產物(tmp_path):
     p = _full_report(tmp_path)
     future = time.time() + 3600

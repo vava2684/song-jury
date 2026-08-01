@@ -59,27 +59,45 @@ CPU_THREADS = "12"        # CPU 模式執行緒上限(13900KS 24 核 → 約 50%
 #
 # ⚠️ demucs 只裝在 anaconda,不在 .venv/.venv-ml → 分軌類元件必須用它跑。
 #    ⛔ 但 song_scorer 不能改用 anaconda:那裡沒有 parselmouth,jitter/shimmer/HNR 會靜靜變 None。
+# 分軌那條線真正需要的模組:demucs 分離、librosa/numpy/soundfile 是 和聲分析 與
+# 分軌快取 在同一個環境裡要用的。⛔ 只驗 demucs 不夠 —— 缺 librosa 時分軌成功、
+# 和聲柱卻整根降級,而安裝器照樣說「九柱齊全」(Codex R13 實測的假陽性)。
+DEMUCS_LINE_MODS = ("demucs", "librosa", "numpy", "soundfile")
+
+
+def _probe_import(py, mods) -> bool:
+    """真的用這支直譯器 import 一次。⛔ 路徑猜測不是證據:
+       舊碼在 Windows 用 py.parent 當 venv 根,於是去找 `Scripts\\Lib\\site-packages`
+       (實際在 `<venv>\\Lib\\site-packages`)—— 專案 .venv-demucs 永遠被跳過、
+       改用全域 anaconda,還剛好遮住 .venv-demucs 缺 librosa 這件事(Codex R13)。"""
+    try:
+        r = subprocess.run([str(py), "-c", "import " + ", ".join(mods)],
+                           capture_output=True, text=True, timeout=120, **_NO_WINDOW)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _find_demucs_py():
-    """找一個裝了 demucs 的 python。順序:環境變數 → 既有 anaconda(向下相容,存在才用)
-    → 安裝腳本建的 .venv-demucs → .venv-ml。⚠️ 這條線斷掉 = 結構編曲柱 + 和聲柱一起缺
-    (合計 26.2% 權重),所以 install 腳本一定要把 .venv-demucs 建起來。"""
+    """找一支能跑「分軌 + 和聲」那條線的 python。
+    順序:環境變數 → 專案 .venv-demucs → .venv-ml → 既有 conda(向下相容)。
+    ⚠️ 這條線斷掉 = 結構編曲柱 + 和聲柱一起缺(合計 26.2% 權重)。"""
     env_py = os.environ.get("SONG_JURY_DEMUCS_PY")
     if env_py:
         return env_py
     win = os.name == "nt"
     base = Path(__file__).resolve().parent
 
-    def _has_demucs(py: Path) -> bool:
-        """這個 python 真的裝了 demucs 嗎 —— 看 site-packages 有沒有 demucs 套件目錄。
-        ⛔ 不能只看 python.exe 在不在:很多人裝了 anaconda 但裡面沒有 demucs,
-           只驗檔案存在就會挑中一個跑不動的直譯器,26.2% 權重靜靜消失。"""
+    def _maybe_has(py: Path) -> bool:
+        """便宜的預篩(免啟動 python):兩種 layout 都看 ——
+        venv 的根在 Scripts/bin 的**上一層**,conda 的根就是 python 旁邊。"""
         if not py.exists():
             return False
-        root = py.parent if win else py.parent.parent
-        pats = ["Lib/site-packages/demucs"] if win else ["lib/python*/site-packages/demucs"]
-        # ⚠️ 一定要 next(..., None) 或 list() 把產生器取值 —— Path.glob() 回的是**產生器,
-        #    永遠是 truthy**,直接丟進 any() 會讓任何存在的 python 都被判成「有 demucs」。
-        return any(next(root.glob(p), None) is not None for p in pats)
+        pats = (["Lib/site-packages/demucs"] if win else ["lib/python*/site-packages/demucs"])
+        for root in (py.parent.parent, py.parent):
+            if any(next(root.glob(p), None) is not None for p in pats):
+                return True
+        return False
 
     # ⚠️ 順序:安裝腳本自己建的 .venv-demucs 要排在 conda 前面 —— 那是「這個專案裝的」,
     #    最可信;conda 只是向下相容既有使用者的退路。
@@ -88,14 +106,24 @@ def _find_demucs_py():
     home = Path.home()
     for d in ("anaconda3", "miniconda3", "miniforge3"):
         cands.append(home / d / ("python.exe" if win else "bin/python"))
+    exist = [p for p in cands if p.exists()]
 
-    for p in cands:                      # 第一輪:真的有 demucs 的才算
-        if _has_demucs(p):
+    # 第一輪:預篩命中的,真 import 整條線(快路徑,通常只啟動一次 python)
+    likely = [p for p in exist if _maybe_has(p)]
+    for p in likely:
+        if _probe_import(p, DEMUCS_LINE_MODS):
             return str(p)
-    for p in cands:                      # 第二輪:退而求其次,至少是個存在的直譯器(錯誤訊息會更清楚)
-        if p.exists():
+    # 第二輪:預篩沒中的也真驗一次(非標準 layout 的救援)
+    for p in exist:
+        if p not in likely and _probe_import(p, DEMUCS_LINE_MODS):
             return str(p)
-    return sys.executable   # 最後退路:當前直譯器(HF Space 這類單一環境)
+    # 第三輪:整條線不齊,但至少有 demucs → 分軌能跑(和聲會誠實降級並記在 stage_notes)
+    for p in exist:
+        if _probe_import(p, ("demucs",)):
+            return str(p)
+    if exist:
+        return str(exist[0])   # 都沒有 demucs:回一支存在的,讓錯誤訊息說得出是哪支
+    return sys.executable      # 最後退路:當前直譯器(HF Space 這類單一環境)
 
 
 DEMUCS_PY = _find_demucs_py()

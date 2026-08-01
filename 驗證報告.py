@@ -28,8 +28,15 @@ def validate(path: Path, newer_than: float = None) -> str:
         return f"檔案不存在:{path}"
     if newer_than is not None and path.stat().st_mtime <= newer_than:
         return "檔案不是本輪新產物(mtime 早於驗證開始時間)—— 讀到舊報告了"
+    def _reject_const(x):
+        # ⛔ json.loads 預設吃 NaN/Infinity —— 那不是合法 JSON,別人的解析器會炸,
+        #    而且 NaN 混進柱分還會一路無聲汙染(Codex R13)。這裡直接拒收。
+        raise ValueError(f"非標準 JSON 常數:{x}")
+
     try:
-        d = json.loads(path.read_text(encoding="utf-8"))
+        d = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_const)
+    except ValueError as e:
+        return f"JSON 不合格:{e}"
     except Exception as e:
         return f"JSON 解析失敗:{type(e).__name__}"
     if not isinstance(d, dict):
@@ -50,6 +57,18 @@ def validate(path: Path, newer_than: float = None) -> str:
     missing = [p for p in REQUIRED_PILLARS if p not in 柱分]
     if missing:
         return f"柱分缺鍵:{missing}"
+    # ⛔ 只驗「柱名在不在」是裝飾:柱值換成 None / {} / {"score": NaN} / true / 999
+    #    以前全部 PASS(Codex R13 五連探針)。每一柱的 score 都要是
+    #    非 bool、有限、0-100 的數字 —— 這才是「九柱真的算出來了」。
+    for name in REQUIRED_PILLARS:
+        det = 柱分.get(name)
+        if not isinstance(det, dict):
+            return f"柱分[{name}] 不是 dict(拿到 {type(det).__name__})"
+        s = det.get("score")
+        if isinstance(s, bool) or not isinstance(s, (int, float)):
+            return f"柱分[{name}].score 不是數字:{s!r}"
+        if not math.isfinite(s) or not (0 <= s <= 100):
+            return f"柱分[{name}].score 不是 0-100 的有限數字:{s!r}"
     return ""
 
 

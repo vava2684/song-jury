@@ -215,8 +215,17 @@ if ($hasEnvExe) {
     $env:PYTHONUTF8 = "1"
     $demucsPy = (& .venv\Scripts\python.exe -c "import 評審團 as J; print(J.DEMUCS_PY)" 2>$null | Select-Object -Last 1)
     if ($demucsPy -and (Test-Path $demucsPy)) {
-        & $demucsPy -c "import demucs" 2>$null
+        # ⛔ 不可以只驗 import demucs:和聲分析.py 也在這個環境跑,它要 librosa。
+        #    只驗 demucs 的話,缺 librosa 時分軌成功、和聲柱(13.6%)整根降級,
+        #    安裝器卻印「九柱齊全」—— Codex R13 實測到的假陽性。整條線一起驗。
+        & $demucsPy -c "import demucs, librosa, numpy, soundfile" 2>$null
         $hasDemucs = ($LASTEXITCODE -eq 0)
+        if (-not $hasDemucs) {
+            & $demucsPy -c "import demucs" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Bad "分軌環境缺依賴" "有 demucs 但缺 librosa/numpy/soundfile 其一 → 和聲柱會整根降級;請重跑安裝或 uv pip install -r requirements-demucs.txt"
+            }
+        }
     }
 }
 # ⛔ 不能只看 python.exe 在不在:`uv venv` 建完就有 python.exe,套件裝失敗時環境是空的
@@ -420,6 +429,12 @@ if ($VerifyModels) {
         } finally {
             if ($null -ne $oldSkip)  { $env:SONG_JURY_SKIP_GEMINI = $oldSkip }
             if ($null -ne $oldTrust) { $env:SONG_JURY_TRUST_LEGACY_STEMS = $oldTrust }
+            # ⛔ 清理放 finally,而且要清**所有** $vid 前綴的產物:評測中途炸掉時
+            #    已經寫出的 _評分.json / _編曲層次.json / _和聲分析.json / _伴奏節奏軌.wav…
+            #    都會留在專案裡(Codex R13 故障注入實測)。Ctrl+C 也走這裡。
+            Get-ChildItem -File -Filter "$vid*" -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue
+            Get-ChildItem "_stems" -Directory -Filter "$vid*" -EA SilentlyContinue |
+                Remove-Item -Recurse -Force -EA SilentlyContinue
         }
         if ($vrc -eq 0) {
             & .venv\Scripts\python.exe 驗證報告.py "${vid}_評審團.json" --newer-than $vEpoch
@@ -436,10 +451,6 @@ if ($VerifyModels) {
             Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"
             $script:VerifyOk = $false
         }
-        # 善後:測試音檔、報告、它的分軌快取都清掉,不留垃圾
-        Remove-Item "$vid.wav", "${vid}_評審團.json" -EA SilentlyContinue
-        Get-ChildItem "_stems" -Directory -Filter "$vid*" -EA SilentlyContinue |
-            Remove-Item -Recurse -Force -EA SilentlyContinue
     } else {
         Bad "-VerifyModels 需要 .venv 可用" "先完成安裝再驗"
         $script:VerifyOk = $false
