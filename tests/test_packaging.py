@@ -99,7 +99,8 @@ def test_不可外洩版權音檔與金鑰():
 環境相依 = {
     "requirements.txt": ["評審團", "song_scorer", "Gemini曲評", "情感弧線", "報告轉PDF",
                          "轉PNG", "顯示規則", "批次評測", "曲評測清單", "brand_logo",
-                         "setup_nrcvad", "make_demo_song"],
+                         "setup_nrcvad", "make_demo_song", "狀態目錄", "子程序",
+                         "金鑰驗證", "驗證報告"],
     "requirements-demucs.txt": ["分軌快取", "編曲層次", "和聲分析", "伴奏混音"],
     "requirements-audition.txt": ["演唱聽感", "真實距離"],
     "requirements-web.txt": ["app"],
@@ -307,16 +308,21 @@ def test_安裝腳本把ffmpeg當完整安裝必要件():
 
 
 def test_安裝腳本真的驗金鑰有效性且有完整驗證開關():
-    """🔴 Codex R11:任意長字串也照樣「九柱齊全、exit 0」—— 光 grep 格式不算驗證。
-    兩個安裝腳本都要真打一次 Google API(models 端點)驗金鑰;
-    另外要有 -VerifyModels/--verify-models 把九柱實跑一遍(import 成功≠模型能推論)。"""
+    """🔴 Codex R11/R12:光 grep 格式不算驗證;內嵌探針只驗第一把、429 被洗成成功。
+    驗證邏輯集中在 金鑰驗證.py / 驗證報告.py(有行為測試+變異的 python 模組),
+    兩個安裝腳本必須**呼叫它們**,不准再自己內嵌探針。"""
     ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
     sh = (REPO / "install.sh").read_text(encoding="utf-8")
     for name, src in (("install.ps1", ps1), ("install.sh", sh)):
-        assert "generativelanguage.googleapis.com" in src, \
-            f"🔴 {name} 沒有真打 Google 驗金鑰(任意字串會被當有效金鑰)"
+        assert "金鑰驗證.py" in src, f"🔴 {name} 沒有呼叫 金鑰驗證.py(逐把驗、三態)"
+        assert "驗證報告.py" in src, f"🔴 {name} 的 VerifyModels 沒有獨立 JSON 裁判(空 JSON 也會過)"
+        assert "generativelanguage" not in src,             f"🔴 {name} 又內嵌探針了 —— 只驗第一把/429 洗白的老路;一律走 金鑰驗證.py"
     assert "VerifyModels" in ps1, "install.ps1 少了 -VerifyModels 完整驗證開關"
     assert "--verify-models" in sh, "install.sh 少了 --verify-models 完整驗證開關"
+    # 真探針本體要在 金鑰驗證.py 裡
+    kp = (REPO / "金鑰驗證.py").read_text(encoding="utf-8")
+    assert "generativelanguage.googleapis.com" in kp
+
 
 
 def test_安裝步數要跟實際步驟一致():
@@ -374,3 +380,13 @@ def test_四語範例歌曲成對且語言對得上():
     if tracked:
         got = [p for p in tracked if p.startswith("examples/")]
         assert len(got) >= 8, f"examples/ 只有 {len(got)} 個檔進 repo,四首 mp3+四份 txt 要都在"
+
+
+def test_SKILL有實作退出碼契約():
+    """🔴 Codex R12:SKILL.md 直接執行評審團卻不看 $LASTEXITCODE ——
+    Claude Code 依 SKILL 跑時,exit 2 可能被當一般錯誤丟掉報告,
+    或被無視後做出沒標「不完整」的交付。契約必須寫死在 SKILL 裡。"""
+    s = (REPO / "SKILL.md").read_text(encoding="utf-8")
+    assert "$juryRc = $LASTEXITCODE" in s, "SKILL 沒保存評審團的退出碼"
+    assert "退出碼契約" in s and "不可排行" in s, "SKILL 沒寫 0/2/其他 的處置規則"
+    assert "pillar_totals.完整評測" in s, "SKILL 要求二次確認 JSON 完整性"

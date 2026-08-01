@@ -14,6 +14,8 @@ import tempfile
 from pathlib import Path
 
 import gradio as gr
+
+from 子程序 import run_tree
 import requests
 from urllib.parse import urlparse
 
@@ -52,41 +54,19 @@ _JOB_TIMEOUT = int(os.environ.get("SONG_JURY_WEB_TIMEOUT", "7200"))
 
 
 def _run(cmd, timeout=None):
-    """跑子程序;逾時就把**整棵程序樹**殺掉。
+    """跑子程序;逾時就把**整棵程序樹**殺掉(實作在 子程序.run_tree,三處共用)。
 
-    ⛔ 一定要用 Popen 自己保管 PID:`subprocess.TimeoutExpired` **沒有 .pid 欄位**
-       (實測屬性只有 cmd/output/stderr/timeout),舊寫法 getattr(e,"pid",0) 等於
-       `taskkill /PID 0` —— 父程序被 run() 收掉,但 Demucs/torch 的子孫程序留在背景吃 GPU。
-    """
+    ⛔ 歷史教訓都沉澱在 run_tree 裡:TimeoutExpired 沒有 .pid、POSIX 要開新
+       session 否則 killpg 連 Gradio 自己一起殺 —— 評審團/批次/app 不再各寫各的
+       (Codex R12:另外兩處就是因為自己寫,孫程序殺不乾淨)。"""
     lim = timeout or _JOB_TIMEOUT
-    # ⛔ POSIX 一定要 start_new_session=True:不開新 session 的話子程序會留在 **本網頁服務
-    #    自己的程序群組**裡,下面那個 killpg 會把 Gradio app 甚至啟動它的 shell 一起殺掉。
-    #    Windows 用 CREATE_NEW_PROCESS_GROUP,taskkill /T 才收得乾淨。
-    _iso = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _WIN
-            else {"start_new_session": True})
-    p = subprocess.Popen(cmd, cwd=str(BASE), env=ENV,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, encoding="utf-8", errors="replace", **_iso)
     try:
-        out, err = p.communicate(timeout=lim)
-        return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)
-    except subprocess.TimeoutExpired:
-        if _WIN:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
-        else:
-            import signal
-            try:      # POSIX:殺整個程序群組
-                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-            except Exception:
-                p.kill()
-        try:
-            out, err = p.communicate(timeout=10)
-        except Exception:
-            out, err = "", ""
+        return run_tree(cmd, cwd=BASE, env=ENV, timeout=lim)
+    except subprocess.TimeoutExpired as e:
         return subprocess.CompletedProcess(
-            cmd, 1, stdout=out,
-            stderr=(err or "") + f"\n逾時:超過 {lim} 秒仍未完成,已中止整棵程序樹。"
-                                 f"(可設環境變數 SONG_JURY_WEB_TIMEOUT 調整)")
+            cmd, 1, stdout=e.output or "",
+            stderr=(e.stderr or "") + f"\n逾時:超過 {lim} 秒仍未完成,已中止整棵程序樹。"
+                                      f"(可設環境變數 SONG_JURY_WEB_TIMEOUT 調整)")
 
 
 # ── Ollama(本機免費 AI)────────────────────────────────────────

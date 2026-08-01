@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 from statistics import mean, pstdev
 
+from 子程序 import run_tree
+
 os.environ.setdefault("PYTHONUTF8", "1")
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -105,9 +107,11 @@ def run_one(song: Path, timeout=3600):
     #    批次表格拿到的是上次的舊分數,而且錯誤字串是空的 —— 完全看不出來。
     if out_json.exists():
         out_json.unlink()
-    r = subprocess.run([str(VENV_PY), str(BASE / "評審團.py"), str(song)],
-                       cwd=str(BASE), capture_output=True, text=True, env=env,
-                       encoding="utf-8", errors="replace", timeout=timeout, **_NO_WINDOW)
+    # ⛔ 逾時要殺整棵程序樹(run_tree):subprocess.run 只殺直屬的 評審團.py,
+    #    它開的 Demucs/torch 孫程序會活著繼續吃 GPU、寫分軌快取(Codex R12)。
+    r = run_tree([str(VENV_PY), str(BASE / "評審團.py"), str(song)],
+                 cwd=BASE, env=env, timeout=timeout,
+                 extra_creationflags=_NO_WINDOW.get("creationflags", 0))
     # ⛔ 也要看 returncode:程式中途炸掉但檔案已寫出時,光看檔案在不在會誤判成功。
     #    2 是「報告已完整發布但缺柱」的專用碼(Codex R11)—— 要繼續往下讀,
     #    交給下面的完整性檢查給出「缺柱:…」的誠實訊息,不是當成炸掉。

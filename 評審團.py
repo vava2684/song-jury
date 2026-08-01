@@ -35,7 +35,8 @@ BASE = Path(__file__).parent.resolve()
 ENV = {**os.environ, "PYTHONUTF8": "1"}
 
 # 鎖檔的全域位置(⛔ 不放 BASE:兩份 ZIP 副本會各鎖各的,互斥失效 —— Codex R10)
-from 狀態目錄 import state_root, StateDirError, safe_open_lock
+from 狀態目錄 import locks_dir, state_root, StateDirError, safe_open_lock
+from 子程序 import run_tree
 
 # Windows:子程序不要各自彈出主控台黑框(一次評測會開好幾個子程序)。Linux 無此旗標 → 空 dict。
 _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {}
@@ -108,13 +109,15 @@ def _optional_stage(cmd, label, env=None, timeout=1800, cwd=None):
     ⚠️ 不能只看 returncode:這些工具把例外包起來後照樣寫 JSON 並回 0
        (和聲分析.py 就是這樣),所以要檢查 degraded 與有沒有實際內容。
     ⚠️ cwd 不存在時 subprocess 在 Windows 丟 NotADirectoryError、POSIX 丟 FileNotFoundError,
-       兩者都由下面那個 except Exception 接住 → 回 (None, 說明),不會炸掉主流程。"""
+       兩者都由下面那個 except Exception 接住 → 回 (None, 說明),不會炸掉主流程。
+    ⛔ 逾時要用 run_tree 殺**整棵程序樹**:subprocess.run 只殺直屬子程序,
+       Demucs/torch 孫程序會活著繼續吃 GPU、寫中間檔(Codex R12 探針:
+       grandchild_survived_and_wrote_later=true)。"""
     try:
-        r = subprocess.run(cmd, cwd=str(cwd or BASE), env=env or ENV, capture_output=True,
-                           text=True, encoding="utf-8", errors="replace",
-                           timeout=timeout, **_NO_WINDOW)
+        r = run_tree(cmd, cwd=(cwd or BASE), env=env or ENV, timeout=timeout,
+                     extra_creationflags=_NO_WINDOW.get("creationflags", 0))
     except subprocess.TimeoutExpired:
-        return None, f"{label}:逾時({timeout}s)"
+        return None, f"{label}:逾時({timeout}s,已中止整棵程序樹)"
     except Exception as e:
         return None, f"{label}:{type(e).__name__}"
     if r.returncode != 0:
@@ -852,8 +855,9 @@ def _lock_path_for(song: Path) -> Path:
     ⚠️ 誠實的邊界(Codex R11):互斥範圍=同一台機器的**同一位 OS 使用者**。
        兩個帳號(登入使用者 vs 排程服務)同評一個共享音檔仍會互踩,不要那樣用。
        鎖檔 0 byte、永不刪(flock inode 陷阱)。"""
-    d = state_root() / "_locks"
-    d.mkdir(exist_ok=True)
+    # ⛔ 用 locks_dir():目錄本身也要驗(拒 symlink/junction、0700、驗擁有者)——
+    #    只驗鎖檔不驗目錄,`_locks` 被換成 symlink 照樣把鎖導出去(Codex R12)
+    d = locks_dir()
     h = hashlib.sha256(str(song.resolve()).encode("utf-8")).hexdigest()[:16]
     return d / f"job_{h}.lock"
 

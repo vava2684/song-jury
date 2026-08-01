@@ -59,6 +59,63 @@ def test_safe_open_lock拒開symlink且不碰目標(tmp_path):
     assert victim.read_text(encoding="utf-8") == "珍貴資料"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink 語意")
+def test_locks目錄本身是symlink要拒絕(tmp_path, monkeypatch):
+    """🔴 Codex R12:只驗鎖檔不驗目錄 —— `_locks` 被換成指向外部的 symlink,
+    鎖檔照樣被導出互斥域。目錄本身也要過同一套私人資料夾標準。"""
+    root = tmp_path / "s"
+    monkeypatch.setenv("SONG_JURY_STATE_DIR", str(root))
+    S.state_root()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "_locks").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(S.StateDirError):
+        S.locks_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink 語意")
+def test_狀態根目錄是symlink要拒絕且不chmod到目標(tmp_path, monkeypatch):
+    """🔴 Codex R12:STATE_DIR 指向 symlink 被接受,還把目標目錄 chmod 成 0700。"""
+    target = tmp_path / "real"
+    target.mkdir(mode=0o755)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("SONG_JURY_STATE_DIR", str(link))
+    before = os.stat(target).st_mode & 0o777
+    with pytest.raises(S.StateDirError):
+        S.state_root()
+    assert (os.stat(target).st_mode & 0o777) == before, \
+        "🔴 symlink 目標目錄被 chmod 了 —— 動到別人的目錄"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX umask 語意")
+def test_umask全開時建立當下就是0700沒有窗口(tmp_path, monkeypatch):
+    """🔴 Codex R12:mkdir(預設)→chmod 之間有 0777 窗口可塞 symlink。
+    mkdir(mode=0o700) 讓目錄從建立那一刻就 0700,窗口不存在。"""
+    d = tmp_path / "s2"
+    monkeypatch.setenv("SONG_JURY_STATE_DIR", str(d))
+    old = os.umask(0)
+    try:
+        S.state_root()
+    finally:
+        os.umask(old)
+    assert (os.stat(d).st_mode & 0o777) == 0o700
+
+
+def test_鎖檔hardlink要拒絕且不碰目標(tmp_path):
+    """🔴 Codex R12:O_NOFOLLOW 擋不住 hardlink —— job_<hash>.lock 硬連結到
+    victim.txt,fstat 看到的仍是普通檔案,寫 pid 就把 victim 蓋了
+    (實測 st_nlink=2、victim 變 pid=…)。link count 必須是 1。"""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("KEEP-ME", encoding="utf-8")
+    lock = tmp_path / "job.lock"
+    os.link(victim, lock)                      # 跨平台:NTFS 也支援 hardlink
+    with pytest.raises(OSError):
+        S.safe_open_lock(lock)
+    assert victim.read_text(encoding="utf-8") == "KEEP-ME", \
+        "🔴 victim 被動到了 —— hardlink 繞過了鎖檔防線"
+
+
 def test_safe_open_lock正常路徑可開可重開(tmp_path):
     p = tmp_path / "x.lock"
     f = S.safe_open_lock(p)

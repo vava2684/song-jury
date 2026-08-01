@@ -242,24 +242,30 @@ fi
 # ⛔ ffmpeg 是完整安裝的必要件:一般 WAV 超過 Gemini 內嵌上限,靠它轉檔才評得了
 HAS_FFMPEG=0; have ffmpeg && HAS_FFMPEG=1
 
-# ⛔ 光 grep .env 格式不算「有金鑰」:任意長字串也照樣「九柱齊全、exit 0」
-#    (Codex R11 假金鑰探針)。真的打一次 Google API(models 清單端點,不耗生成配額)。
-#    ⚠️ 網路不通 ≠ 金鑰無效:HTTP 400/401/403 才打回,連不上只警告。
+# ⛔ 金鑰驗證交給 金鑰驗證.py(共用實作,逐把真打 Google、絕不只驗第一把)。
+#    Codex R12:內嵌版只驗第一把(第一把好第二把壞=假陽性、反過來=假陰性),
+#    而且 429/網路/TLS 全被洗成成功。三態:verified=綠燈資格;invalid=視同沒金鑰;
+#    cooling/unknown=「未能驗證」→ 最後 exit 3(獨立退出碼,跟缺柱 exit 1 分開)。
+KEY_UNVERIFIED=0
 if [ "$HAS_KEY" = 1 ]; then
-  _KLINE=$(printf '%s\n' "$_ENV_TEXT" | grep -E '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=' | head -n 1)
-  FIRST_KEY=$(printf '%s' "$_KLINE" | sed -E 's/^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*//' \
-              | cut -d, -f1 | tr -d '\042\047[:space:]')
-  if have curl; then
-    HTTP=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-           "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=$FIRST_KEY" 2>/dev/null)
-    case "$HTTP" in
-      200) ok "Gemini 金鑰驗證通過(真的打了一次 Google API;多把金鑰只驗第一把)" ;;
-      400|401|403) HAS_KEY=0
-        bad "Gemini 金鑰無效(HTTP $HTTP)" "格式像金鑰但 Google 不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" ;;
-      *) warn "金鑰驗證連不上 Google(HTTP ${HTTP:-000},網路問題?)—— 先當有;裝完請跑 --check-only 再驗" ;;
+  if [ -x .venv/bin/python ]; then PROBE_PY=.venv/bin/python
+  elif have python3; then PROBE_PY=python3
+  elif have python; then PROBE_PY=python
+  else PROBE_PY=""; fi
+  if [ -n "$PROBE_PY" ]; then
+    PYTHONUTF8=1 "$PROBE_PY" 金鑰驗證.py .env
+    case "$?" in
+      0) ok "Gemini 金鑰驗證通過(逐把真打 Google;各把狀態見上)" ;;
+      1) HAS_KEY=0
+         bad "Gemini 金鑰全部無效" "格式像金鑰但 Google 全不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" ;;
+      3) KEY_UNVERIFIED=1
+         warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 --check-only" ;;
+      4) HAS_KEY=0; warn ".env 裡沒有可用金鑰(只有佔位字串?)" ;;
+      *) KEY_UNVERIFIED=1; warn "金鑰驗證工具異常 —— 不給完整綠燈" ;;
     esac
   else
-    warn "沒有 curl,金鑰只驗了格式、沒驗有效性"
+    KEY_UNVERIFIED=1
+    warn "找不到任何 python 可跑金鑰驗證 —— 金鑰只驗了格式;裝完請重跑 --check-only"
   fi
 fi
 
@@ -326,6 +332,12 @@ elif [ "$HAS_FFMPEG" != 1 ]; then
   printf "      ${C_RED}⛔ 缺 ffmpeg —— 一般 WAV(4 分鐘 PCM ≈ 40MB)超過 Gemini 內嵌上限,${C_OFF}\n"
   printf "      ${C_RED}   沒有它轉檔,評 WAV 時 Gemini 餵的六個柱項全缺 → 不算完整安裝。${C_OFF}\n"
   printf "      ${C_YEL}   → 用套件管理員裝 ffmpeg 後重跑 --check-only。${C_OFF}\n"
+elif [ "$KEY_UNVERIFIED" = 1 ]; then
+  # ⛔ 「組件都在」≠「驗證通過」:金鑰 429/網路問題時不可宣稱九柱齊全(Codex R12)
+  printf "      ${C_YEL}⚠️ 九柱組件都在,但 Gemini 金鑰有效性【未能驗證】(限流/網路/TLS)——${C_OFF}
+"
+  printf "      ${C_YEL}   不給完整綠燈。等恢復後重跑 --check-only 拿驗證通過的結論。${C_OFF}
+"
 else
   printf "      ${C_GREEN}✅ 九柱齊全、細項無缺 —— 這才是可以拿來評分的完整安裝。${C_OFF}\n"
 fi
@@ -372,17 +384,35 @@ fi
 VERIFY_OK=1
 if [ "$VERIFY_MODELS" = 1 ]; then
   if [ "$HAS_ENV" = 1 ]; then
-    printf "\n      ${C_DIM}--verify-models:實跑 評審團.py demo_mix.wav(首次會下載數 GB 模型權重,會很久)...${C_OFF}\n"
-    rm -f "demo_mix_評審團.json"
-    PYTHONUTF8=1 .venv/bin/python 評審團.py demo_mix.wav
+    # ⛔ 三件事缺一不可(Codex R12):
+    #    ① 唯一檔名 verify_<id>.wav → 分軌快取鍵含檔名,強迫 Demucs 真的重新推論,
+    #       不會沿用 demo_mix 的舊 stems;
+    #    ② 子環境用 env -u 清掉 SKIP_GEMINI/TRUST_LEGACY_STEMS ——
+    #       呼叫 shell 遺留的變數會讓驗證跳關或信任舊快取;也不動呼叫者的環境;
+    #    ③ 不信 exit 0:用 驗證報告.py 獨立解析 JSON —— stub 寫個 {} 也騙不過。
+    VID="verify_$(date +%s)_$$"
+    printf "
+      ${C_DIM}--verify-models:實跑 評審團.py ${VID}.wav(唯一檔名,強迫全模型路徑;首次會下載數 GB)...${C_OFF}
+"
+    cp demo_mix.wav "${VID}.wav"
+    V_EPOCH=$(date +%s)
+    env -u SONG_JURY_SKIP_GEMINI -u SONG_JURY_TRUST_LEGACY_STEMS         PYTHONUTF8=1 .venv/bin/python 評審團.py "${VID}.wav"
     VRC=$?
-    if [ "$VRC" -eq 0 ] && [ -f "demo_mix_評審團.json" ]; then
-      ok "完整驗證通過:九柱實跑成功、完整評測=True(證據:demo_mix_評審團.json)"
+    if [ "$VRC" -eq 0 ]; then
+      if PYTHONUTF8=1 .venv/bin/python 驗證報告.py "${VID}_評審團.json" --newer-than "$V_EPOCH"; then
+        ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"
+      else
+        bad "完整驗證:評審團回報成功但 JSON 驗不過(見上一行 VERIFY_BAD)" "退出碼契約與產出內容不一致,不可採信"
+        VERIFY_OK=0
+      fi
     elif [ "$VRC" -eq 2 ]; then
       bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"; VERIFY_OK=0
     else
       bad "完整驗證沒過(退出碼 $VRC)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"; VERIFY_OK=0
     fi
+    # 善後:測試音檔、報告、它的分軌快取都清掉,不留垃圾
+    rm -f "${VID}.wav" "${VID}_評審團.json"
+    rm -rf _stems/"${VID}"*
   else
     bad "--verify-models 需要 .venv 可用" "先完成安裝再驗"; VERIFY_OK=0
   fi
@@ -419,5 +449,11 @@ USAGE
 if [ "${#PROBLEMS[@]}" -gt 0 ] || [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ] || [ "$SMOKE_OK" != 1 ] || [ "$HAS_FFMPEG" != 1 ] || [ "$VERIFY_OK" != 1 ]; then
   printf "${C_DIM}  (退出碼 1:安裝未完全成功)${C_OFF}\n"
   exit 1
+fi
+if [ "$KEY_UNVERIFIED" = 1 ]; then
+  # ⛔ 組件齊但金鑰未能驗證(429/網路/TLS)→ 獨立退出碼 3,不冒充完整成功(Codex R12)
+  printf "${C_DIM}  (退出碼 3:組件齊全,但金鑰有效性未能驗證 —— 恢復後重跑 --check-only)${C_OFF}
+"
+  exit 3
 fi
 exit 0

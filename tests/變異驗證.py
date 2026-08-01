@@ -174,6 +174,68 @@ MUTATIONS = [
      "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
+    # ── Codex 第十二輪:程序樹、逐把驗金鑰、獨立 JSON 裁判、目錄防線 ──────
+    ("逾時只殺直屬子程序(Demucs/torch 孫程序活著繼續吃 GPU)",
+     "子程序.py",
+     '        kill_tree(p)',
+     '        pass  # 變異:不殺樹,只收直屬',
+     "tests/test_run_tree.py::test_逾時要殺整棵樹_孫程序不可存活寫檔"),
+
+    ("金鑰驗證退回只驗第一把(第一好第二壞=假陽性)",
+     "金鑰驗證.py",
+     '    for i, k in enumerate(keys, 1):',
+     '    for i, k in enumerate(keys[:1], 1):',
+     "tests/test_keyprobe_and_verify.py::test_第一把好第二把壞_要逐把驗且誠實列出"),
+
+    ("429 被洗成 verified(全部限流照樣綠燈)",
+     "金鑰驗證.py",
+     '        if e.code == 429:\n            return "cooling", e.code',
+     '        if e.code == 429:\n            return "verified", e.code',
+     "tests/test_keyprobe_and_verify.py::test_真網路分類器_HTTPError對照"),
+
+    ("網路/TLS 錯誤被洗成 verified(斷網也給綠燈)",
+     "金鑰驗證.py",
+     '    except Exception:\n        return "unknown", None       # DNS/TLS/逾時 —— 不是金鑰的錯,但也沒驗成',
+     '    except Exception:\n        return "verified", None',
+     "tests/test_keyprobe_and_verify.py::test_真網路分類器_HTTPError對照"),
+
+    ("驗證報告裁判放水:不驗完整評測(stub 寫 {} 也算完整)",
+     "驗證報告.py",
+     '    if pt.get("完整評測") is not True:',
+     '    if False:',
+     "tests/test_keyprobe_and_verify.py::test_各種殘缺都要被打回"),
+
+    ("驗證報告不驗新舊(舊報告冒充本輪 VerifyModels 證據)",
+     "驗證報告.py",
+     '    if newer_than is not None and path.stat().st_mtime <= newer_than:',
+     '    if False:',
+     "tests/test_keyprobe_and_verify.py::test_舊檔不可冒充本輪新產物"),
+
+    ("SKILL 又不看退出碼(exit 2 的報告被丟掉或當完整交付)",
+     "SKILL.md",
+     '$juryRc = $LASTEXITCODE   # ⛔ 立刻保存 —— 退出碼是完整性契約,不看等於裝瞎',
+     '# 變異:不看退出碼',
+     "tests/test_packaging.py::test_SKILL有實作退出碼契約"),
+
+    ("鎖檔 hardlink 防線拆掉(鎖寫入可覆寫任意可硬連結檔案)",
+     "狀態目錄.py",
+     '        if st.st_nlink != 1:',
+     '        if False:',
+     "tests/test_state_dir.py::test_鎖檔hardlink要拒絕且不碰目標"),
+
+    # ⚠️ 下面三條的測試是 POSIX 專屬(Windows 本機跑會誠實顯示「無法驗證」,CI ubuntu 會抓)
+    ("狀態/鎖目錄的 symlink 防線拆掉(鎖被導向外部目錄)",
+     "狀態目錄.py",
+     '    if d.is_symlink():\n        raise StateDirError',
+     '    if False:\n        raise StateDirError',
+     "tests/test_state_dir.py::test_locks目錄本身是symlink要拒絕"),
+
+    ("目錄建立退回預設權限(mkdir→chmod 之間出現 0777 窗口)",
+     "狀態目錄.py",
+     '        d.mkdir(parents=True, exist_ok=True, mode=0o700)   # mode 只作用在最後一層',
+     '        d.mkdir(parents=True, exist_ok=True)',
+     "tests/test_state_dir.py::test_umask全開時建立當下就是0700沒有窗口"),
+
     # ── Codex 第十一輪:隔離競態、狀態上限、修復寫入、退出碼契約、安裝驗證 ──
     ("隔離退回無鎖 rename(寫入者剛發布的新狀態被搬去 .corrupt)",
      "Gemini曲評.py",
@@ -201,7 +263,7 @@ MUTATIONS = [
 
     ("狀態目錄錯誤退回原始 traceback(FileExistsError 噴在保護層外)",
      "狀態目錄.py",
-     '    except FileExistsError:\n        raise StateDirError(f"狀態目錄的位置被一個普通檔案佔住:{d} —— 請移走那個檔案")',
+     '    except FileExistsError:\n        raise StateDirError(f"{what} 的位置被一個普通檔案佔住:{d} —— 請移走那個檔案")',
      '    except FileExistsError:\n        raise',
      "tests/test_state_dir.py::test_override指到普通檔案要講人話不可原始traceback"),
 
@@ -215,12 +277,12 @@ MUTATIONS = [
      "批次評測.py",
      '    if r.returncode not in (0, 2):',
      '    if r.returncode != 0:',
-     "tests/test_packaging.py::test_批次與網頁版要接受退出碼2的不完整報告"),
+     "tests/test_batch_and_windows.py::test_退出碼2的缺柱報告要讀進來給誠實訊息"),
 
-    ("安裝器金鑰驗證退回純格式檢查(任意字串被當有效金鑰)",
+    ("安裝器又內嵌金鑰探針(繞過 金鑰驗證.py 的逐把/三態契約)",
      "install.ps1",
-     'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=$firstKey',
-     'https://example.invalid/?key=$firstKey',
+     '$script:KeyUnverified = $false',
+     '$script:KeyUnverified = $false   # generativelanguage 內嵌探針(變異)',
      "tests/test_packaging.py::test_安裝腳本真的驗金鑰有效性且有完整驗證開關"),
 
     ("安裝步數又少算(完整安裝印 [10/9])",
@@ -232,8 +294,8 @@ MUTATIONS = [
     # ── Codex 第十輪:鎖跨副本、狀態 schema、冷卻持久化、顯示層防炸 ──────
     ("鎖位置退回 BASE(兩份 ZIP 副本各鎖各的,互斥只在單一副本內成立)",
      "評審團.py",
-     '    d = state_root() / "_locks"',
-     '    d = BASE / "_locks"',
+     '    d = locks_dir()',
+     '    d = BASE / "_locks"; d.mkdir(exist_ok=True)',
      "tests/test_lock_and_gate.py::test_鎖的位置跟工具副本無關"),
 
     ("狀態檔頂層不驗型別(合法 JSON 的 [] 讓 Gemini 整關炸掉)",

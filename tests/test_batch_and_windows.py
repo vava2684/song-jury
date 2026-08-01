@@ -48,7 +48,8 @@ def _stub_run(monkeypatch, returncode, write_json=None):
                 p.with_name(p.stem + "_評審團.json").write_text(
                     json.dumps(write_json, ensure_ascii=False), encoding="utf-8")
         return types.SimpleNamespace(returncode=returncode, stdout="", stderr="boom")
-    monkeypatch.setattr(subprocess, "run", fake)
+    # run_one 走的是 子程序.run_tree(逾時殺整棵樹的共用實作),stub 要指到它
+    monkeypatch.setattr(B, "run_tree", fake)
 
 
 完整JSON = {"pillar_totals": {"完整評測": True, "缺柱": [], "曲側合成": 70.0}}
@@ -137,3 +138,18 @@ def test_不完整評測不可以進批次表(monkeypatch, tmp_path):
     d, err = B.run_one(song)
     assert d is None
     assert "不完整" in err and "律動" in err
+
+
+def test_退出碼2的缺柱報告要讀進來給誠實訊息(monkeypatch, tmp_path):
+    """🔴 Codex R12(⑨ 行為版):評審團 exit 2 = 報告已完整發布但缺柱。
+    批次要**照樣讀 JSON**,用完整性檢查給「缺柱:…」的誠實訊息 ——
+    不可以停在「評審團 結束碼 2」讓人以為程式炸了。(批次仍拒收進表:缺柱不可比)"""
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    不完整JSON = {"pillar_totals": {"完整評測": False, "缺柱": ["律動"],
+                                    "缺柱權重合計": 4.0, "柱分": {}}}
+    _stub_run(monkeypatch, returncode=2, write_json=不完整JSON)
+    d, err = B.run_one(song)
+    assert d is None, "缺柱結果不可進批次表(另一把尺)"
+    assert "缺柱" in err and "律動" in err, f"要給完整性的誠實訊息:{err!r}"
+    assert "結束碼" not in err, f"🔴 exit 2 被當成程式炸掉:{err!r}"

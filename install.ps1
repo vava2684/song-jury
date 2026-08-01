@@ -251,25 +251,33 @@ if (Test-Path ".env") {
 #    (缺它=評 WAV 時 Gemini 六柱項全缺=不完整)。-CheckOnly 也要驗。
 $hasFfmpeg = Have "ffmpeg"
 
-# ⛔ 光 grep .env 格式不算「有金鑰」:任意長字串也照樣「九柱齊全、exit 0」
-#    (Codex R11 假金鑰探針)。真的打一次 Google API 驗證(models 清單端點,
-#    不耗生成配額)。⚠️ 網路不通 ≠ 金鑰無效:認證失敗才打回,連不上只警告。
+# ⛔ 金鑰驗證交給 金鑰驗證.py(共用實作,逐把真打 Google、絕不只驗第一把)。
+#    Codex R12 兩條:內嵌版只驗第一把(第一把好第二把壞=假陽性、反過來=假陰性);
+#    429/網路/TLS 全被洗成成功。python 驗還順帶根治 PS5.1 的 TLS 協商問題。
+#    三態:verified=綠燈資格;invalid=視同沒金鑰;cooling/unknown=「未能驗證」,
+#    不給綠燈、最後 exit 3(獨立退出碼,跟「缺柱 exit 1」分開)。
+$script:KeyUnverified = $false
 if ($hasKey) {
-    $keyLine = (Get-Content ".env" -ErrorAction SilentlyContinue |
-                Where-Object { $_ -match '^\s*GEMINI_API_KEYS?\s*=' } | Select-Object -First 1)
-    $firstKey = ($keyLine -replace '^\s*GEMINI_API_KEYS?\s*=\s*', '').Trim().Trim('"').Trim("'").Split(',')[0].Trim()
-    try {
-        Invoke-RestMethod -Uri "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=$firstKey" -TimeoutSec 15 | Out-Null
-        Ok "Gemini 金鑰驗證通過(真的打了一次 Google API;多把金鑰只驗第一把)"
-    } catch {
-        $code = $null
-        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
-        if ($code -in 400, 401, 403) {
-            $hasKey = $false
-            Bad "Gemini 金鑰無效(HTTP $code)" "格式像金鑰但 Google 不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env"
-        } else {
-            Warn "金鑰驗證連不上 Google(網路問題?)—— 先當有;裝完請跑 -CheckOnly 再驗一次"
+    $probePy = if (Test-Path ".venv\Scripts\python.exe") { ".venv\Scripts\python.exe" }
+               elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
+               elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+               else { $null }
+    if ($probePy) {
+        $env:PYTHONUTF8 = "1"
+        & $probePy "金鑰驗證.py" ".env"
+        switch ($LASTEXITCODE) {
+            0 { Ok "Gemini 金鑰驗證通過(逐把真打 Google;各把狀態見上)" }
+            1 { $hasKey = $false
+                Bad "Gemini 金鑰全部無效" "格式像金鑰但 Google 全不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" }
+            3 { $script:KeyUnverified = $true
+                Warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 -CheckOnly" }
+            4 { $hasKey = $false; Warn ".env 裡沒有可用金鑰(只有佔位字串?)" }
+            default { $script:KeyUnverified = $true
+                      Warn "金鑰驗證工具異常(退出碼 $LASTEXITCODE)—— 不給完整綠燈" }
         }
+    } else {
+        $script:KeyUnverified = $true
+        Warn "找不到任何 python 可跑金鑰驗證 —— 金鑰只驗了格式;裝完請重跑 -CheckOnly"
     }
 }
 
@@ -328,6 +336,10 @@ if ($lost -gt 0) {
     Write-Host "      ⛔ 缺 ffmpeg —— 一般 WAV(4 分鐘 PCM ≈ 40MB)超過 Gemini 內嵌上限," -ForegroundColor Red
     Write-Host "         沒有它轉檔,評 WAV 時 Gemini 餵的六個柱項全缺 → 不算完整安裝。" -ForegroundColor Red
     Write-Host "         → winget install Gyan.FFmpeg(或手動裝好加入 PATH)後重跑 -CheckOnly。" -ForegroundColor Yellow
+} elseif ($script:KeyUnverified) {
+    # ⛔ 「組件都在」≠「驗證通過」:金鑰 429/網路問題時不可宣稱九柱齊全(Codex R12)
+    Write-Host "      ⚠️ 九柱組件都在,但 Gemini 金鑰有效性【未能驗證】(限流/網路/TLS)——" -ForegroundColor Yellow
+    Write-Host "         不給完整綠燈。等網路/限流恢復後重跑 -CheckOnly 拿驗證通過的結論。" -ForegroundColor Yellow
 } else {
     Write-Host "      ✅ 九柱齊全、細項無缺 —— 這才是可以拿來評分的完整安裝。" -ForegroundColor Green
 }
@@ -387,13 +399,36 @@ if ($hasEnv) {
 $script:VerifyOk = $true
 if ($VerifyModels) {
     if ($hasEnv) {
-        Write-Host "`n      -VerifyModels:實跑 評審團.py demo_mix.wav(首次會下載數 GB 模型權重,會很久)..." -ForegroundColor DarkGray
+        # ⛔ 三件事缺一不可(Codex R12):
+        #    ① 唯一檔名 verify_<id>.wav → 分軌快取鍵含檔名,強迫 Demucs 真的重新推論,
+        #       不會沿用 demo_mix 的舊 stems;
+        #    ② 子環境清掉 SONG_JURY_SKIP_GEMINI / SONG_JURY_TRUST_LEGACY_STEMS ——
+        #       呼叫 shell 遺留的變數會讓驗證跳關或信任舊快取(驗完恢復,不動呼叫者);
+        #    ③ 不信 exit 0:用 驗證報告.py 獨立解析 JSON(完整評測/缺柱/曲側合成/
+        #       八柱鍵/本輪新產物)—— stub 寫個 {} 也騙不過。
+        $vid = "verify_" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        Write-Host "`n      -VerifyModels:實跑 評審團.py $vid.wav(唯一檔名,強迫全模型路徑;首次會下載數 GB)..." -ForegroundColor DarkGray
         $env:PYTHONUTF8 = "1"
-        Remove-Item "demo_mix_評審團.json" -EA SilentlyContinue
-        & .venv\Scripts\python.exe 評審團.py demo_mix.wav
-        $vrc = $LASTEXITCODE
-        if ($vrc -eq 0 -and (Test-Path "demo_mix_評審團.json")) {
-            Ok "完整驗證通過:九柱實跑成功、完整評測=True(證據:demo_mix_評審團.json)"
+        Copy-Item "demo_mix.wav" "$vid.wav"
+        $vEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $oldSkip = $env:SONG_JURY_SKIP_GEMINI; $oldTrust = $env:SONG_JURY_TRUST_LEGACY_STEMS
+        Remove-Item Env:SONG_JURY_SKIP_GEMINI -EA SilentlyContinue
+        Remove-Item Env:SONG_JURY_TRUST_LEGACY_STEMS -EA SilentlyContinue
+        try {
+            & .venv\Scripts\python.exe 評審團.py "$vid.wav"
+            $vrc = $LASTEXITCODE
+        } finally {
+            if ($null -ne $oldSkip)  { $env:SONG_JURY_SKIP_GEMINI = $oldSkip }
+            if ($null -ne $oldTrust) { $env:SONG_JURY_TRUST_LEGACY_STEMS = $oldTrust }
+        }
+        if ($vrc -eq 0) {
+            & .venv\Scripts\python.exe 驗證報告.py "${vid}_評審團.json" --newer-than $vEpoch
+            if ($LASTEXITCODE -eq 0) {
+                Ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"
+            } else {
+                Bad "完整驗證:評審團回報成功但 JSON 驗不過(見上一行 VERIFY_BAD)" "退出碼契約與產出內容不一致,不可採信"
+                $script:VerifyOk = $false
+            }
         } elseif ($vrc -eq 2) {
             Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
             $script:VerifyOk = $false
@@ -401,6 +436,10 @@ if ($VerifyModels) {
             Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"
             $script:VerifyOk = $false
         }
+        # 善後:測試音檔、報告、它的分軌快取都清掉,不留垃圾
+        Remove-Item "$vid.wav", "${vid}_評審團.json" -EA SilentlyContinue
+        Get-ChildItem "_stems" -Directory -Filter "$vid*" -EA SilentlyContinue |
+            Remove-Item -Recurse -Force -EA SilentlyContinue
     } else {
         Bad "-VerifyModels 需要 .venv 可用" "先完成安裝再驗"
         $script:VerifyOk = $false
@@ -443,5 +482,10 @@ $failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:Smo
 if ($failed) {
     Write-Host "  (退出碼 1:安裝未完全成功)" -ForegroundColor DarkGray
     exit 1
+}
+if ($script:KeyUnverified) {
+    # ⛔ 組件齊但金鑰未能驗證(429/網路/TLS)→ 獨立退出碼 3,不冒充完整成功(Codex R12)
+    Write-Host "  (退出碼 3:組件齊全,但金鑰有效性未能驗證 —— 恢復後重跑 -CheckOnly)" -ForegroundColor DarkGray
+    exit 3
 }
 exit 0
