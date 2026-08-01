@@ -461,6 +461,9 @@ GIT_MUTATIONS = [
     ("四把尺其中一把沒進 repo(詞柱評不出來)",
      "rubrics/JA_lyric_rubric_v3.md",
      "tests/test_packaging.py::test_規則與尺都隨包"),
+    ("四語範例歌曲其中一首沒進 repo(開源門面缺一角)",
+     "examples/中文範例-貓步友情進行式.mp3",
+     "tests/test_packaging.py::test_四語範例歌曲成對且語言對得上"),
 ]
 
 

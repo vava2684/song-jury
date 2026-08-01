@@ -76,6 +76,11 @@ docs/PACKAGING.md
 !demo_mix.wav
 !demo_report.json
 
+# ── 放行「四語範例歌曲」(作者自己的 SUNO 作品,同意公開散布)──
+# ⚠️ 只放 中/英/日/韓 各一首 mp3+歌詞 txt;其他任何音檔仍被上面的 /* 擋住
+!examples/
+!examples/**
+
 # ── 放行 assets(logo 等品牌素材)──
 !assets/
 !assets/**

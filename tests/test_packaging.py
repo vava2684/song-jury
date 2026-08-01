@@ -78,10 +78,18 @@ def test_規則與尺都隨包():
 
 
 def test_不可外洩版權音檔與金鑰():
-    """⛔ 公開 repo 絕不可以出現得獎歌 mp3、分軌、測試歌、金鑰、個人校準層。"""
+    """⛔ 公開 repo 絕不可以出現得獎歌 mp3、分軌、測試歌、金鑰、個人校準層。
+
+    ⚠️ 唯一的 mp3 例外是 `examples/` 底下的**四語範例**(作者自己的 SUNO 作品,
+       同意公開散布)——窄門只開這一格,其他任何位置的 mp3 照樣全擋。"""
     bad = [p for p in _tracked()
-           if re.search(r"(^|/)_stems/|(^|/)_C層|(^|/)下載/|\.mp3$|\.flac$|(^|/)\.env$|個人整理", p)]
+           if re.search(r"(^|/)_stems/|(^|/)_C層|(^|/)下載/|\.mp3$|\.flac$|(^|/)\.env$|個人整理", p)
+           and not (p.startswith("examples/") and p.endswith(".mp3"))]
     assert bad == [], f"這些不該進 repo:{bad}"
+    # 窄門的邊界也要驗:examples/ 只准 mp3+txt,別的類型(flac/wav/zip…)不准搭便車
+    ex_bad = [p for p in _tracked()
+              if p.startswith("examples/") and not p.endswith((".mp3", ".txt"))]
+    assert ex_bad == [], f"examples/ 只准範例 mp3 與歌詞 txt:{ex_bad}"
 
 
 # 哪支程式跑在哪個環境 → 它的頂層第三方相依必須由那個環境的 requirements 宣告。
@@ -327,3 +335,42 @@ def test_批次與網頁版要接受退出碼2的不完整報告():
         src = (REPO / f).read_text(encoding="utf-8")
         assert "not in (0, 2)" in src, \
             f"🔴 {f} 要把 exit 2(完成但缺柱)當可讀結果處理,不是當失敗丟掉"
+
+
+def test_四語範例歌曲成對且語言對得上():
+    """examples/ 是開源展示的門面:中/英/日/韓各一首 mp3+歌詞 txt,成對缺一不可。
+    🔴 真實事故:「英文範例」實際上整首是葡萄牙文(Me Brilha)——詞柱四把尺
+    沒有葡文,掛英文範例會被英文尺亂評。語言用文字系統啟發式擋住明顯掛錯的。"""
+    ex = REPO / "examples"
+    assert ex.is_dir(), "examples/ 不見了"
+    for lang in ("中文範例", "英文範例", "日文範例", "韓文範例"):
+        mp3s = sorted(ex.glob(f"{lang}-*.mp3"))
+        txts = sorted(ex.glob(f"{lang}-*.txt"))
+        assert len(mp3s) == 1 and len(txts) == 1, \
+            f"{lang} 要恰好一首 mp3+一份歌詞 txt(現在 mp3={len(mp3s)}, txt={len(txts)})"
+        body = txts[0].read_text(encoding="utf-8")
+        # 去掉 SUNO 段落標記([Verse…]/(演奏描述)),只看歌詞本體
+        lyric = "\n".join(l for l in body.splitlines()
+                          if l.strip() and not l.strip().startswith(("[", "(")))
+        assert lyric, f"{lang} 歌詞 txt 裡沒有歌詞本體"
+        has_kana = any("぀" <= c <= "ヿ" for c in lyric)
+        has_hangul = any("가" <= c <= "힣" for c in lyric)
+        has_han = any("一" <= c <= "鿿" for c in lyric)
+        letters = [c for c in lyric if c.isalpha()]
+        accented = [c for c in letters if c in "ãõçáéíóúâêôàüñèìòù"]
+        if lang == "中文範例":
+            assert has_han and not has_kana and not has_hangul, "中文範例的歌詞不像中文"
+        elif lang == "日文範例":
+            assert has_kana, "日文範例的歌詞沒有假名,不像日文"
+        elif lang == "韓文範例":
+            assert has_hangul, "韓文範例的歌詞沒有諺文,不像韓文"
+        else:  # 英文
+            assert not (has_kana or has_hangul or has_han), "英文範例混進了 CJK 歌詞"
+            assert letters and len(accented) / len(letters) < 0.005, \
+                f"🔴 英文範例的重音字母比例 {len(accented)}/{len(letters)} 太高 —— " \
+                f"看起來是葡文/西文/法文之類,不是英文(詞柱沒有那把尺)"
+    # 而且要真的進 repo(白名單漏放行=別人 clone 拿不到門面)
+    tracked = _tracked()
+    if tracked:
+        got = [p for p in tracked if p.startswith("examples/")]
+        assert len(got) >= 8, f"examples/ 只有 {len(got)} 個檔進 repo,四首 mp3+四份 txt 要都在"
