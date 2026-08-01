@@ -60,10 +60,14 @@ def test_ps1的驗證順序_裁判先看到報告清理在最後(tmp_path):
     r = _run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)], tmp_path)
 
     witness = (tmp_path / "WITNESS.txt")
-    assert witness.exists(), f"裁判沒被呼叫到:{r.stdout[-500:]}"
+    assert witness.exists(), f"裁判沒被呼叫到:rc={r.returncode}
+OUT={r.stdout[-600:]}
+ERR={r.stderr[-600:]}"
     assert witness.read_text(encoding="utf-8") == "SEEN", \
         "🔴 裁判被呼叫時報告已經被清掉了 —— 清理排在驗證之前(成功路徑必定假陰性)"
-    assert "VERIFYOK=True" in r.stdout, f"成功路徑不該判失敗:{r.stdout[-500:]}"
+    assert "VERIFYOK=True" in r.stdout, f"成功路徑不該判失敗:rc={r.returncode}
+OUT={r.stdout[-600:]}
+ERR={r.stderr[-600:]}"
     # 收工後所有 $vid 前綴的產物都要清乾淨(含中途寫出的 _評分.json)
     left = [p.name for p in tmp_path.glob("verify_*")]
     assert left == [], f"🔴 沒清乾淨:{left}"
@@ -96,8 +100,12 @@ def test_sh的驗證順序_裁判先看到報告清理在最後(tmp_path):
     r = _run(["bash", str(script)], tmp_path)
 
     witness = (tmp_path / "WITNESS.txt")
-    assert witness.exists(), f"裁判沒被呼叫到:{r.stdout[-500:]}"
+    assert witness.exists(), f"裁判沒被呼叫到:rc={r.returncode}
+OUT={r.stdout[-600:]}
+ERR={r.stderr[-600:]}"
     assert witness.read_text(encoding="utf-8") == "SEEN", \
         "🔴 裁判被呼叫時報告已經被清掉了"
-    assert "VERIFYOK=1" in r.stdout, f"成功路徑不該判失敗:{r.stdout[-500:]}"
+    assert "VERIFYOK=1" in r.stdout, f"成功路徑不該判失敗:rc={r.returncode}
+OUT={r.stdout[-600:]}
+ERR={r.stderr[-600:]}"
     assert [p.name for p in tmp_path.glob("verify_*")] == []
