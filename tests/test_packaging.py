@@ -296,3 +296,34 @@ def test_安裝腳本把ffmpeg當完整安裝必要件():
     # ⚠️ 要釘在「退出碼那一行」:hasFfmpeg 在顯示區也有出現,只 grep 全文會被顯示區騙過
     assert re.search(r"\$failed\s*=.*\$hasFfmpeg", ps1),         "install.ps1 的退出碼($failed)要把 ffmpeg 算進去"
     assert re.search(r"\{#PROBLEMS\[@\]\}.*HAS_FFMPEG", sh),         "install.sh 的退出碼(exit 1 條件)要把 ffmpeg 算進去"
+
+
+def test_安裝腳本真的驗金鑰有效性且有完整驗證開關():
+    """🔴 Codex R11:任意長字串也照樣「九柱齊全、exit 0」—— 光 grep 格式不算驗證。
+    兩個安裝腳本都要真打一次 Google API(models 端點)驗金鑰;
+    另外要有 -VerifyModels/--verify-models 把九柱實跑一遍(import 成功≠模型能推論)。"""
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    for name, src in (("install.ps1", ps1), ("install.sh", sh)):
+        assert "generativelanguage.googleapis.com" in src, \
+            f"🔴 {name} 沒有真打 Google 驗金鑰(任意字串會被當有效金鑰)"
+    assert "VerifyModels" in ps1, "install.ps1 少了 -VerifyModels 完整驗證開關"
+    assert "--verify-models" in sh, "install.sh 少了 --verify-models 完整驗證開關"
+
+
+def test_安裝步數要跟實際步驟一致():
+    """🔴 Codex R11:完整安裝最後印 [10/9] —— TOTAL 少算一步。"""
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    assert re.search(r"\{ 1 \} elseif \(\$SkipML\) \{ 5 \} else \{ 10 \}", ps1), \
+        "install.ps1 的 TOTAL 要是 完整10/SkipML5/CheckOnly1"
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    assert "TOTAL=10" in sh and "TOTAL=5" in sh, "install.sh 的 TOTAL 要是 完整10/skip-ml5"
+
+
+def test_批次與網頁版要接受退出碼2的不完整報告():
+    """🔴 Codex R11:評審團對不完整評測回專用退出碼 2(報告已完整發布)。
+    批次/網頁版把 2 當一般失敗會**丟掉昂貴產物**;要照樣讀報告、顯示不可採信。"""
+    for f in ("批次評測.py", "app.py"):
+        src = (REPO / f).read_text(encoding="utf-8")
+        assert "not in (0, 2)" in src, \
+            f"🔴 {f} 要把 exit 2(完成但缺柱)當可讀結果處理,不是當失敗丟掉"

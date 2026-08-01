@@ -40,6 +40,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 os.environ.setdefault("PYTHONUTF8", "1")
@@ -54,10 +55,17 @@ import requests
 BASE = Path(__file__).parent.resolve()
 ENV_FILE = BASE / ".env"
 # ⛔ 冷卻狀態與金鑰租約不放 BASE:兩份 ZIP 副本會各自一套冷卻/租約,
-#    同一把 key 照樣被兩個副本同時轟(Codex R10)。金鑰是「這台機器」的資源,
+#    同一把 key 照樣被兩個副本同時轟(Codex R10)。金鑰是同一位使用者的資源,
 #    狀態就要放使用者全域目錄 —— 見 狀態目錄.py。(.env 留在 BASE:金鑰設定跟副本走)
-from 狀態目錄 import state_root
-STATE_FILE = state_root() / ".gemini_key_state.json"
+from 狀態目錄 import state_root, StateDirError, safe_open_lock
+try:
+    STATE_FILE = state_root() / ".gemini_key_state.json"
+except StateDirError as _e:
+    # ⛔ 狀態目錄壞掉(覆寫指到普通檔案/相對路徑/權限)不可以噴原始 traceback ——
+    #    講清楚原因與路徑再退出(Codex R11:炸在保護層外,訊息接不到)。
+    print(f"⛔ {_e}", file=sys.stderr)
+    raise SystemExit(2)
+MAX_STATE_BYTES = 1_048_576   # 狀態檔上限 1MiB:正常內容是幾十筆小 record,超過=被塞爆(Codex R11 16MiB 探針)
 
 # ── 模型與可調門檻(啟發式起手值,非論文數據)────────────────────────────
 GEMINI_MUSIC_MODEL = "gemini-3.5-flash"   # 網頁版實測:2.5-flash 對新金鑰停用,3.5-flash 才吃音檔
@@ -192,27 +200,12 @@ def load_keys() -> list:
     return out
 
 
-def load_state() -> dict:
-    """讀冷卻狀態,**驗過 schema 才交出去**。
-
-    ⛔ 合法 JSON ≠ 合法狀態:頂層是 [] 時 state.get() 直接 AttributeError,
-       整個 Gemini subprocess 非零退出 → 評測缺柱(Codex R10 實測)。
-       record 不是 dict、cooldown_until 不是有限數字,也會在 is_cooling 炸。
-       壞檔隔離成 .corrupt(留證據)後回空狀態,不讓一個壞檔癱瘓整關。"""
-    try:
-        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        _quarantine_state("JSON 解析失敗")
-        return {}
-    if not isinstance(raw, dict):
-        _quarantine_state(f"頂層是 {type(raw).__name__},應為 dict")
-        return {}
+def _sanitize_records(raw: dict) -> dict:
+    """只留合法 record:dict 且 cooldown_until 是有限數字。單筆壞丟單筆,不整檔陪葬。"""
     out = {}
     for fp, rec in raw.items():
         if not isinstance(rec, dict):
-            continue                       # 單筆壞 → 丟單筆就好,別整檔陪葬
+            continue
         cu = rec.get("cooldown_until", 0)
         if isinstance(cu, bool) or not isinstance(cu, (int, float)) or not math.isfinite(cu):
             continue
@@ -220,14 +213,86 @@ def load_state() -> dict:
     return out
 
 
-def _quarantine_state(why: str):
-    """把壞掉的狀態檔改名成 .corrupt 隔離(留證據,且下次不會再讀到它)。"""
+def _quarantine_locked(why: str):
+    """把壞掉的狀態檔改名隔離。⛔ 呼叫者必須已持有狀態鎖。
+
+    · 檔名帶 uuid:固定名稱會先刪舊證據才隔離新的,連環壞檔只留最後一份。"""
+    bad = STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt.{uuid.uuid4().hex[:8]}")
     try:
-        bad = STATE_FILE.with_suffix(".json.corrupt")
-        bad.unlink(missing_ok=True)
         STATE_FILE.rename(bad)
         print(f"⚠ Gemini 狀態檔壞掉({why})→ 已隔離成 {bad.name},以空狀態繼續",
               file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _read_state_locked() -> dict:
+    """鎖內讀 + 驗 + 清洗;壞檔就地隔離。⛔ 呼叫者必須已持有狀態鎖。
+
+    ⛔ 大小上限先看 stat 再讀:16MiB 垃圾檔會先吃 80MB+ 記憶體才發現是垃圾
+       (Codex R11 探針);共享/網路目錄被塞數百 MB 時直接 OOM。超限就隔離。"""
+    try:
+        size = STATE_FILE.stat().st_size
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    if size > MAX_STATE_BYTES:
+        _quarantine_locked(f"檔案 {size} bytes 超過上限 {MAX_STATE_BYTES}")
+        return {}
+    try:
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        _quarantine_locked("JSON 解析失敗")
+        return {}
+    if not isinstance(raw, dict):
+        _quarantine_locked(f"頂層是 {type(raw).__name__},應為 dict")
+        return {}
+    return _sanitize_records(raw)
+
+
+def load_state() -> dict:
+    """讀冷卻狀態,**驗過 schema 才交出去**。
+
+    ⛔ 合法 JSON ≠ 合法狀態:頂層是 [] 時 state.get() 直接 AttributeError,
+       整個 Gemini subprocess 非零退出 → 評測缺柱(Codex R10 實測)。
+    ⛔ 隔離**必須在狀態鎖內、鎖內重讀確認還是壞的**才動手:
+       無鎖 rename 會把寫入者剛換上的新狀態搬去 .corrupt —— 冷卻遺失,
+       其他程序再轟已限流的 key(Codex R11 探針:corrupt_contains_fresh_writer_data)。
+       拿不到鎖就這次先回空狀態,檔案一根指頭都不碰。"""
+    try:
+        size = STATE_FILE.stat().st_size
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    if size <= MAX_STATE_BYTES:
+        try:
+            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return _sanitize_records(raw)      # 快路徑:好檔不必進鎖
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            pass
+    # 壞檔/超大 → 進鎖重讀;還是壞的才隔離(寫入者可能剛換上新的合法狀態)
+    try:
+        with _state_lock(timeout=5.0) as acquired:
+            if acquired:
+                return _read_state_locked()
+    except Exception:
+        pass
+    return {}
+
+
+def _quarantine_state(why: str):
+    """(鎖外入口)拿到狀態鎖、鎖內重讀確認還是壞的,才隔離。拿不到鎖就不動。"""
+    try:
+        with _state_lock(timeout=5.0) as acquired:
+            if acquired:
+                _read_state_locked()   # 內含「重讀→還是壞的才隔離」;好檔原樣保留
     except Exception:
         pass
 
@@ -265,7 +330,9 @@ def _os_file_lock(lockf: Path, timeout: float):
     f = None
     status = "error"
     try:
-        f = open(lockf, "a+", encoding="utf-8")
+        # ⛔ safe_open_lock:不跟隨 symlink、驗普通檔案(共享目錄預植
+        #    symlink 鎖檔可把寫入導到任意檔案 —— Codex R11 探針)
+        f = safe_open_lock(lockf)
     except Exception:
         f = None          # 連鎖檔都開不了 → 鎖不可用,不是有人持有
     if f is not None:
@@ -338,12 +405,10 @@ def _locked_update(mutator):
         with _state_lock() as acquired:
             if not acquired:
                 return False          # 沒鎖就跳過保存,絕不無鎖寫入
-            try:
-                cur = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-                if not isinstance(cur, dict):
-                    cur = {}
-            except Exception:
-                cur = {}
+            # ⛔ 鎖內用同一套「驗+清洗」讀(_read_state_locked):
+            #    磁碟上的畸形 record(cooldown_until="bad")若原樣進 mutator,
+            #    merge 的 float() 會炸 → 寫入端永遠修不好那筆壞資料(Codex R11)。
+            cur = _read_state_locked()
             mutator(cur)
             tmp = STATE_FILE.with_suffix(f".json.tmp{os.getpid()}")
             tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -359,9 +424,14 @@ def merge_cooldown(fp: str, record: dict) -> bool:
     def _m(cur):
         old = cur.get(fp)
         if isinstance(old, dict):
+            # ⛔ 不可對舊值直接 float():磁碟上的畸形 record("bad")會讓 float 炸,
+            #    寫入端永遠修不好它(Codex R11)。舊值不是合法數字 → 新 record 直接取代。
+            #    (主防線是 _locked_update 鎖內先過 _read_state_locked 清洗;
+            #     這裡是第二道 —— 清洗被繞過時也不准炸。)
+            _o = old.get("cooldown_until")
             _n = float(record.get("cooldown_until", 0) or 0)
-            _o = float(old.get("cooldown_until", 0) or 0)
-            if _o > _n:
+            if (isinstance(_o, (int, float)) and not isinstance(_o, bool)
+                    and math.isfinite(_o) and _o > _n):
                 return                 # 磁碟上那筆比較晚到期 → 保留它
         cur[fp] = record
     return _locked_update(_m)

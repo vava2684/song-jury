@@ -108,8 +108,10 @@ def run_one(song: Path, timeout=3600):
     r = subprocess.run([str(VENV_PY), str(BASE / "評審團.py"), str(song)],
                        cwd=str(BASE), capture_output=True, text=True, env=env,
                        encoding="utf-8", errors="replace", timeout=timeout, **_NO_WINDOW)
-    # ⛔ 也要看 returncode:程式中途炸掉但檔案已寫出時,光看檔案在不在會誤判成功
-    if r.returncode != 0:
+    # ⛔ 也要看 returncode:程式中途炸掉但檔案已寫出時,光看檔案在不在會誤判成功。
+    #    2 是「報告已完整發布但缺柱」的專用碼(Codex R11)—— 要繼續往下讀,
+    #    交給下面的完整性檢查給出「缺柱:…」的誠實訊息,不是當成炸掉。
+    if r.returncode not in (0, 2):
         return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]
     if not out_json.exists():
         return None, (r.stderr or r.stdout or "")[-300:]

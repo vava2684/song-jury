@@ -7,6 +7,7 @@
 #    bash install.sh --skip-ml      只裝量測+報告(輕量,不含模型耳朵)
 #    bash install.sh --no-auto-tools 不要自動幫我裝 uv/git/ffmpeg
 #    bash install.sh --check-only   什麼都不裝,只檢查現在哪幾根柱子能用
+#    bash install.sh --verify-models 自我檢查後再實跑一遍九柱(模型下載/載入/推論全來真的)
 #
 #  設計原則:**任何一步失敗都不中斷整個安裝**。失敗的記下來,最後一次告訴你
 #  哪幾根柱子會缺、怎麼補。半套能用,總比裝到一半炸掉什麼都沒有好。
@@ -16,19 +17,21 @@
 set -o pipefail
 cd "$(dirname "$0")"
 
-SKIP_ML=0; NO_AUTO=0; CHECK_ONLY=0
+SKIP_ML=0; NO_AUTO=0; CHECK_ONLY=0; VERIFY_MODELS=0
 for a in "$@"; do
   case "$a" in
     --skip-ml)        SKIP_ML=1 ;;
     --no-auto-tools)  NO_AUTO=1 ;;
     --check-only)     CHECK_ONLY=1 ;;
+    --verify-models)  VERIFY_MODELS=1 ;;
     *) echo "未知參數:$a"; exit 1 ;;
   esac
 done
 
+# ⚠️ 步數要跟實際的 step 呼叫數一致(Codex R11:完整安裝最後印 [10/9])
 if   [ "$CHECK_ONLY" = 1 ]; then TOTAL=1
-elif [ "$SKIP_ML"    = 1 ]; then TOTAL=4
-else TOTAL=9; fi
+elif [ "$SKIP_ML"    = 1 ]; then TOTAL=5
+else TOTAL=10; fi
 N=0
 PROBLEMS=()
 C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_YEL='\033[33m'; C_RED='\033[31m'; C_DIM='\033[90m'; C_OFF='\033[0m'
@@ -239,6 +242,27 @@ fi
 # ⛔ ffmpeg 是完整安裝的必要件:一般 WAV 超過 Gemini 內嵌上限,靠它轉檔才評得了
 HAS_FFMPEG=0; have ffmpeg && HAS_FFMPEG=1
 
+# ⛔ 光 grep .env 格式不算「有金鑰」:任意長字串也照樣「九柱齊全、exit 0」
+#    (Codex R11 假金鑰探針)。真的打一次 Google API(models 清單端點,不耗生成配額)。
+#    ⚠️ 網路不通 ≠ 金鑰無效:HTTP 400/401/403 才打回,連不上只警告。
+if [ "$HAS_KEY" = 1 ]; then
+  _KLINE=$(printf '%s\n' "$_ENV_TEXT" | grep -E '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=' | head -n 1)
+  FIRST_KEY=$(printf '%s' "$_KLINE" | sed -E 's/^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*//' \
+              | cut -d, -f1 | tr -d '\042\047[:space:]')
+  if have curl; then
+    HTTP=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+           "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=$FIRST_KEY" 2>/dev/null)
+    case "$HTTP" in
+      200) ok "Gemini 金鑰驗證通過(真的打了一次 Google API;多把金鑰只驗第一把)" ;;
+      400|401|403) HAS_KEY=0
+        bad "Gemini 金鑰無效(HTTP $HTTP)" "格式像金鑰但 Google 不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" ;;
+      *) warn "金鑰驗證連不上 Google(HTTP ${HTTP:-000},網路問題?)—— 先當有;裝完請跑 --check-only 再驗" ;;
+    esac
+  else
+    warn "沒有 curl,金鑰只驗了格式、沒驗有效性"
+  fi
+fi
+
 # ⛔ 不自己猜 demucs 在哪 —— 問評審團.py 自己解析出來的那條路徑(唯一真理來源),
 #    再實際 import 一次確認那個 python 真的有 demucs。
 HAS_DEMUCS=0
@@ -341,6 +365,29 @@ else
   bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"
 fi
 
+# ── 完整驗證(--verify-models)──────────────────────────────────────
+# ⛔ import 檢查證明不了「權重下載得動、模型載入得了、推論跑得完」
+#    (Codex R11:綠燈之後首次實跑才下載 2.86GiB)。這個開關把九柱真的跑一遍,
+#    退出碼交給 評審團.py 的完整性契約(0=完整、2=缺柱)。
+VERIFY_OK=1
+if [ "$VERIFY_MODELS" = 1 ]; then
+  if [ "$HAS_ENV" = 1 ]; then
+    printf "\n      ${C_DIM}--verify-models:實跑 評審團.py demo_mix.wav(首次會下載數 GB 模型權重,會很久)...${C_OFF}\n"
+    rm -f "demo_mix_評審團.json"
+    PYTHONUTF8=1 .venv/bin/python 評審團.py demo_mix.wav
+    VRC=$?
+    if [ "$VRC" -eq 0 ] && [ -f "demo_mix_評審團.json" ]; then
+      ok "完整驗證通過:九柱實跑成功、完整評測=True(證據:demo_mix_評審團.json)"
+    elif [ "$VRC" -eq 2 ]; then
+      bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"; VERIFY_OK=0
+    else
+      bad "完整驗證沒過(退出碼 $VRC)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"; VERIFY_OK=0
+    fi
+  else
+    bad "--verify-models 需要 .venv 可用" "先完成安裝再驗"; VERIFY_OK=0
+  fi
+fi
+
 # ── 總結 ────────────────────────────────────────────────────────────
 printf "\n══════════════════════════════════════════════════\n"
 # ⚠️ 總結要跟柱狀判定一致 ——「每一步都沒報錯」≠「裝好了」:
@@ -368,8 +415,8 @@ USAGE
 
 # ⛔ 退出碼一定要反映結果:失敗項不為零、九柱沒齊、或冒煙測試沒過 → exit 1。
 #    否則自動化/CI/包裝層看到 exit 0 會以為裝好了。
-# ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段)
-if [ "${#PROBLEMS[@]}" -gt 0 ] || [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ] || [ "$SMOKE_OK" != 1 ] || [ "$HAS_FFMPEG" != 1 ]; then
+# ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段);--verify-models 沒過同理
+if [ "${#PROBLEMS[@]}" -gt 0 ] || [ "$(awk "BEGIN{print ($LOST>0)}")" = 1 ] || [ "$SMOKE_OK" != 1 ] || [ "$HAS_FFMPEG" != 1 ] || [ "$VERIFY_OK" != 1 ]; then
   printf "${C_DIM}  (退出碼 1:安裝未完全成功)${C_OFF}\n"
   exit 1
 fi

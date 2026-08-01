@@ -95,6 +95,18 @@ def test_Gemini總分取的是gemini_reported_total而不是total():
     assert dict((n, v) for n, w, v in items2["整體"])["Gemini 總分"] is None
 
 
+def test_退出碼要跟評測完整性一致():
+    """🔴 Codex R11:缺柱評測 exit 0,只看退出碼的外部自動化會把無效分數當成功。
+    契約:0=完整、2=報告已發布但缺柱、其他=失敗。fail-closed:欄位缺/型別錯=2。"""
+    assert J._final_exit_code({"pillar_totals": {"完整評測": True}}) == 0
+    assert J._final_exit_code({"pillar_totals": {"完整評測": False}}) == 2
+    assert J._final_exit_code({"pillar_totals": {}}) == 2
+    assert J._final_exit_code({"pillar_totals": "junk"}) == 2
+    assert J._final_exit_code({}) == 2
+    assert J._final_exit_code({"pillar_totals": {"完整評測": 1}}) == 2, \
+        "1 不是 True —— truthy 放行等於把型別閘門拆掉"
+
+
 def test_Gemini總分是bool時不可以被洗成10分():
     """🔴 Codex R9:整體柱那行舊寫法 `raw * 10.0` —— True*10 == 10.0,
     bool 在 _ev/_evnum 防線之外的最後一條小路又被洗白一次。

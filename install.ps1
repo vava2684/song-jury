@@ -8,18 +8,20 @@
 #    ./install.ps1 -SkipML        只裝量測+報告(輕量,不含模型耳朵)
 #    ./install.ps1 -NoAutoTools   不要自動幫我裝 uv/git/ffmpeg
 #    ./install.ps1 -CheckOnly     什麼都不裝,只檢查現在哪幾根柱子能用
+#    ./install.ps1 -VerifyModels  自我檢查後再實跑一遍九柱(模型下載/載入/推論全來真的)
 #
 #  設計原則:**任何一步失敗都不中斷整個安裝**。失敗的記下來,最後一次告訴你
 #  哪幾根柱子會缺、怎麼補。半套能用,總比裝到一半炸掉什麼都沒有好。
 # ══════════════════════════════════════════════════════════════════════
-param([switch]$SkipML, [switch]$NoAutoTools, [switch]$CheckOnly)
+param([switch]$SkipML, [switch]$NoAutoTools, [switch]$CheckOnly, [switch]$VerifyModels)
 
 $ROOT = $PSScriptRoot
 Set-Location $ROOT
 $ErrorActionPreference = "Continue"      # ⛔ 不用 Stop:單步失敗要能繼續往下走
 $PSNativeCommandUseErrorActionPreference = $false
 
-$TOTAL = if ($CheckOnly) { 1 } elseif ($SkipML) { 4 } else { 9 }
+# ⚠️ 步數要跟實際的 Step 呼叫數一致(Codex R11:完整安裝最後印 [10/9])
+$TOTAL = if ($CheckOnly) { 1 } elseif ($SkipML) { 5 } else { 10 }
 $script:N = 0
 $script:Problems = @()
 
@@ -249,6 +251,28 @@ if (Test-Path ".env") {
 #    (缺它=評 WAV 時 Gemini 六柱項全缺=不完整)。-CheckOnly 也要驗。
 $hasFfmpeg = Have "ffmpeg"
 
+# ⛔ 光 grep .env 格式不算「有金鑰」:任意長字串也照樣「九柱齊全、exit 0」
+#    (Codex R11 假金鑰探針)。真的打一次 Google API 驗證(models 清單端點,
+#    不耗生成配額)。⚠️ 網路不通 ≠ 金鑰無效:認證失敗才打回,連不上只警告。
+if ($hasKey) {
+    $keyLine = (Get-Content ".env" -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '^\s*GEMINI_API_KEYS?\s*=' } | Select-Object -First 1)
+    $firstKey = ($keyLine -replace '^\s*GEMINI_API_KEYS?\s*=\s*', '').Trim().Trim('"').Trim("'").Split(',')[0].Trim()
+    try {
+        Invoke-RestMethod -Uri "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=$firstKey" -TimeoutSec 15 | Out-Null
+        Ok "Gemini 金鑰驗證通過(真的打了一次 Google API;多把金鑰只驗第一把)"
+    } catch {
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -in 400, 401, 403) {
+            $hasKey = $false
+            Bad "Gemini 金鑰無效(HTTP $code)" "格式像金鑰但 Google 不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env"
+        } else {
+            Warn "金鑰驗證連不上 Google(網路問題?)—— 先當有;裝完請跑 -CheckOnly 再驗一次"
+        }
+    }
+}
+
 # 每根柱子:名稱 / 權重 / 完整需要什麼 / 缺了會怎樣
 $sev = ($hasMl -and $hasSongEval)
 # ⚠️ 這張表必須跟 評審團.py 的 PILLAR_ITEMS 實際行為對得起來(已用乾淨 clone 實跑對照):
@@ -356,6 +380,33 @@ if ($hasEnv) {
     $script:SmokeOk = $false
 }
 
+# ── 完整驗證(-VerifyModels)────────────────────────────────────────
+# ⛔ 安裝器的 import 檢查證明不了「權重下載得動、模型載入得了、推論跑得完」
+#    (Codex R11:綠燈之後首次實跑才下載 2.86GiB)。這個開關把九柱真的跑一遍,
+#    退出碼交給 評審團.py 的完整性契約(0=完整、2=缺柱)。
+$script:VerifyOk = $true
+if ($VerifyModels) {
+    if ($hasEnv) {
+        Write-Host "`n      -VerifyModels:實跑 評審團.py demo_mix.wav(首次會下載數 GB 模型權重,會很久)..." -ForegroundColor DarkGray
+        $env:PYTHONUTF8 = "1"
+        Remove-Item "demo_mix_評審團.json" -EA SilentlyContinue
+        & .venv\Scripts\python.exe 評審團.py demo_mix.wav
+        $vrc = $LASTEXITCODE
+        if ($vrc -eq 0 -and (Test-Path "demo_mix_評審團.json")) {
+            Ok "完整驗證通過:九柱實跑成功、完整評測=True(證據:demo_mix_評審團.json)"
+        } elseif ($vrc -eq 2) {
+            Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
+            $script:VerifyOk = $false
+        } else {
+            Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"
+            $script:VerifyOk = $false
+        }
+    } else {
+        Bad "-VerifyModels 需要 .venv 可用" "先完成安裝再驗"
+        $script:VerifyOk = $false
+    }
+}
+
 # ── 總結 ────────────────────────────────────────────────────────────
 Write-Host "`n══════════════════════════════════════════════════" -ForegroundColor White
 # ⚠️ 總結要跟上面的柱狀判定一致。舊版只看 Problems.Count,結果冷安裝實測出現
@@ -387,8 +438,8 @@ if ($Host.Name -eq "ConsoleHost" -and -not $CheckOnly) {
 
 # ⛔ 退出碼一定要反映結果:失敗項不為零、九柱沒齊、或冒煙測試沒過 → exit 1。
 #    否則自動化/CI/包裝層看到 exit 0 會以為裝好了(Codex 實跑遇到 10 項失敗仍回 0)。
-# ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段)
-$failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk) -or (-not $hasFfmpeg)
+# ffmpeg 缺席也算未完成:一般 WAV 會評不完整(見自我檢查段);-VerifyModels 沒過同理
+$failed = ($script:Problems.Count -gt 0) -or ($lost -gt 0) -or (-not $script:SmokeOk) -or (-not $hasFfmpeg) -or (-not $script:VerifyOk)
 if ($failed) {
     Write-Host "  (退出碼 1:安裝未完全成功)" -ForegroundColor DarkGray
     exit 1

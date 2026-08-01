@@ -257,17 +257,7 @@ def test_同一把金鑰同時只准一個工作在打(tmp_path, monkeypatch):
             assert other == "ok", "不同金鑰不應互相卡"
 
 
-def _break_lock_backend(monkeypatch):
-    """把 OS 鎖後端弄壞(ENOLCK:網路 FS 不支援鎖的典型錯誤)。"""
-    import errno as _e
-    if sys.platform == "win32":
-        import msvcrt
-        monkeypatch.setattr(msvcrt, "locking",
-                            lambda fd, m, n: (_ for _ in ()).throw(OSError(_e.ENOLCK, "no locks")))
-    else:
-        import fcntl
-        monkeypatch.setattr(fcntl, "flock",
-                            lambda fd, fl: (_ for _ in ()).throw(OSError(_e.ENOLCK, "no locks")))
+from conftest import break_lock_backend as _break_lock_backend
 
 
 def test_鎖壞掉不可以被當成有人持有(tmp_path, monkeypatch):
@@ -303,6 +293,26 @@ def test_鎖壞掉整條鏈fail_closed一次都不打(tmp_path, monkeypatch):
     assert meta["keys_tried"] == 0, "沒真的打出去就不可以計入 keys_tried"
     assert "租約鎖" in (meta["degraded_reason"] or ""), \
         f"🔴 原因要誠實說是租約鎖,不可推給冷卻:{meta['degraded_reason']!r}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink 語意(Windows 建 symlink 需特權)")
+def test_工作鎖不跟隨symlink不可覆寫別人的檔案(tmp_path):
+    """🔴 Codex R11 探針:共享狀態目錄預植 `job_<hash>.lock -> victim.txt`,
+    進 _job_lock 後 victim 被改寫成 pid=…。safe_open_lock 用 O_NOFOLLOW 拒開,
+    工作鎖 fail-closed 退出,victim 一個 byte 都不可以動。"""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("珍貴資料", encoding="utf-8")
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    lockf = J._lock_path_for(song)
+    if lockf.exists():
+        lockf.unlink()
+    lockf.symlink_to(victim)
+    with pytest.raises(SystemExit):
+        with J._job_lock(song):
+            pass
+    assert victim.read_text(encoding="utf-8") == "珍貴資料", \
+        "🔴 pid 被寫進 victim —— 鎖檔跟著 symlink 走了"
 
 
 def test_工作鎖壞掉要硬擋不可裝沒事(tmp_path, monkeypatch):

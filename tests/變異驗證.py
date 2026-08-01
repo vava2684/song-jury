@@ -174,6 +174,61 @@ MUTATIONS = [
      "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
+    # ── Codex 第十一輪:隔離競態、狀態上限、修復寫入、退出碼契約、安裝驗證 ──
+    ("隔離退回無鎖 rename(寫入者剛發布的新狀態被搬去 .corrupt)",
+     "Gemini曲評.py",
+     '    try:\n        with _state_lock(timeout=5.0) as acquired:\n            if acquired:\n                _read_state_locked()   # 內含「重讀→還是壞的才隔離」;好檔原樣保留\n    except Exception:\n        pass',
+     '    try:\n        bad = STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt.{uuid.uuid4().hex[:8]}")\n        STATE_FILE.rename(bad)\n    except Exception:\n        pass',
+     "tests/test_state_and_cooldown.py::test_隔離前要鎖內重讀_新狀態不可被搬走"),
+
+    ("狀態檔大小上限拆掉(16MiB 垃圾檔整份讀進記憶體)",
+     "Gemini曲評.py",
+     '    if size > MAX_STATE_BYTES:\n        _quarantine_locked(f"檔案 {size} bytes 超過上限 {MAX_STATE_BYTES}")\n        return {}',
+     '    if size > MAX_STATE_BYTES and False:\n        _quarantine_locked(f"檔案 {size} bytes 超過上限 {MAX_STATE_BYTES}")\n        return {}',
+     "tests/test_state_and_cooldown.py::test_狀態檔超過大小上限要隔離不吃記憶體"),
+
+    ("merge 對畸形舊 record 直接 float(寫入端永遠修不好壞資料)",
+     "Gemini曲評.py",
+     '            _o = old.get("cooldown_until")\n            _n = float(record.get("cooldown_until", 0) or 0)\n            if (isinstance(_o, (int, float)) and not isinstance(_o, bool)\n                    and math.isfinite(_o) and _o > _n):\n                return                 # 磁碟上那筆比較晚到期 → 保留它',
+     '            _n = float(record.get("cooldown_until", 0) or 0)\n            _o = float(old.get("cooldown_until", 0) or 0)\n            if _o > _n:\n                return',
+     "tests/test_state_and_cooldown.py::test_merge對畸形舊record要直接取代不可炸"),
+
+    ("相對的 SONG_JURY_STATE_DIR 被放行(互斥域隨 cwd 分裂)",
+     "狀態目錄.py",
+     '        if not d.is_absolute():',
+     '        if False:',
+     "tests/test_state_dir.py::test_相對override要被拒絕"),
+
+    ("狀態目錄錯誤退回原始 traceback(FileExistsError 噴在保護層外)",
+     "狀態目錄.py",
+     '    except FileExistsError:\n        raise StateDirError(f"狀態目錄的位置被一個普通檔案佔住:{d} —— 請移走那個檔案")',
+     '    except FileExistsError:\n        raise',
+     "tests/test_state_dir.py::test_override指到普通檔案要講人話不可原始traceback"),
+
+    ("不完整評測照樣 exit 0(外部自動化把無效分數當成功)",
+     "評審團.py",
+     '    pt = merged.get("pillar_totals")\n    if isinstance(pt, dict) and pt.get("完整評測") is True:\n        return 0\n    return 2',
+     '    pt = merged.get("pillar_totals")\n    return 0            # 變異:一律成功',
+     "tests/test_pillars.py::test_退出碼要跟評測完整性一致"),
+
+    ("批次把 exit 2 當一般失敗(昂貴的不完整報告被丟掉)",
+     "批次評測.py",
+     '    if r.returncode not in (0, 2):',
+     '    if r.returncode != 0:',
+     "tests/test_packaging.py::test_批次與網頁版要接受退出碼2的不完整報告"),
+
+    ("安裝器金鑰驗證退回純格式檢查(任意字串被當有效金鑰)",
+     "install.ps1",
+     'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=$firstKey',
+     'https://example.invalid/?key=$firstKey',
+     "tests/test_packaging.py::test_安裝腳本真的驗金鑰有效性且有完整驗證開關"),
+
+    ("安裝步數又少算(完整安裝印 [10/9])",
+     "install.ps1",
+     '$TOTAL = if ($CheckOnly) { 1 } elseif ($SkipML) { 5 } else { 10 }',
+     '$TOTAL = if ($CheckOnly) { 1 } elseif ($SkipML) { 4 } else { 9 }',
+     "tests/test_packaging.py::test_安裝步數要跟實際步驟一致"),
+
     # ── Codex 第十輪:鎖跨副本、狀態 schema、冷卻持久化、顯示層防炸 ──────
     ("鎖位置退回 BASE(兩份 ZIP 副本各鎖各的,互斥只在單一副本內成立)",
      "評審團.py",
@@ -183,7 +238,7 @@ MUTATIONS = [
 
     ("狀態檔頂層不驗型別(合法 JSON 的 [] 讓 Gemini 整關炸掉)",
      "Gemini曲評.py",
-     '    if not isinstance(raw, dict):\n        _quarantine_state(f"頂層是 {type(raw).__name__},應為 dict")\n        return {}',
+     '    if not isinstance(raw, dict):\n        _quarantine_locked(f"頂層是 {type(raw).__name__},應為 dict")\n        return {}',
      '    if not isinstance(raw, dict):\n        return raw             # 變異:合法 JSON 就直接交出去',
      "tests/test_state_and_cooldown.py::test_狀態檔頂層不是dict要隔離成corrupt不可炸"),
 
@@ -345,7 +400,7 @@ MUTATIONS = [
 
     ("批次不看 returncode(程式炸掉但檔案已寫出 → 誤判成功)",
      "批次評測.py",
-     'if r.returncode != 0:\n        return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]',
+     'if r.returncode not in (0, 2):\n        return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]',
      'if False:\n        pass',
      "tests/test_batch_and_windows.py::test_子程序失敗但已寫出檔案時仍要判失敗"),
 

@@ -35,7 +35,7 @@ BASE = Path(__file__).parent.resolve()
 ENV = {**os.environ, "PYTHONUTF8": "1"}
 
 # 鎖檔的全域位置(⛔ 不放 BASE:兩份 ZIP 副本會各鎖各的,互斥失效 —— Codex R10)
-from 狀態目錄 import state_root
+from 狀態目錄 import state_root, StateDirError, safe_open_lock
 
 # Windows:子程序不要各自彈出主控台黑框(一次評測會開好幾個子程序)。Linux 無此旗標 → 空 dict。
 _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {}
@@ -847,8 +847,10 @@ def _lock_path_for(song: Path) -> Path:
        鎖 backend 一壞就得在「fail-open(取消互斥)」與「擋住使用者」之間二選一。
     ⛔ 也不放在 BASE(工具資料夾)底下:電腦上同時存在兩份 ZIP 副本
        (新舊版並存、App 與 CLI 來自不同資料夾)時,各副本各鎖各的,
-       對同一首歌照樣雙雙進鎖(Codex R10 實測)。鎖要鎖「這台機器上的這首歌」,
-       所以位置必須跟副本無關 —— 見 狀態目錄.py。
+       對同一首歌照樣雙雙進鎖(Codex R10 實測)。鎖要鎖「同一位使用者手上的
+       這首歌」,所以位置必須跟副本無關 —— 見 狀態目錄.py。
+    ⚠️ 誠實的邊界(Codex R11):互斥範圍=同一台機器的**同一位 OS 使用者**。
+       兩個帳號(登入使用者 vs 排程服務)同評一個共享音檔仍會互踩,不要那樣用。
        鎖檔 0 byte、永不刪(flock inode 陷阱)。"""
     d = state_root() / "_locks"
     d.mkdir(exist_ok=True)
@@ -871,20 +873,21 @@ def _job_lock(song: Path):
        互斥失效 —— 這是 flock 的經典陷阱。留一個隱藏小檔是正確的代價。
     ⚠️ 這把鎖只擋「同一個音檔」,不同的歌(含 SUNO 抽卡的各個 take)照樣並行。
     """
-    # ⭐ 鎖檔放在**本機狀態目錄** BASE/_locks(以歌曲絕對路徑的雜湊命名),
-    #    不放在歌曲來源資料夾 —— 歌可能在 NFS/SMB 這種不支援鎖的網路磁碟上,
-    #    而工具目錄一定是使用者可寫的本機路徑,鎖 backend「壞掉」的情境幾乎消失,
-    #    剩下的極端錯誤就能安心 fail-closed(Codex 的建議,取代先前不安全的 fail-open)。
-    lockf = _lock_path_for(song)
+    # ⭐ 鎖檔放在**使用者全域狀態目錄**(以歌曲絕對路徑的雜湊命名),
+    #    不放歌旁邊(網路磁碟鎖不可靠)也不放 BASE(副本分裂)。
+    #    路徑計算與開檔都要在保護層**裡面**:狀態目錄壞掉(覆寫指到普通檔案/
+    #    相對路徑/_locks 被塞成檔案)不可以噴原始 traceback(Codex R11)。
     try:
-        f = open(lockf, "a+", encoding="utf-8")
-    except Exception as e:
+        lockf = _lock_path_for(song)
+        # ⛔ safe_open_lock:不跟隨 symlink、驗普通檔案 —— 共享目錄預植
+        #    `job_<hash>.lock -> victim` 可把 pid 寫進任意檔案(Codex R11 探針)
+        f = safe_open_lock(lockf)
+    except Exception as e:               # 含 StateDirError(訊息自帶路徑與原因)
         # ⛔ fail-closed:放行 = 取消互斥(Codex 注入 error 實測兩個工作雙雙進場,
         #    中間檔互踩重演)。鎖建不起來就不評,講清楚原因與出路。
         sys.exit(f"⛔ 無法建立工作鎖({type(e).__name__}: {e})。\n"
-                 f"   鎖檔位置:{lockf}\n"
-                 f"   → 請確認本工具所在資料夾可寫;若整個資料夾在網路磁碟上,"
-                 f"請把工具移到本機磁碟再跑。")
+                 f"   → 請確認狀態目錄可用(SONG_JURY_STATE_DIR 需為絕對路徑、"
+                 f"指向本機磁碟且為目前使用者所有)。")
     import errno
     _BUSY = {errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
              getattr(errno, "EDEADLK", -1), getattr(errno, "EDEADLOCK", -1)}
@@ -1297,6 +1300,18 @@ def _evaluate(song: Path):
         print(f"\n⚠ 摘要顯示失敗({type(e).__name__}: {e})—— 這只是顯示問題,"
               f"評測本身已完成且報告完整寫出。")
         print(f"完整報告:{out_path}")
+    sys.exit(_final_exit_code(merged))
+
+
+def _final_exit_code(merged: dict) -> int:
+    """程序退出碼要跟評測完整性一致(Codex R11):
+    0 = 完整評測;2 = **報告已完整發布**但缺柱(可讀、不可互比/排行);其他 = 失敗。
+    ⛔ 不完整卻回 0,任何只看退出碼的外部自動化都會把無效分數當成功。
+       批次/網頁版看到 2 要照樣讀報告,顯示「已完成但不可採信」,不是丟掉昂貴產物。"""
+    pt = merged.get("pillar_totals")
+    if isinstance(pt, dict) and pt.get("完整評測") is True:
+        return 0
+    return 2
 
 
 if __name__ == "__main__":

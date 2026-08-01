@@ -200,7 +200,9 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     # ⛔ 一定要用 .venv 跑 評審團.py:它自己的相依(含 yt-dlp)裝在 .venv,
     #    而且它會用 sys.executable 去呼叫 yt-dlp。用 .venv-ml 跑會找不到已裝好的 yt-dlp。
     r = _run([_venv_py(".venv"), str(BASE / "評審團.py"), str(src)])
-    if r.returncode != 0:
+    # ⛔ 2 = 報告已完整發布但缺柱(Codex R11 專用碼):照樣往下讀,
+    #    下面的完整性區塊會掛「⛔ 這不是一份完整評測」;丟掉昂貴產物才是錯的。
+    if r.returncode not in (0, 2):
         return [], None, "", f"❌ 音訊評分失敗:\n```\n{(r.stderr or r.stdout)[-1000:]}\n```"
     jpath = _jpath_from_stdout(r.stdout)
     if not jpath or not jpath.exists():

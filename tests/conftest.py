@@ -26,6 +26,19 @@ def load(module_name: str):
 import pytest
 
 
+def break_lock_backend(monkeypatch):
+    """把 OS 鎖後端弄壞(ENOLCK:網路 FS 不支援鎖的典型錯誤)。多個測試檔共用。"""
+    import errno as _e
+    if sys.platform == "win32":
+        import msvcrt
+        monkeypatch.setattr(msvcrt, "locking",
+                            lambda fd, m, n: (_ for _ in ()).throw(OSError(_e.ENOLCK, "no locks")))
+    else:
+        import fcntl
+        monkeypatch.setattr(fcntl, "flock",
+                            lambda fd, fl: (_ for _ in ()).throw(OSError(_e.ENOLCK, "no locks")))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_state_dir(tmp_path, monkeypatch):
     """每條測試都把全域狀態目錄(工作鎖/Gemini 冷卻)導到自己的 tmp。
