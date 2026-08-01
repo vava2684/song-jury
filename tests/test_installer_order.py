@@ -43,7 +43,7 @@ def test_ps1的驗證順序_裁判先看到報告清理在最後(tmp_path):
     j = src.index("# <verify-block-end>")
     # 直譯器換成本測試的 python:單純複製 python.exe 到假 venv 是跑不起來的
     # (缺 DLL/stdlib);這條測的是**順序**,不是路徑字面。
-    block = src[i:j].replace(".venv\Scripts\python.exe", f'"{sys.executable}"')
+    block = src[i:j].replace(r".venv\Scripts\python.exe", f'"{sys.executable}"')
     # stub:jury 寫出報告並 exit 0;裁判把「我看到報告了嗎」寫進見證檔
     (tmp_path / "評審團.py").write_text(
         "import sys, pathlib\n"
@@ -80,9 +80,9 @@ def test_ps1的驗證順序_裁判先看到報告清理在最後(tmp_path):
 @pytest.mark.skipif(sys.platform == "win32", reason="bash 版")
 def test_sh的驗證順序_裁判先看到報告清理在最後(tmp_path):
     src = (REPO / "install.sh").read_text(encoding="utf-8")
-    i = src.index('VID="verify_')
-    j = src.index("  else\n    bad \"--verify-models", i)
-    block = src[i:j]
+    i = src.index("# <verify-block-start>")
+    j = src.index("# <verify-block-end>")
+    block = src[i:j].replace(".venv/bin/python", f'"{sys.executable}"')
     (tmp_path / "評審團.py").write_text(
         "import sys, pathlib\n"
         "p = pathlib.Path(sys.argv[1]).with_name(pathlib.Path(sys.argv[1]).stem + '_評審團.json')\n"
