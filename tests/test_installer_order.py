@@ -166,8 +166,13 @@ def _stub_repo(tmp_path, code):
 
 @pytest.mark.parametrize("code,expect", _MATRIX)
 def test_ps1把helper的退出碼照契約傳出(tmp_path, code, expect):
-    exe = shutil.which("pwsh") or (shutil.which("powershell")
-                                   if sys.platform == "win32" else None)
+    # ⚠️ install.ps1 是**Windows 專用**安裝器:它找的是 .venv\Scripts\python.exe。
+    #    CI 的 ubuntu/macOS 也有 pwsh,但那裡的 venv 是 bin/python → 自我檢查
+    #    永遠判 base 環境不可用,根本走不到驗證段(第一次推上 CI 就踩到)。
+    #    ⛔ 這條在 POSIX 上跳過**不是**放水:那邊的對應契約由 install.sh 那組驗。
+    if sys.platform != "win32":
+        pytest.skip("install.ps1 是 Windows 安裝器(venv layout 不同);POSIX 看 install.sh 那組")
+    exe = shutil.which("pwsh") or shutil.which("powershell")
     if not exe:
         pytest.skip("這台沒有 PowerShell")
     d = _stub_repo(tmp_path, code)
