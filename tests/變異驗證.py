@@ -201,7 +201,8 @@ MUTATIONS = [
      '                return True\n'
      '        return False\n'
      '    globals()["_SJ_NO_RESCUE"] = True    # 變異:同時拔掉第二輪救援',
-     "tests/test_demucs_resolve.py::test_專案venv要贏過全域conda"),
+     "tests/test_demucs_resolve.py::test_專案venv要贏過全域conda",
+     "win32"),   # ⚠ Windows 專屬:POSIX 的 py.parent.parent 本來就對,這個 bug 不存在
 
     ("process env 的一般金鑰又被借走(拿別條產線的付費額度)",
      "金鑰政策.py",
@@ -676,7 +677,18 @@ def main():
         return 1
 
     bad, skipped = [], []
-    for i, (desc, fname, old, new, target) in enumerate(MUTATIONS, 1):
+    for i, item in enumerate(MUTATIONS, 1):
+        # 第 6 個元素(可選)= 這條變異只在哪個平台成立。
+        # ⛔ 有些 bug 是平台專屬的(例:Windows venv 的 site-packages layout),
+        #    在別的平台上「沒抓到」不是測試爛,是那個 bug 在那裡根本不存在。
+        #    硬算進 bad 會逼人去修一個假問題(CI ubuntu 實際踩到)。
+        desc, fname, old, new, target = item[:5]
+        only = item[5] if len(item) > 5 else None
+        if only and sys.platform != only:
+            print(f"\n[{i}/{len(MUTATIONS)}] ⏭ 無法驗證:{desc}")
+            print(f"        → 這條是 {only} 專屬的缺陷,本平台({sys.platform})不成立")
+            skipped.append(("platform", desc))
+            continue
         p = REPO / fname
         # ⛔ 一定要用二進位讀寫:read_text/write_text 在 Windows 會做換行轉換,
         #    「還原」時會把 LF 檔案寫成 CRLF,把原始碼弄髒(自己踩過)。
