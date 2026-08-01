@@ -494,6 +494,17 @@ def _pwsh():
                                     if sys.platform == "win32" else None)
 
 
+def _bash():
+    """⚠️ Windows 上 `bash` 常常是 **WSL 的** bash(C:\\Windows\\System32\\bash.exe):
+    它吃不了 Windows 路徑,拿它跑 install.sh 只會得到 127 —— 那是環境問題,
+    不是安裝器的錯,不可以讓它變成假的紅燈(在乾淨 clone 裡實測踩到)。
+    要驗 install.sh 就用 Git Bash,或到 Linux/macOS(CI 兩邊都會跑)。"""
+    exe = shutil.which("bash")
+    if exe and sys.platform == "win32" and "system32" in exe.lower():
+        return None
+    return exe
+
+
 def test_安裝器要擋下未知參數_真的跑一次():
     """🔴 Codex R16-11:未知 switch 被靜默忽略 —— 把 -VerifyModels 拼錯的人
     會拿到普通安裝的綠燈,卻以為做過完整模型驗證(最危險的假證據)。
@@ -514,15 +525,17 @@ def test_安裝器要擋下未知參數_真的跑一次():
                             "-CheckOnly", "-NoAutoTools", "-VerifyModles"],
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=600, cwd=str(REPO))
-        assert r.returncode == 64, f"🔴 install.ps1 沒擋下拼錯的參數(拿到 {r.returncode})"
+        assert r.returncode == 64, \
+            f"🔴 install.ps1 沒擋下拼錯的參數(拿到 {r.returncode}):{r.stdout[-300:]}"
         ran.append("ps1")
-    bash = shutil.which("bash")
+    bash = _bash()
     if bash:
         r = subprocess.run([bash, str(REPO / "install.sh"),
                             "--check-only", "--no-auto-tools", "--verify-modles"],
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=600, cwd=str(REPO))
-        assert r.returncode == 64, f"🔴 install.sh 沒擋下拼錯的參數(拿到 {r.returncode})"
+        assert r.returncode == 64, \
+            f"🔴 install.sh 沒擋下拼錯的參數(拿到 {r.returncode}):{(r.stdout + r.stderr)[-300:]}"
         ran.append("sh")
     if not ran:
         pytest.skip("這台機器沒有 pwsh 也沒有 bash,兩支安裝器都跑不起來")
