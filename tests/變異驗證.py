@@ -174,11 +174,96 @@ MUTATIONS = [
      "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
+    # ── Codex 第十五輪:schema 必填、契約版本、政策唯一來源、比較器規則 ────
+    ("裁判又讓 items/missing 可省略(不完整 schema 被蓋章)",
+     "驗證報告.py",
+     '        if "items" not in det:',
+     '        if False:',
+     "tests/test_keyprobe_and_verify.py::test_柱的內層schema壞掉要拒收"),
+
+    ("缺柱權重合計用 default 0(缺鍵被偽造成合法)",
+     "驗證報告.py",
+     '    if "缺柱權重合計" not in pt:',
+     '    if False:',
+     "tests/test_keyprobe_and_verify.py::test_缺欄位一律要拒收"),
+
+    ("曲側含柱退回 optional(缺鍵/dict 都矇混過關)",
+     "驗證報告.py",
+     '    if "曲側含柱" not in pt:',
+     '    if False:',
+     "tests/test_keyprobe_and_verify.py::test_缺欄位一律要拒收"),
+
+    ("合成容差放回 0.15(放過一整個顯示刻度的錯)",
+     "驗證報告.py",
+     'COMPOSITE_TOL = 0.05',
+     'COMPOSITE_TOL = 0.15',
+     "tests/test_keyprobe_and_verify.py::test_合成差一個刻度也要抓到"),
+
+    ("不認得的計分契約照樣放行(舊報告/竄改版被蓋章)",
+     "驗證報告.py",
+     '        if not isinstance(cname, str) or cname not in CONTRACTS:',
+     '        if False:',
+     "tests/test_keyprobe_and_verify.py::test_不認得的計分契約要拒收"),
+
+    ("秘密檔只驗 leaf(父目錄 junction 借用別條產線)",
+     "金鑰政策.py",
+     '        if parent.is_symlink() or (os.name == "nt" and _is_reparse(pst)):',
+     '        if False:',
+     "tests/test_key_policy.py::test_父目錄是連結要拒絕"),
+
+    ("政策錯誤被洗成「沒有金鑰」(自動化分不出安全問題與沒填)",
+     "金鑰驗證.py",
+     '    if policy_error:',
+     '    if False:',
+     "tests/test_keyprobe_and_verify.py::test_政策錯誤要用獨立退出碼"),
+
+    ("PK 不要求指定語言(跨語言尺被硬比)",
+     "比較.py",
+     '    if not lang:',
+     '    if False:',
+     "tests/test_compare.py::test_PK要指定語言"),
+
+    ("比較器不檢查計分契約(換了尺照樣比)",
+     "比較.py",
+     '    if len(names) > 1:',
+     '    if False:',
+     "tests/test_compare.py::test_不同計分契約不可比"),
+
+    ("比較器不過獨立裁判(不完整報告混進排名)",
+     "比較.py",
+     '    why = validate(path)',
+     '    why = ""',
+     "tests/test_compare.py::test_不完整的報告不可以進比較"),
+
+    ("並列門檻拆掉(0.3 分的差距被當成真的高下)",
+     "比較.py",
+     '        tie = i > 0 and (ordered[i - 1]["composite"] - it["composite"]) < TIE_THRESHOLD',
+     '        tie = False',
+     "tests/test_compare.py::test_差距很小要標並列不是硬排名次"),
+
+    ("批次退回「只收完整九柱」(預設模式每首都被拒收)",
+     "批次評測.py",
+     '    extra = lost - GEMINI_ONLY_PILLARS',
+     '    extra = lost',
+     "tests/test_batch_and_windows.py::test_預設批次收得到結果而不是每首都拒收"),
+
+    ("VerifyModels 拿掉外層 timeout(模型 deadlock 就永遠掛著)",
+     "install.ps1",
+     # ⚠ 要**整行**拿掉:只改前半的話,同一行後段與訊息裡的變數名還在,
+     #   grep 型的測試照樣命中(裝飾品)。
+     '            $vTimeout = if ($env:SONG_JURY_VERIFY_TIMEOUT) { $env:SONG_JURY_VERIFY_TIMEOUT } else { "7200" }',
+     '            $vTimeout = "7200"   # 變異:拿掉可設定的逾時',
+     "tests/test_packaging.py::test_VerifyModels要有外層timeout",
+     "win32"),
+
     # ── Codex 第十四輪:驗證順序、失敗路徑殺樹、裁判自洽、政策 fail-closed ──
+    # ⚠ 要注入的是**順序錯誤**(清理跑在裁判之前),不是「不叫裁判」——
+    #   後者是另一種缺陷,描述與注入不一致就等於沒驗到那個 bug(Codex R15)。
     ("VerifyModels 先清理才叫裁判(成功路徑必定假陰性)",
      "install.ps1",
-     '            if ($vrc -eq 0) {\n                & .venv\\Scripts\\python.exe 驗證報告.py',
-     '            if ($false) {\n                & .venv\\Scripts\\python.exe 驗證報告.py',
+     '            if ($vrc -eq 124) {',
+     '            Get-ChildItem -File -Filter "$vid*" -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue\n'
+     '            if ($vrc -eq 124) {',
      "tests/test_installer_order.py::test_ps1的驗證順序_裁判先看到報告清理在最後",
      "win32"),
 
@@ -227,7 +312,7 @@ MUTATIONS = [
 
     ("裁判不驗柱的內層 schema(items=[]、missing='junk' 照過)",
      "驗證報告.py",
-     '        if items is not None and not isinstance(items, dict):',
+     '        if not isinstance(det["items"], dict):',
      '        if False:',
      "tests/test_keyprobe_and_verify.py::test_柱的內層schema壞掉要拒收"),
 
@@ -456,7 +541,7 @@ MUTATIONS = [
      "批次評測.py",
      '    if r.returncode not in (0, 2):',
      '    if r.returncode != 0:',
-     "tests/test_batch_and_windows.py::test_退出碼2的缺柱報告要讀進來給誠實訊息"),
+     "tests/test_batch_and_windows.py::test_退出碼2的缺柱報告要讀進來不可當成程式炸掉"),
 
     ("安裝器又內嵌金鑰探針(繞過 金鑰驗證.py 的逐把/三態契約)",
      "install.ps1",
@@ -531,11 +616,11 @@ MUTATIONS = [
      'SJ_STEP_LOG="/tmp/_sj_step.log"',
      "tests/test_packaging.py::test_install_sh不可用固定tmp檔且要容忍BOM"),
 
-    ("金鑰自檢不剝 BOM(PS5.1 寫的 .env 在 WSL 被判沒金鑰)",
-     "install.sh",
-     r'''  _ENV_TEXT="$(sed "1s/^$(printf '\357\273\277')//" .env 2>/dev/null || cat .env)"''',
-     r'''  _ENV_TEXT="$(cat .env)"''',
-     "tests/test_packaging.py::test_install_sh不可用固定tmp檔且要容忍BOM"),
+    ("讀 .env 不吃 BOM(PS5.1 寫的 .env 被判成沒金鑰)",
+     "金鑰政策.py",
+     '        text = p.read_text(encoding="utf-8-sig")',
+     '        text = p.read_text(encoding="utf-8")',
+     "tests/test_keyprobe_and_verify.py::test_BOM開頭的env也讀得到金鑰"),
 
     ("ffmpeg 從退出碼移除(缺它仍 exit 0=假完整)",
      "install.ps1",
@@ -773,12 +858,24 @@ def main():
         #    「還原」時會把 LF 檔案寫成 CRLF,把原始碼弄髒(自己踩過)。
         raw = p.read_bytes()
         src = raw.decode("utf-8")
-        if old not in src:
+        # ⛔ 比對前要把換行正規化(Codex R15 抓到的假驗證):
+        #    .gitattributes 規定 *.ps1 / *.bat 是 CRLF,所以**任何 clone 拿到的
+        #    工作區都是 CRLF**;而變異 pattern 寫在 .py 裡一律是 LF。
+        #    我本機因為都用編輯器寫檔、還沒被 git 轉過,工作區是 LF —— 於是
+        #    「我這台抓到、別人那台找不到字串」,我宣稱的通過率對別人不成立。
+        #    → 比對/替換都在正規化後的文字上做,寫回時換回原檔的換行,
+        #      還原一律用原始 bytes(逐位元)。
+        crlf = "\r\n" in src
+        norm = src.replace("\r\n", "\n") if crlf else src
+        if old not in norm:
             print(f"\n[{i}/{len(MUTATIONS)}] ⚠ 跳過:在 {fname} 找不到要變異的字串")
             print(f"        ({desc})  ← 程式改過了?請更新這條變異")
             bad.append(desc)
             continue
-        p.write_bytes(src.replace(old, new, 1).encode("utf-8"))
+        mutated = norm.replace(old, new, 1)
+        if crlf:
+            mutated = mutated.replace("\n", "\r\n")
+        p.write_bytes(mutated.encode("utf-8"))
         try:
             failed, ran = run_pytest(target)
         finally:

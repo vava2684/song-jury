@@ -19,7 +19,9 @@
    0 = 至少一把 verified(部分壞的照樣列出來警告)
    1 = 全部 invalid(格式像金鑰但 Google 全不認)→ 視同沒金鑰
    3 = 沒有任何 verified,且有 cooling/unknown → 「未能驗證」,不可宣稱九柱齊全
-   4 = .env 裡沒有(非佔位的)金鑰
+   4 = 找不到可用金鑰(沒填/只有佔位字串)
+   5 = **金鑰政策無效**(拒絕名單格式錯、秘密檔來源可疑)——
+       ⛔ 跟 4 分開:那是安全設定壞了,叫使用者去申請新 key 沒有用(Codex R15)
 """
 import sys
 import urllib.error
@@ -36,8 +38,8 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 from 金鑰政策 import effective_keys
 
 
-def parse_keys(env_path: Path) -> list:
-    """讀出**執行期真正會用的那組金鑰**(順序即嘗試順序)。
+def parse_keys(env_path: Path):
+    """讀出**執行期真正會用的那組金鑰**(順序即嘗試順序)。回 (keys, policy_error)。
 
     ⛔ 這裡絕不可以自己再解析一次 .env:驗證器與執行期各解析各的,就會
        「驗 A、跑 B」——`.env=A` 但 process env 有 B/C 時驗證形同虛設,
@@ -46,7 +48,10 @@ def parse_keys(env_path: Path) -> list:
     keys, notes = effective_keys(env_path)
     for n in notes:
         print(n)
-    return keys
+    # ⛔ 「政策壞掉」與「沒填金鑰」是兩件事,不可以混成同一個退出碼:
+    #    GUI/自動化只能靠解析人類文字猜(Codex R15)。政策問題回 5。
+    policy_error = any("政策無效" in n for n in notes)
+    return keys, policy_error
 
 
 def probe_key(key: str):
@@ -67,9 +72,12 @@ def probe_key(key: str):
 
 def main(argv) -> int:
     env_path = Path(argv[1]) if len(argv) > 1 else Path(".env")
-    keys = parse_keys(env_path)
+    keys, policy_error = parse_keys(env_path)
+    if policy_error:
+        print("KEYPROBE verified=0 invalid=0 cooling=0 unknown=0 total=0 policy_error=1")
+        return 5
     if not keys:
-        print("KEYPROBE verified=0 invalid=0 cooling=0 unknown=0 total=0")
+        print("KEYPROBE verified=0 invalid=0 cooling=0 unknown=0 total=0 policy_error=0")
         return 4
     counts = {"verified": 0, "invalid": 0, "cooling": 0, "unknown": 0}
     for i, k in enumerate(keys, 1):
@@ -79,7 +87,7 @@ def main(argv) -> int:
         print(f"KEY {i} …{fp} {status}" + (f" HTTP{code}" if code else ""))
     print("KEYPROBE " + " ".join(f"{s}={counts[s]}" for s in
                                  ("verified", "invalid", "cooling", "unknown"))
-          + f" total={len(keys)}")
+          + f" total={len(keys)} policy_error=0")
     if counts["verified"] > 0:
         return 0
     if counts["invalid"] == len(keys):

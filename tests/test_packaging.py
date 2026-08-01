@@ -291,7 +291,12 @@ def test_install_sh不可用固定tmp檔且要容忍BOM():
     sh = (REPO / "install.sh").read_text(encoding="utf-8")
     assert "/tmp/_sj_step.log" not in sh, "🔴 固定共用 log 檔回來了"
     assert "mktemp" in sh, "step log 要用 mktemp 建專屬檔"
-    assert r"\357\273\277" in sh, "🔴 金鑰自檢沒剝 BOM —— PS5.1 寫的 .env 會被誤判成沒金鑰"
+    # ⚠️ BOM 容忍已經不在 shell 裡了:R15 起 .env 一律交給 金鑰政策 解析(utf-8-sig)。
+    #    shell 不可以再自己 grep/剝 —— 那就是第二套政策,會漏掉專用變數。
+    assert "utf-8-sig" in (REPO / "金鑰政策.py").read_text(encoding="utf-8"), \
+        "🔴 金鑰政策沒用 utf-8-sig 讀 .env —— PS5.1 寫的 BOM 檔會被誤判成沒金鑰"
+    assert "GEMINI_API_KEYS?" not in sh, \
+        "🔴 install.sh 又自己 grep .env 的金鑰了 —— 前置判斷會漏掉專用變數(R15)"
 
 
 def test_安裝腳本把ffmpeg當完整安裝必要件():
@@ -417,3 +422,25 @@ def test_範例歌的實際位元率要跟README對得上():
         for p in mp3s:
             mb = p.stat().st_size / 1024 / 1024
             assert 2.5 <= mb <= 12, f"{p.name} 大小 {mb:.1f}MB 不像 ~180kbps 的 3–5 分鐘歌"
+
+
+def test_VerifyModels要有外層timeout():
+    """🔴 Codex R15:`& python 評審團.py` 沒有任何外層 timeout —— 模型載入真的
+    deadlock 時只能靠人工中斷,而硬 kill 不保證跑得到 finally(清理與環境還原)。"""
+    for name in ("install.ps1", "install.sh"):
+        src = (REPO / name).read_text(encoding="utf-8")
+        # ⚠️ 不可以只 grep 變數名 —— 註解裡也寫著它,程式改壞照樣命中(裝飾品)。
+        knob = ("$env:SONG_JURY_VERIFY_TIMEOUT" if name.endswith(".ps1")
+                else "${SONG_JURY_VERIFY_TIMEOUT:-")
+        assert knob in src, f"{name} 沒有真的讀 SONG_JURY_VERIFY_TIMEOUT"
+        assert "run_tree" in src, f"{name} 的 jury 沒有用可殺整棵樹的 runner 包住"
+        assert "124" in src, f"{name} 沒有處理逾時的專用退出碼"
+
+
+def test_比較器要隨包且被文件指到():
+    """PK/抽卡的規則寫死在 比較.py —— 它必須進 repo,而且 README/SKILL 要指到它,
+    否則使用者還是會在對話裡自己發明公式(Codex R15)。"""
+    tracked = _tracked()
+    assert "比較.py" in tracked, "🔴 比較.py 沒進 repo"
+    for doc in ("README.md", "SKILL.md"):
+        assert "比較.py" in (REPO / doc).read_text(encoding="utf-8"), f"{doc} 沒有指到比較器"

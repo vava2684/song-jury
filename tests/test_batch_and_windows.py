@@ -132,24 +132,63 @@ def test_損壞主檔不可以覆蓋好備份(tmp_path):
 
 
 def test_不完整評測不可以進批次表(monkeypatch, tmp_path):
-    """⛔ 缺柱是另一把尺,拿去算鑑別力會得到假結論。"""
+    """⛔ 缺柱是另一把尺,拿去算鑑別力會得到假結論。
+    ⚠️ R15 起分兩種契約:完整模式要求九柱齊全;預設(local)模式只放行
+    「Gemini 造成的缺柱」。這條驗的是完整模式的收件標準。"""
     song = tmp_path / "song.wav"; song.write_bytes(b"x")
+    monkeypatch.setattr(B, "FULL_MODE", True)
     _stub_run(monkeypatch, returncode=0, write_json=不完整JSON)
     d, err = B.run_one(song)
     assert d is None
     assert "不完整" in err and "律動" in err
 
 
-def test_退出碼2的缺柱報告要讀進來給誠實訊息(monkeypatch, tmp_path):
+def test_退出碼2的缺柱報告要讀進來不可當成程式炸掉(monkeypatch, tmp_path):
     """🔴 Codex R12(⑨ 行為版):評審團 exit 2 = 報告已完整發布但缺柱。
-    批次要**照樣讀 JSON**,用完整性檢查給「缺柱:…」的誠實訊息 ——
-    不可以停在「評審團 結束碼 2」讓人以為程式炸了。(批次仍拒收進表:缺柱不可比)"""
+    批次要**照樣讀 JSON**,不可以停在「評審團 結束碼 2」讓人以為程式炸了。"""
     song = tmp_path / "song.wav"
     song.write_bytes(b"x")
     不完整JSON = {"pillar_totals": {"完整評測": False, "缺柱": ["律動"],
                                     "缺柱權重合計": 4.0, "柱分": {}}}
     _stub_run(monkeypatch, returncode=2, write_json=不完整JSON)
     d, err = B.run_one(song)
-    assert d is None, "缺柱結果不可進批次表(另一把尺)"
-    assert "缺柱" in err and "律動" in err, f"要給完整性的誠實訊息:{err!r}"
-    assert "結束碼" not in err, f"🔴 exit 2 被當成程式炸掉:{err!r}"
+    assert "結束碼" not in (err or ""), f"🔴 exit 2 被當成程式炸掉:{err!r}"
+
+
+def test_預設批次收得到結果而不是每首都拒收(monkeypatch, tmp_path):
+    """🔴 Codex R15 的死鎖:預設略過 Gemini → 律動必缺 → 又用「完整評測」當收件
+    標準 → **每一首都被拒收**,預設批次不可能產生任何可比較資料。
+    改成 local-metrics 契約:只缺 Gemini 柱的結果照收,但明確標記契約。"""
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    只缺律動 = {"pillar_totals": {"完整評測": False, "缺柱": ["律動"],
+                                  "缺柱權重合計": 4.0, "柱分": {}}}
+    monkeypatch.setattr(B, "FULL_MODE", False)
+    _stub_run(monkeypatch, returncode=2, write_json=只缺律動)
+    d, err = B.run_one(song)
+    assert d is not None, f"🔴 預設批次連一筆都收不到:{err!r}"
+    assert d["_batch_contract"] == B.LOCAL_CONTRACT, "要明寫這不是九柱總分"
+
+
+def test_缺了安裝問題造成的柱仍要拒收(monkeypatch, tmp_path):
+    """⛔ 放寬只放給「Gemini 造成的缺柱」:和聲/結構編曲缺席是安裝壞了,
+    那種結果進表會讓鑑別力算出假結論。"""
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    缺和聲 = {"pillar_totals": {"完整評測": False, "缺柱": ["律動", "和聲"],
+                                "缺柱權重合計": 17.6, "柱分": {}}}
+    monkeypatch.setattr(B, "FULL_MODE", False)
+    _stub_run(monkeypatch, returncode=2, write_json=缺和聲)
+    d, err = B.run_one(song)
+    assert d is None and "和聲" in err, f"沒擋住安裝問題造成的缺柱:{err!r}"
+
+
+def test_完整模式仍然要求九柱齊全(monkeypatch, tmp_path):
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    只缺律動 = {"pillar_totals": {"完整評測": False, "缺柱": ["律動"],
+                                  "缺柱權重合計": 4.0, "柱分": {}}}
+    monkeypatch.setattr(B, "FULL_MODE", True)
+    _stub_run(monkeypatch, returncode=2, write_json=只缺律動)
+    d, err = B.run_one(song)
+    assert d is None and "不完整" in err

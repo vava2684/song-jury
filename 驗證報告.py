@@ -24,7 +24,25 @@ REQUIRED_PILLARS = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶"
 # ⚠️ 這份要跟 評審團.PILLAR_W 的曲側部分一致;test_packaging 有測試釘住兩邊同步。
 CANON_PILLAR_W = {"人聲": 15.2, "和聲": 13.6, "結構編曲": 12.6, "聲學": 12.1,
                   "旋律記憶": 6.1, "真實風格": 6.1, "整體": 5.1, "律動": 4.0}
-COMPOSITE_TOL = 0.15      # 產出端 round(...,1) → 容差給到 0.15 足夠,再大就是真的算錯
+# ⛔ 容差不可放到 0.15:兩邊都是「一位小數的柱分 × 同一組固定權重 → round(,1)」,
+#    根本沒有 0.1 級的浮點不確定性,0.15 等於放過一整個顯示刻度的錯誤(Codex R15)。
+#    0.05 只吸收 round 的最後一位表示誤差。
+COMPOSITE_TOL = 0.05
+
+# ⭐ 計分契約版本:權重/曲側柱集合/取整規則的**具名快照**。
+# ⛔ 為什麼要版本(Codex R15):現在靠打包測試強迫裁判權重 == 評審團權重,
+#    那麼「權重正當改版」與「兩邊一起改錯」在裁判眼裡完全一樣,而且舊報告
+#    也無法被明確拒絕。改成:報告自報 scoring_contract,裁判查表;
+#    合法改版=新增一個版本,不覆寫舊的。
+CONTRACTS = {
+    "2026-07-25-v1": {
+        "pillars": REQUIRED_PILLARS,
+        "weights": CANON_PILLAR_W,
+        "composite_round": 1,
+        "note": "重構庭 2026-07-25 定版:詞柱 25.3% 不在曲側合成內,曲側八柱自我歸一化",
+    },
+}
+DEFAULT_CONTRACT = "2026-07-25-v1"   # 報告沒自報版本時(舊格式)用這個,但會留痕
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -52,6 +70,24 @@ def validate(path: Path, newer_than: float = None) -> str:
     pt = d.get("pillar_totals")
     if not isinstance(pt, dict):
         return "缺 pillar_totals(舊格式或產出不完整)"
+
+    # ⭐ 計分契約:報告自報版本 → 裁判查表拿權重與柱集合。
+    # ⛔ 不認得的版本一律拒收:那可能是新契約(裁判要跟上)或竄改,
+    #    兩種都不該由這支替它背書(Codex R15)。
+    cname = d.get("scoring_contract") or pt.get("scoring_contract")
+    if cname is None:
+        # 舊格式(這個欄位 2026-08-01 才加)→ 用預設契約驗,但要**講出來**:
+        # 這份報告沒有版本證據,只是「看起來像」預設契約。
+        cname = DEFAULT_CONTRACT
+        print(f"⚠ 報告沒有 scoring_contract(舊格式)→ 以預設契約 {cname} 驗證",
+              file=sys.stderr)
+    else:
+        if not isinstance(cname, str) or cname not in CONTRACTS:
+            return (f"不認得的計分契約:{cname!r} —— 可能是新版契約(請更新裁判)"
+                    f"或報告被竄改;認得的有 {sorted(CONTRACTS)}")
+    contract = CONTRACTS[cname]
+    pillars, weights = contract["pillars"], contract["weights"]
+
     if pt.get("完整評測") is not True:
         return f"完整評測={pt.get('完整評測')!r},不是 True(缺柱:{pt.get('缺柱')})"
     if pt.get("缺柱") != []:
@@ -62,14 +98,14 @@ def validate(path: Path, newer_than: float = None) -> str:
     柱分 = pt.get("柱分")
     if not isinstance(柱分, dict):
         return "柱分不是 dict"
-    missing = [p for p in REQUIRED_PILLARS if p not in 柱分]
+    missing = [p_ for p_ in pillars if p_ not in 柱分]
     if missing:
         return f"柱分缺鍵:{missing}"
-    # ⛔ 只驗「柱名在不在」是裝飾:柱值換成 None / {} / {"score": NaN} / true / 999
-    #    以前全部 PASS(Codex R13 五連探針)。每一柱的 score 都要是
-    #    非 bool、有限、0-100 的數字 —— 這才是「九柱真的算出來了」。
+
+    # ⛔ 欄位一律**必填**,不可「有值才驗」:省略 items/missing 時 None 直接放行,
+    #    等於獨立裁判替不完整 schema 背書(Codex R15 探針:全部省略照樣 ACCEPT)。
     scores = {}
-    for name in REQUIRED_PILLARS:
+    for name in pillars:
         det = 柱分.get(name)
         if not isinstance(det, dict):
             return f"柱分[{name}] 不是 dict(拿到 {type(det).__name__})"
@@ -79,37 +115,46 @@ def validate(path: Path, newer_than: float = None) -> str:
         if not math.isfinite(s) or not (0 <= s <= 100):
             return f"柱分[{name}].score 不是 0-100 的有限數字:{s!r}"
         scores[name] = float(s)
-        # ⛔ 內層 schema 也要驗:items 必須是 dict、missing 必須是字串 list ——
-        #    不驗的話 items=[]、missing="junk" 這種破結構照樣被蓋章
-        #    (Codex R14:裁判只驗「八個 score 各自像數字」)。
-        items = det.get("items")
-        if items is not None and not isinstance(items, dict):
-            return f"柱分[{name}].items 不是 dict(拿到 {type(items).__name__})"
-        miss = det.get("missing")
-        if miss is not None and (not isinstance(miss, list)
-                                 or any(not isinstance(x, str) for x in miss)):
+        if "items" not in det:
+            return f"柱分[{name}] 少了 items(完整評測必須列出細項,空 dict 也要寫)"
+        if not isinstance(det["items"], dict):
+            return f"柱分[{name}].items 不是 dict(拿到 {type(det['items']).__name__})"
+        if "missing" not in det:
+            return f"柱分[{name}] 少了 missing(沒有缺項就寫空陣列)"
+        miss = det["missing"]
+        if not isinstance(miss, list) or any(not isinstance(x, str) for x in miss):
             return f"柱分[{name}].missing 不是字串陣列:{miss!r}"
 
-    # ⛔ 完整評測時「缺柱權重合計」必須是 0 —— 完整=true、缺柱=[] 卻寫 99.9
-    #    是內部自相矛盾,代表產出端的完整性計算壞了(Codex R14 探針)。
-    lostw = pt.get("缺柱權重合計", 0)
+    # ⛔ 缺柱權重合計必填(不可 get(...,0) 把「缺鍵」偽造成合法的 0)
+    if "缺柱權重合計" not in pt:
+        return "少了 缺柱權重合計(完整評測必須明寫 0)"
+    lostw = pt["缺柱權重合計"]
     if isinstance(lostw, bool) or not isinstance(lostw, (int, float)) or not math.isfinite(lostw):
         return f"缺柱權重合計不是有限數字:{lostw!r}"
     if abs(float(lostw)) > 1e-9:
         return f"完整評測卻有缺柱權重 {lostw} —— 完整性欄位自相矛盾"
 
-    # ⛔ 曲側合成用**裁判自己的權重**重算一次:八柱 score 全 0 卻宣稱合成 100,
+    # ⛔ 曲側合成用**契約裡的權重**重算:八柱 score 全 0 卻宣稱合成 100,
     #    舊裁判照樣 PASS。權重不信報告裡的(那會被一起改壞)。
-    wsum = sum(CANON_PILLAR_W.values())
-    expect = round(sum(CANON_PILLAR_W[k] * scores[k] for k in REQUIRED_PILLARS) / wsum, 1)
+    wsum = sum(weights.values())
+    expect = round(sum(weights[k] * scores[k] for k in pillars) / wsum,
+                   contract["composite_round"])
     if abs(expect - float(v)) > COMPOSITE_TOL:
         return (f"曲側合成 {v} 與八柱重算值 {expect} 不符(差 {abs(expect - float(v)):.2f})"
                 f" —— 合成算錯或柱分被竄改")
 
-    # 曲側含柱(有的話)要正好是八柱
-    inc = pt.get("曲側含柱")
-    if inc is not None and sorted(inc) != sorted(REQUIRED_PILLARS):
-        return f"曲側含柱與必要八柱不一致:{inc!r}"
+    # ⛔ 曲側含柱必填、必須是 list、內容必須剛好是契約的八柱且不重複。
+    #    (舊版 optional 又用 sorted():dict 會被 sorted 成 keys 而矇混過關,
+    #     scalar 則直接 TypeError 崩掉而不是回 VERIFY_BAD —— Codex R15。)
+    if "曲側含柱" not in pt:
+        return "少了 曲側含柱"
+    inc = pt["曲側含柱"]
+    if not isinstance(inc, list) or any(not isinstance(x, str) for x in inc):
+        return f"曲側含柱不是字串陣列:{inc!r}"
+    if len(inc) != len(set(inc)):
+        return f"曲側含柱有重複:{inc!r}"
+    if sorted(inc) != sorted(pillars):
+        return f"曲側含柱與契約的八柱不一致:{inc!r}"
     return ""
 
 

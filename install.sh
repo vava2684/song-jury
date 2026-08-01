@@ -228,17 +228,13 @@ HAS_ENV=0;  test_import .venv librosa numpy soundfile pyloudnorm reportlab && HA
 HAS_ML=0;   test_import .venv-ml torch muq audiobox_aesthetics && HAS_ML=1
 HAS_SE=0;   [ -f SongEval/eval.py ] && [ "$HAS_ML" = 1 ] && HAS_SE=1
 HAS_AUD=0;  test_import .venv-audition torch s3prl muq && HAS_AUD=1
-# ⛔ 錨在行首(排除註解行),並排除 .env.example 的佔位字串。
-# ⛔ 第一行要先剝掉 UTF-8 BOM:Windows PowerShell 5.1 寫的 .env 開頭是 EF BB BF,
-#    行首錨 ^ 對不上 → 明明有金鑰卻被判沒有(Codex R10 實測)。printf 八進位跨平台。
+# ⛔ 這裡**故意不做前置正則判斷**(Codex R15):舊版先自己 grep .env 的
+#    GEMINI_API_KEY(S),有中才呼叫共用驗證器 —— 政策正式支援的專用變數
+#    SONG_JURY_GEMINI_API_KEYS(process env 或 .env)整個被漏掉:
+#    runtime 會用那把 key,安裝器卻說「沒有金鑰、律動柱缺席」。
+#    → 有 python 就無條件呼叫 金鑰驗證.py,由 effective_keys() 唯一決定。
 HAS_KEY=0
-if [ -f .env ]; then
-  _ENV_TEXT="$(sed "1s/^$(printf '\357\273\277')//" .env 2>/dev/null || cat .env)"
-  if printf '%s\n' "$_ENV_TEXT" | grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*[^[:space:]]' \
-     && ! printf '%s\n' "$_ENV_TEXT" | grep -qE '^[[:space:]]*GEMINI_API_KEYS?[[:space:]]*=[[:space:]]*.*(你的.*金鑰|^your|xxx)'; then
-    HAS_KEY=1
-  fi
-fi
+
 # ⛔ ffmpeg 是完整安裝的必要件:一般 WAV 超過 Gemini 內嵌上限,靠它轉檔才評得了
 HAS_FFMPEG=0; have ffmpeg && HAS_FFMPEG=1
 
@@ -247,26 +243,24 @@ HAS_FFMPEG=0; have ffmpeg && HAS_FFMPEG=1
 #    而且 429/網路/TLS 全被洗成成功。三態:verified=綠燈資格;invalid=視同沒金鑰;
 #    cooling/unknown=「未能驗證」→ 最後 exit 3(獨立退出碼,跟缺柱 exit 1 分開)。
 KEY_UNVERIFIED=0
-if [ "$HAS_KEY" = 1 ]; then
-  if [ -x .venv/bin/python ]; then PROBE_PY=.venv/bin/python
-  elif have python3; then PROBE_PY=python3
-  elif have python; then PROBE_PY=python
-  else PROBE_PY=""; fi
-  if [ -n "$PROBE_PY" ]; then
-    PYTHONUTF8=1 "$PROBE_PY" 金鑰驗證.py .env
-    case "$?" in
-      0) ok "Gemini 金鑰驗證通過(逐把真打 Google;各把狀態見上)" ;;
-      1) HAS_KEY=0
-         bad "Gemini 金鑰全部無效" "格式像金鑰但 Google 全不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" ;;
-      3) KEY_UNVERIFIED=1
-         warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 --check-only" ;;
-      4) HAS_KEY=0; warn ".env 裡沒有可用金鑰(只有佔位字串?)" ;;
-      *) KEY_UNVERIFIED=1; warn "金鑰驗證工具異常 —— 不給完整綠燈" ;;
-    esac
-  else
-    KEY_UNVERIFIED=1
-    warn "找不到任何 python 可跑金鑰驗證 —— 金鑰只驗了格式;裝完請重跑 --check-only"
-  fi
+if [ -x .venv/bin/python ]; then PROBE_PY=.venv/bin/python
+elif have python3; then PROBE_PY=python3
+elif have python; then PROBE_PY=python
+else PROBE_PY=""; fi
+if [ -n "$PROBE_PY" ]; then
+  PYTHONUTF8=1 "$PROBE_PY" 金鑰驗證.py .env
+  case "$?" in
+    0) HAS_KEY=1; ok "Gemini 金鑰驗證通過(逐把真打 Google;各把狀態見上)" ;;
+    1) bad "Gemini 金鑰全部無效" "格式像金鑰但 Google 全不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" ;;
+    3) KEY_UNVERIFIED=1; HAS_KEY=1
+       warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 --check-only" ;;
+    4) warn "找不到可用金鑰(.env 沒填、只有佔位字串,或環境變數名字用錯)" ;;
+    5) bad "Gemini 金鑰政策無效" "拒絕名單格式錯,或 .env 來源可疑(symlink/硬連結/父目錄連結)。⛔ 這不是「沒填金鑰」—— 去申請新 key 沒有用,請照上面的訊息修設定" ;;
+    *) KEY_UNVERIFIED=1; HAS_KEY=1; warn "金鑰驗證工具異常 —— 不給完整綠燈" ;;
+  esac
+else
+  KEY_UNVERIFIED=1
+  warn "找不到任何 python 可跑金鑰驗證 —— 這台無法確認金鑰;裝完請重跑 --check-only"
 fi
 
 # ⛔ 不自己猜 demucs 在哪 —— 問評審團.py 自己解析出來的那條路徑(唯一真理來源),
@@ -410,9 +404,26 @@ if [ "$VERIFY_MODELS" = 1 ]; then
     #    清所有 $VID 前綴的產物,不是只清 wav 與最終報告。
     _sj_verify_cleanup() { rm -rf "${VID}"* _stems/"${VID}"*; }
     trap '_sj_verify_cleanup' EXIT INT TERM
-    env -u SONG_JURY_SKIP_GEMINI -u SONG_JURY_TRUST_LEGACY_STEMS         PYTHONUTF8=1 .venv/bin/python 評審團.py "${VID}.wav"
+    # ⛔ 外層 timeout(Codex R15):模型載入 deadlock 時直接跑會永遠掛著。
+    #    用可殺整棵樹的 runner 包住;首次下載很久,預設給寬,可用
+    #    SONG_JURY_VERIFY_TIMEOUT 調整。
+    V_TIMEOUT="${SONG_JURY_VERIFY_TIMEOUT:-7200}"
+    env -u SONG_JURY_SKIP_GEMINI -u SONG_JURY_TRUST_LEGACY_STEMS         PYTHONUTF8=1 .venv/bin/python -c '
+import subprocess, sys
+sys.path.insert(0, ".")
+from 子程序 import run_tree
+try:
+    r = run_tree([sys.executable, "評審團.py", sys.argv[1]], timeout=float(sys.argv[2]))
+    sys.stdout.write(r.stdout or ""); sys.stderr.write(r.stderr or "")
+    sys.exit(r.returncode)
+except subprocess.TimeoutExpired:
+    print("⛔ 評審團逾時(已中止整棵程序樹)", file=sys.stderr)
+    sys.exit(124)
+' "${VID}.wav" "$V_TIMEOUT"
     VRC=$?
-    if [ "$VRC" -eq 0 ]; then
+    if [ "$VRC" -eq 124 ]; then
+      bad "完整驗證逾時(超過 ${V_TIMEOUT}s,已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設 SONG_JURY_VERIFY_TIMEOUT 加長再試"; VERIFY_OK=0
+    elif [ "$VRC" -eq 0 ]; then
       if PYTHONUTF8=1 .venv/bin/python 驗證報告.py "${VID}_評審團.json" --newer-than "$V_EPOCH"; then
         ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"
       else

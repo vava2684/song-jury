@@ -247,15 +247,14 @@ $hasAud = Test-Import ".venv-audition" @("torch", "s3prl", "muq")
 $hasSongEval = (Test-Path "SongEval\eval.py") -and $hasMl
 # ⛔ 正則要錨在行首(多行模式),否則 `# GEMINI_API_KEY=...` 這種註解行也會被當成有金鑰;
 #    也要排除 .env.example 的佔位字串。
+# ⛔ 這裡**故意不做任何前置正則判斷**(Codex R15):
+#    舊版先自己 grep .env 的 GEMINI_API_KEY(S),有中才呼叫共用驗證器 ——
+#    於是政策正式支援的專用變數 SONG_JURY_GEMINI_API_KEYS(process env 或 .env)
+#    整個被漏掉:runtime 會用那把 key,安裝器卻宣稱「沒有金鑰、律動柱缺席」。
+#    「驗證器與執行期共用唯一真理來源」只做到後半段等於沒做。
+#    → 有 python 就無條件呼叫 金鑰驗證.py,由 effective_keys() 唯一決定
+#      process env / .env / 佔位字串 / deny / PolicyError。
 $hasKey = $false
-if (Test-Path ".env") {
-    foreach ($line in (Get-Content ".env" -ErrorAction SilentlyContinue)) {
-        if ($line -match '^\s*GEMINI_API_KEYS?\s*=\s*(\S.*)$') {
-            $v = $Matches[1].Trim().Trim('"').Trim("'")
-            if ($v -and $v -notmatch '你的.*金鑰' -and $v -notmatch '^(your|xxx|todo)') { $hasKey = $true }
-        }
-    }
-}
 # ⛔ ffmpeg 是完整安裝的必要件:一般 WAV 超過 Gemini 內嵌上限,靠它轉檔才評得了
 #    (缺它=評 WAV 時 Gemini 六柱項全缺=不完整)。-CheckOnly 也要驗。
 $hasFfmpeg = Have "ffmpeg"
@@ -266,28 +265,33 @@ $hasFfmpeg = Have "ffmpeg"
 #    三態:verified=綠燈資格;invalid=視同沒金鑰;cooling/unknown=「未能驗證」,
 #    不給綠燈、最後 exit 3(獨立退出碼,跟「缺柱 exit 1」分開)。
 $script:KeyUnverified = $false
-if ($hasKey) {
-    $probePy = if (Test-Path ".venv\Scripts\python.exe") { ".venv\Scripts\python.exe" }
-               elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
-               elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" }
-               else { $null }
-    if ($probePy) {
-        $env:PYTHONUTF8 = "1"
+$probePy = if (Test-Path ".venv\Scripts\python.exe") { ".venv\Scripts\python.exe" }
+           elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
+           elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+           else { $null }
+if ($probePy) {
+    $oldUtf8Probe = $env:PYTHONUTF8       # ⚠️ 先存再設(同 -VerifyModels 那段的教訓)
+    $env:PYTHONUTF8 = "1"
+    try {
         & $probePy "金鑰驗證.py" ".env"
-        switch ($LASTEXITCODE) {
-            0 { Ok "Gemini 金鑰驗證通過(逐把真打 Google;各把狀態見上)" }
-            1 { $hasKey = $false
-                Bad "Gemini 金鑰全部無效" "格式像金鑰但 Google 全不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" }
-            3 { $script:KeyUnverified = $true
-                Warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 -CheckOnly" }
-            4 { $hasKey = $false; Warn ".env 裡沒有可用金鑰(只有佔位字串?)" }
-            default { $script:KeyUnverified = $true
-                      Warn "金鑰驗證工具異常(退出碼 $LASTEXITCODE)—— 不給完整綠燈" }
-        }
-    } else {
-        $script:KeyUnverified = $true
-        Warn "找不到任何 python 可跑金鑰驗證 —— 金鑰只驗了格式;裝完請重跑 -CheckOnly"
+        $krc = $LASTEXITCODE
+    } finally {
+        if ($null -eq $oldUtf8Probe) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
+        else { $env:PYTHONUTF8 = $oldUtf8Probe }
     }
+    switch ($krc) {
+        0 { $hasKey = $true; Ok "Gemini 金鑰驗證通過(逐把真打 Google;各把狀態見上)" }
+        1 { Bad "Gemini 金鑰全部無效" "格式像金鑰但 Google 全不認;請到 https://aistudio.google.com/apikey 重新申請並填進 .env" }
+        3 { $script:KeyUnverified = $true; $hasKey = $true
+            Warn "金鑰有效性未能驗證(全部限流中或網路/TLS 問題)—— 不給完整綠燈;恢復後請重跑 -CheckOnly" }
+        4 { Warn "找不到可用金鑰(.env 沒填、只有佔位字串,或環境變數名字用錯)" }
+        5 { Bad "Gemini 金鑰政策無效" "拒絕名單格式錯,或 .env 來源可疑(symlink/硬連結/父目錄連結)。⛔ 這不是「沒填金鑰」—— 去申請新 key 沒有用,請照上面的訊息修設定" }
+        default { $script:KeyUnverified = $true; $hasKey = $true
+                  Warn "金鑰驗證工具異常(退出碼 $krc)—— 不給完整綠燈" }
+    }
+} else {
+    $script:KeyUnverified = $true
+    Warn "找不到任何 python 可跑金鑰驗證 —— 這台無法確認金鑰;裝完請重跑 -CheckOnly"
 }
 
 # 每根柱子:名稱 / 權重 / 完整需要什麼 / 缺了會怎樣
@@ -418,11 +422,14 @@ if ($VerifyModels) {
         # <verify-block-start>  ⚠️ 這對標記給 tests/test_installer_order.py 抽取用
         $vid = "verify_" + [guid]::NewGuid().ToString("N").Substring(0, 8)
         Write-Host "`n      -VerifyModels:實跑 評審團.py $vid.wav(唯一檔名,強迫全模型路徑;首次會下載數 GB)..." -ForegroundColor DarkGray
-        $env:PYTHONUTF8 = "1"
         Copy-Item "demo_mix.wav" "$vid.wav"
         $vEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        # ⛔ 順序:**先存原值再設定**。舊碼先 $env:PYTHONUTF8="1" 才存 $oldUtf8,
+        #    於是「原值」永遠是 1 —— 使用者在自己的 PowerShell 直接跑 ./install.ps1
+        #    之後,環境被永久改成 1(Codex R15 探針:STATE False|1)。
         $oldSkip = $env:SONG_JURY_SKIP_GEMINI; $oldTrust = $env:SONG_JURY_TRUST_LEGACY_STEMS
         $oldUtf8 = $env:PYTHONUTF8
+        $env:PYTHONUTF8 = "1"
         Remove-Item Env:SONG_JURY_SKIP_GEMINI -EA SilentlyContinue
         Remove-Item Env:SONG_JURY_TRUST_LEGACY_STEMS -EA SilentlyContinue
         # ⛔ 順序鐵則(Codex R14 抓到的迴歸,而且是我上一輪加清理時自己造成的):
@@ -431,9 +438,28 @@ if ($VerifyModels) {
         #    → 成功路徑必定先被刪掉報告,裁判永遠 VERIFY_BAD 檔案不存在,
         #    完整驗證的成功路徑變成必定假陰性。
         try {
-            & .venv\Scripts\python.exe 評審團.py "$vid.wav"
+            # ⛔ 外層 timeout(Codex R15):jury/模型載入真的 deadlock 時,直接
+            #    `& python 評審團.py` 會永遠掛著,只能靠人工中斷 —— 而硬 kill
+            #    不保證跑得到 finally。用可殺整棵樹的 runner(子程序.run_tree)包住,
+            #    首次下載很久,所以預設給得寬(可用 SONG_JURY_VERIFY_TIMEOUT 調)。
+            $vTimeout = if ($env:SONG_JURY_VERIFY_TIMEOUT) { $env:SONG_JURY_VERIFY_TIMEOUT } else { "7200" }
+            & .venv\Scripts\python.exe -c @"
+import subprocess, sys
+sys.path.insert(0, '.')
+from 子程序 import run_tree
+try:
+    r = run_tree([sys.executable, '評審團.py', sys.argv[1]], timeout=float(sys.argv[2]))
+    sys.stdout.write(r.stdout or ''); sys.stderr.write(r.stderr or '')
+    sys.exit(r.returncode)
+except subprocess.TimeoutExpired:
+    print('⛔ 評審團逾時(已中止整棵程序樹)', file=sys.stderr)
+    sys.exit(124)
+"@ "$vid.wav" $vTimeout
             $vrc = $LASTEXITCODE
-            if ($vrc -eq 0) {
+            if ($vrc -eq 124) {
+                Bad "完整驗證逾時(超過 $vTimeout 秒,已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設環境變數 SONG_JURY_VERIFY_TIMEOUT 加長再試"
+                $script:VerifyOk = $false
+            } elseif ($vrc -eq 0) {
                 & .venv\Scripts\python.exe 驗證報告.py "${vid}_評審團.json" --newer-than $vEpoch
                 if ($LASTEXITCODE -eq 0) {
                     Ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"

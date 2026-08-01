@@ -91,13 +91,24 @@ def _save_store(store: Path, results: dict):
     os.replace(tmp, store)
 
 
+# ⭐ 兩種批次契約,輸出會明寫是哪一種(Codex R15)
+FULL_MODE = os.environ.get("SONG_JURY_BATCH_GEMINI") == "1"
+LOCAL_CONTRACT = "local-metrics-v1"
+# 「只由 Gemini 供分」的柱:略過 Gemini 時它一定缺,那是**預期**而非安裝壞掉。
+# ⚠️ 其餘柱(和聲/結構編曲…)缺席一律是安裝問題,照樣拒收。
+GEMINI_ONLY_PILLARS = {"律動"}
+
+
 def run_one(song: Path, timeout=3600):
-    """跑六關,回 merged dict 或 None。
+    """跑六關,回 (merged dict 或 None, 錯誤說明)。
 
     ⛔ 預設【略過 Gemini】—— 2026-07-20 教訓:批次是一首接一首零間隔跑,
-       39 首 = 39 次連續呼叫 → 她的 Gemini 金鑰被 Google 擋掉,**約 28 天才恢復**。
-       批次的用途是算鑑別力(本機確定性關卡就夠),不該把外部 API 綁進來。
-       真的要在批次裡跑 Gemini:設環境變數 SONG_JURY_BATCH_GEMINI=1(自負風險)。
+       39 首 = 39 次連續呼叫 → 金鑰被 Google 擋掉,**約 28 天才恢復**。
+       批次的用途是算本機確定性指標的鑑別力,不該把外部 API 綁進來。
+       真的要跑完整九柱:設環境變數 SONG_JURY_BATCH_GEMINI=1(自負風險)。
+    ⭐ 收件標準跟著模式走(見 FULL_MODE / LOCAL_CONTRACT):
+       預設模式收「只缺 Gemini 柱」的結果並標上 local-metrics-v1 契約,
+       ⛔ 那不是九柱總分、不可拿去排行或 PK。
     """
     out_json = song.with_name(song.stem + "_評審團.json")
     env = {**os.environ, "PYTHONUTF8": "1"}
@@ -130,8 +141,24 @@ def run_one(song: Path, timeout=3600):
     _ok = _pt.get("完整評測")
     if not isinstance(_ok, bool):
         return None, "結果的『完整評測』欄位缺失或型別不對,拒收"
-    if not _ok:
-        return None, f"不完整評測,缺柱:{'、'.join(_pt.get('缺柱') or [])}(補齊安裝後重跑)"
+    lost = set(_pt.get("缺柱") or [])
+
+    # ⛔ 兩種契約,絕不混用(Codex R15 抓到的死鎖:預設略過 Gemini → 必缺律動
+    #    → 又用「完整評測」當收件標準 → **預設批次每一首都被拒收**,不可能產生
+    #    任何可比較的資料,跟註解宣稱的用途自相矛盾)。
+    #    · full(SONG_JURY_BATCH_GEMINI=1):要求真正的九柱完整,可拿來排行/PK。
+    #    · local(預設):明講這是「本機確定性指標」——允許缺 Gemini 造成的柱,
+    #      但其他柱(和聲/結構編曲…那些是安裝問題)缺一個都不收;
+    #      而且輸出會標記 contract,⛔ 絕不可冒充九柱總分或拿去 PK。
+    if FULL_MODE:
+        if not _ok:
+            return None, f"不完整評測,缺柱:{'、'.join(sorted(lost))}(補齊安裝後重跑)"
+        return d, ""
+    extra = lost - GEMINI_ONLY_PILLARS
+    if extra:
+        return None, (f"缺了不該缺的柱:{'、'.join(sorted(extra))} —— 那是安裝問題,"
+                      f"不是略過 Gemini 造成的(補齊安裝後重跑)")
+    d["_batch_contract"] = LOCAL_CONTRACT
     return d, ""
 
 

@@ -48,28 +48,49 @@ class PolicyError(RuntimeError):
     ⛔ 一律 fail-closed:回零把金鑰,不是「警告後照常用」。"""
 
 
-def _check_secret_file(p: Path):
-    """秘密檔的來源防護:拒 symlink/reparse、拒 hardlink、POSIX 驗擁有者。
+def _is_reparse(st) -> bool:
+    return bool(getattr(st, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
-    ⛔ Codex R14 實測:把 `.env` 做成指向 `website-production.env` 的 hardlink,
-       金鑰照樣被採用(samefile=True、nlink=2)—— 產線隔離就這樣被繞過去。
-       這多半是同一使用者的配置混用,不是提權,但正是這個政策要防的事故面。
-    ⚠️ 誠實邊界:攻擊者若本來就能改 `.env`,檔內 denylist 不是不可竄改的邊界;
-       真正的 hard deny 請放在 ACL 保護的位置或用受控的 process env 注入。"""
+
+def _check_secret_file(p: Path):
+    """秘密檔的來源防護:拒 symlink/reparse、拒 hardlink、POSIX 驗擁有者;
+    而且**要往上逐層檢查父目錄**。
+
+    ⛔ Codex R14:`.env` 做成指向 website-production.env 的 hardlink 照樣被採用。
+    ⛔ Codex R15:只驗 leaf 還是能繞 —— 把**專案資料夾本身**做成指向另一條產線的
+       directory junction,`.env` 自己是普通單連結檔,一路綠燈。
+    ⚠️ 誠實邊界:攻擊者若本來就能改 `.env`(或改 process env),檔內/環境裡的
+       denylist 都不是不可竄改的邊界;真正的 hard deny 要放在 ACL 保護的位置。
+       這裡防的是「同一位使用者把兩條產線的設定接在一起」這種配置混用。"""
+    # ① leaf 本身
     if p.is_symlink():
         raise PolicyError(f"{p.name} 是符號連結,拒絕當秘密檔用 —— 它可能指向別條產線的金鑰檔")
     st = p.lstat()
     if os.name == "nt":
-        attrs = getattr(st, "st_file_attributes", 0)
-        if attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+        if _is_reparse(st):
             raise PolicyError(f"{p.name} 是 reparse point(junction/symlink),拒絕當秘密檔用")
-    else:
-        if st.st_uid != os.getuid():
-            raise PolicyError(f"{p.name} 不是目前使用者擁有,拒絕當秘密檔用")
+    elif st.st_uid != os.getuid():
+        raise PolicyError(f"{p.name} 不是目前使用者擁有,拒絕當秘密檔用")
     if getattr(st, "st_nlink", 1) > 1:
         raise PolicyError(
             f"{p.name} 有 {st.st_nlink} 個硬連結 —— 它跟另一個檔案是同一份內容,"
             f"很可能是別條產線的金鑰檔。請改成獨立的一份 .env。")
+    # ② 父目錄逐層(用**傳入的原始路徑**往上走:resolve 過就看不到連結痕跡了)
+    seen = 0
+    for parent in Path(os.path.abspath(p)).parents:
+        seen += 1
+        if seen > 40:                       # 保險:不可能有這麼深
+            break
+        try:
+            pst = parent.lstat()
+        except OSError:
+            break                            # 掛載點/權限 → 到此為止,不誤殺
+        if parent.is_symlink() or (os.name == "nt" and _is_reparse(pst)):
+            raise PolicyError(
+                f"秘密檔的上層目錄是連結({parent})—— 整個資料夾可能已指向"
+                f"另一條產線。請把 .env 放在真實目錄裡,或改用專用變數"
+                f"{PRIMARY_ENV} 明確指名這條產線的金鑰。")
 
 
 def parse_env_file(path) -> dict:

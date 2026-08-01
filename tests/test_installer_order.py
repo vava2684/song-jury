@@ -57,6 +57,8 @@ def test_ps1的驗證順序_裁判先看到報告清理在最後(tmp_path):
         "pathlib.Path('WITNESS.txt').write_text('SEEN' if seen else 'GONE', encoding='utf-8')\n"
         "sys.exit(0 if seen else 1)\n", encoding="utf-8")
     (tmp_path / "demo_mix.wav").write_bytes(b"RIFF0000")
+    # verify 區塊現在用 子程序.run_tree 包 jury(外層 timeout)→ stub 目錄要有它
+    shutil.copy(REPO / "子程序.py", tmp_path / "子程序.py")
 
     ps = shutil.which("pwsh") or shutil.which("powershell")
     script = tmp_path / "run.ps1"
@@ -95,6 +97,7 @@ def test_sh的驗證順序_裁判先看到報告清理在最後(tmp_path):
         "pathlib.Path('WITNESS.txt').write_text('SEEN' if seen else 'GONE', encoding='utf-8')\n"
         "sys.exit(0 if seen else 1)\n", encoding="utf-8")
     (tmp_path / "demo_mix.wav").write_bytes(b"RIFF0000")
+    shutil.copy(REPO / "子程序.py", tmp_path / "子程序.py")
 
     script = tmp_path / "run.sh"
     script.write_text(

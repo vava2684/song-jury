@@ -35,7 +35,7 @@ def test_驗證器與執行期看到同一組金鑰(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEYS", B)
     monkeypatch.setenv("GEMINI_API_KEY", C)
     monkeypatch.setattr(G, "ENV_FILE", envp)
-    assert K.parse_keys(envp) == G.load_keys(), "🔴 驗的與跑的不是同一組金鑰"
+    assert K.parse_keys(envp)[0] == G.load_keys(), "🔴 驗的與跑的不是同一組金鑰"
 
 
 def test_process環境的一般金鑰不被借用(tmp_path, monkeypatch):
@@ -141,3 +141,20 @@ def test_env是符號連結要拒絕(tmp_path):
     keys, notes = P.effective_keys(envp)
     assert keys == []
     assert any("符號連結" in n for n in notes)
+
+
+def test_父目錄是連結要拒絕(tmp_path):
+    """🔴 Codex R15:只驗 leaf 還是能繞 —— 把**專案資料夾本身**做成指向另一條
+    產線的 junction/symlink,.env 自己是普通單連結檔,一路綠燈。"""
+    import os as _os
+    real = tmp_path / "website-production"
+    real.mkdir()
+    (real / ".env").write_text(f"GEMINI_API_KEYS={B}", encoding="utf-8")
+    link_dir = tmp_path / "song-jury-project"
+    try:
+        _os.symlink(real, link_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("這個環境不能建 directory symlink(Windows 需特權)")
+    keys, notes = P.effective_keys(link_dir / ".env")
+    assert keys == [], "🔴 父目錄指向別條產線,金鑰還是被拿去用了"
+    assert any("上層目錄" in n for n in notes), f"要說清楚為什麼:{notes}"
