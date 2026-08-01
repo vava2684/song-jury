@@ -224,10 +224,26 @@ MUTATIONS = [
      "tests/test_state_dir.py::test_鎖檔hardlink要拒絕且不碰目標"),
 
     # ⚠️ 下面三條的測試是 POSIX 專屬(Windows 本機跑會誠實顯示「無法驗證」,CI ubuntu 會抓)
+    # ⚠ symlink 檢查有前後兩道(mkdir 前+mkdir 後),只拔一道會被另一道救回 →
+    #   變異必須「兩道一起拔」才是真的 fail-open(CI ubuntu 變異工作抓出來的)
     ("狀態/鎖目錄的 symlink 防線拆掉(鎖被導向外部目錄)",
      "狀態目錄.py",
-     '    if d.is_symlink():\n        raise StateDirError',
-     '    if False:\n        raise StateDirError',
+     '    if d.is_symlink():\n'
+     '        raise StateDirError(f"{what} 是符號連結,拒絕使用:{d} —— 鎖/狀態可被導向外部目錄")\n'
+     '    try:\n'
+     '        d.mkdir(parents=True, exist_ok=True, mode=0o700)   # mode 只作用在最後一層\n'
+     '    except FileExistsError:\n'
+     '        raise StateDirError(f"{what} 的位置被一個普通檔案佔住:{d} —— 請移走那個檔案")\n'
+     '    except OSError as e:\n'
+     '        raise StateDirError(f"{what} 建不起來:{d}({type(e).__name__}: {e})")\n'
+     '    if d.is_symlink() or not d.is_dir():',
+     '    try:\n'
+     '        d.mkdir(parents=True, exist_ok=True, mode=0o700)   # mode 只作用在最後一層\n'
+     '    except FileExistsError:\n'
+     '        raise StateDirError(f"{what} 的位置被一個普通檔案佔住:{d} —— 請移走那個檔案")\n'
+     '    except OSError as e:\n'
+     '        raise StateDirError(f"{what} 建不起來:{d}({type(e).__name__}: {e})")\n'
+     '    if not d.is_dir():',
      "tests/test_state_dir.py::test_locks目錄本身是symlink要拒絕"),
 
     ("目錄建立退回預設權限(mkdir→chmod 之間出現 0777 窗口)",

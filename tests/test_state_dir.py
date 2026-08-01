@@ -94,12 +94,15 @@ def test_umask全開時建立當下就是0700沒有窗口(tmp_path, monkeypatch)
     mkdir(mode=0o700) 讓目錄從建立那一刻就 0700,窗口不存在。"""
     d = tmp_path / "s2"
     monkeypatch.setenv("SONG_JURY_STATE_DIR", str(d))
+    # ⛔ 遮住「事後補救」的 chmod:不遮的話,退回預設 mkdir 的版本會被補救
+    #    洗成最終 0700,「有沒有 0777 窗口」就觀測不到(CI 變異抓出來的盲點)
+    monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
     old = os.umask(0)
     try:
         S.state_root()
     finally:
         os.umask(old)
-    assert (os.stat(d).st_mode & 0o777) == 0o700
+    assert (os.stat(d).st_mode & 0o777) == 0o700,         "🔴 建立當下不是 0700 —— mkdir→chmod 之間存在可被塞 symlink 的窗口"
 
 
 def test_鎖檔hardlink要拒絕且不碰目標(tmp_path):
