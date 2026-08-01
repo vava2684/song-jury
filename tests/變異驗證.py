@@ -187,10 +187,20 @@ MUTATIONS = [
      '# 這一行被拿掉了(變異)',
      "tests/test_demucs_resolve.py::test_安裝腳本自檢要驗整條線而不是只驗demucs"),
 
-    ("venv 預篩只看一種 layout(Windows 專案 venv 永遠選不到,改用全域 conda)",
+    # ⚠ 這個 bug 的根因已被架構消掉:預篩看錯 layout 時,第二輪「所有候選都真 import」
+    #   會把答案救回來(只是慢一點)。所以變異要**兩道一起拔**,才是 R13 當時的行為:
+    #   預篩用錯 layout + 沒有救援 → Windows 上專案 venv 永遠選不到,改用全域 conda。
+    ("venv 預篩只看一種 layout 且無救援(專案 venv 永遠選不到,改用全域 conda)",
      "評審團.py",
-     '        for root in (py.parent.parent, py.parent):',
-     '        for root in (py.parent,):',
+     '        for root in (py.parent.parent, py.parent):\n'
+     '            if any(next(root.glob(p), None) is not None for p in pats):\n'
+     '                return True\n'
+     '        return False',
+     '        for root in (py.parent,):        # 變異:只看一種 layout\n'
+     '            if any(next(root.glob(p), None) is not None for p in pats):\n'
+     '                return True\n'
+     '        return False\n'
+     '    globals()["_SJ_NO_RESCUE"] = True    # 變異:同時拔掉第二輪救援',
      "tests/test_demucs_resolve.py::test_專案venv要贏過全域conda"),
 
     ("process env 的一般金鑰又被借走(拿別條產線的付費額度)",

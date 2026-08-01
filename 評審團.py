@@ -113,10 +113,13 @@ def _find_demucs_py():
     for p in likely:
         if _probe_import(p, DEMUCS_LINE_MODS):
             return str(p)
-    # 第二輪:預篩沒中的也真驗一次(非標準 layout 的救援)
-    for p in exist:
-        if p not in likely and _probe_import(p, DEMUCS_LINE_MODS):
-            return str(p)
+    # 第二輪:預篩沒中的也真驗一次(非標準 layout 的救援)——
+    # ⭐ 這一輪是 R13 那個 bug 的架構級解藥:就算預篩看錯 site-packages 位置,
+    #    真 import 仍會按候選順序找到專案 venv,不會靜靜改用全域 conda。
+    if not globals().get("_SJ_NO_RESCUE"):     # 變異驗證用的開關,產品路徑恆為 False
+        for p in exist:
+            if p not in likely and _probe_import(p, DEMUCS_LINE_MODS):
+                return str(p)
     # 第三輪:整條線不齊,但至少有 demucs → 分軌能跑(和聲會誠實降級並記在 stage_notes)
     for p in exist:
         if _probe_import(p, ("demucs",)):
