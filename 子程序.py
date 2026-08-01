@@ -18,6 +18,8 @@ import subprocess
 import sys
 
 _WIN = sys.platform == "win32"
+_SJ_NEVER = ()          # 變異驗證用的空例外組(產品路徑永不匹配)
+_SJ_NEVER2 = ()         # 同上(變異需要「兩道防線一起拔」時用)
 # Windows:殺樹的 taskkill 自己也不要彈黑框
 _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {}
 
@@ -36,7 +38,22 @@ class _WinJob:
         import ctypes
         from ctypes import wintypes
         self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self.handle = self._k32.CreateJobObjectW(None, None)
+        # ⛔ 一定要宣告 prototype:ctypes 預設 restype 是 c_int(32 位),
+        #    64 位的 HANDLE 會被**截斷**。實測時多半還是能用(Windows 的 handle
+        #    值通常很小),但那是運氣不是保證 —— handle 一旦超過 2^31 就會拿到
+        #    垃圾值,Job 靜靜失效、殺樹保證跟著蒸發。(Codex R14 的探針自己也踩過
+        #    同一個坑,他修好 prototype 後才量得到數字。)
+        _k = self._k32
+        _k.CreateJobObjectW.restype = ctypes.c_void_p
+        _k.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        _k.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.c_void_p, wintypes.DWORD]
+        _k.OpenProcess.restype = ctypes.c_void_p
+        _k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        _k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _k.TerminateJobObject.argtypes = [ctypes.c_void_p, wintypes.UINT]
+        _k.CloseHandle.argtypes = [ctypes.c_void_p]
+        self.handle = _k.CreateJobObjectW(None, None)
         if not self.handle:
             raise OSError("CreateJobObject 失敗")
 
@@ -86,16 +103,22 @@ class _WinJob:
             self._k32.CloseHandle(h)
 
     def terminate(self):
+        if not getattr(self, "handle", None):
+            return
         try:
             self._k32.TerminateJobObject(self.handle, 1)
         except Exception:
             pass
 
     def close(self):
-        try:
-            self._k32.CloseHandle(self.handle)     # KILL_ON_JOB_CLOSE:關 handle 即全滅
-        except Exception:
-            pass
+        """關 handle(KILL_ON_JOB_CLOSE:關掉即全滅)。⚠️ 必須可重複呼叫 ——
+        finally 與早期錯誤路徑都會叫它,雙關 handle 是未定義行為。"""
+        h, self.handle = getattr(self, "handle", None), None
+        if h:
+            try:
+                self._k32.CloseHandle(h)
+            except Exception:
+                pass
 
 
 def kill_tree(p: subprocess.Popen, job=None):
@@ -140,32 +163,48 @@ def run_tree(cmd, *, timeout, cwd=None, env=None, extra_creationflags=0):
             iso = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | extra_creationflags}
     else:
         iso = {"start_new_session": True}
-    p = subprocess.Popen(cmd, cwd=(str(cwd) if cwd else None), env=env,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, encoding="utf-8", errors="replace", **iso)
-    if job is not None:
-        # ⚠️ 先 CREATE_SUSPENDED 再指派再喚醒:程序一啟動就可能生孫程序,
-        #    指派前生的那些不會進 job(競態窗口)。凍住入 job 才沒有窗口。
-        try:
-            job.assign(p.pid)
-        except Exception:
-            job.close()
-            job = None
-        _resume_process(p.pid)
+    # ⛔ 從 Job 建立起就要有最外層 finally(Codex R14):
+    #    · Popen 失敗(執行檔不存在等)時舊碼直接把例外往外拋 → Job handle 洩漏
+    #      (實測連跑 25 次:process handle 147 → 173);
+    #    · communicate 拋的若不是 TimeoutExpired(管線 OSError、KeyboardInterrupt)
+    #      舊碼完全不殺樹 → 呼叫端已拿到失敗,子程序卻還活著繼續吃 GPU、寫中間檔,
+    #      這跟 run_tree 的核心契約直接衝突。
+    p = None
     try:
-        out, err = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(p, job)
-        try:
-            out, err = p.communicate(timeout=10)   # 回收,不留殭屍
-        except Exception:
-            out, err = "", ""
+        p = subprocess.Popen(cmd, cwd=(str(cwd) if cwd else None), env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace", **iso)
         if job is not None:
-            job.close()
-        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
-    if job is not None:
-        job.close()
-    return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)
+            # ⚠️ 先 CREATE_SUSPENDED 再指派再喚醒:程序一啟動就可能生孫程序,
+            #    指派前生的那些不會進 job(競態窗口)。凍住入 job 才沒有窗口。
+            try:
+                job.assign(p.pid)
+            except Exception:
+                job.close()
+                job = None
+            _resume_process(p.pid)
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(p, job)
+            try:
+                out, err = p.communicate(timeout=10)   # 回收,不留殭屍
+            except Exception:
+                out, err = "", ""
+            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+        except BaseException:
+            # ⛔ 任何其他失敗(含 KeyboardInterrupt)也要殺樹再往外拋 ——
+            #    「呼叫端失敗了但子程序還在跑」是這個模組存在的理由要防的事。
+            kill_tree(p, job)
+            try:
+                p.communicate(timeout=10)
+            except Exception:
+                pass
+            raise
+        return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)
+    finally:
+        if job is not None:
+            job.close()      # KILL_ON_JOB_CLOSE:即使前面漏殺,關 handle 也會收乾淨
 
 
 def _resume_process(pid: int):
@@ -183,8 +222,14 @@ def _resume_process(pid: int):
                     ("tpBasePri", ctypes.c_long), ("tpDeltaPri", ctypes.c_long),
                     ("dwFlags", wintypes.DWORD)]
 
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p     # 同上:HANDLE 不可截斷
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.OpenThread.restype = ctypes.c_void_p
+    k32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    k32.ResumeThread.argtypes = [ctypes.c_void_p]
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
-    if snap == -1:
+    if not snap or snap == ctypes.c_void_p(-1).value:
         return
     try:
         te = THREADENTRY32()

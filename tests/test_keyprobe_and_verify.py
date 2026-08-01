@@ -114,7 +114,9 @@ def test_真網路分類器_HTTPError對照():
 def _full_report(tmp_path, **overrides):
     pt = {
         "完整評測": True, "缺柱": [], "缺柱權重合計": 0.0,
-        "曲側合成": 77.7,
+        # ⚠️ 預設值要自洽:八柱全 70 → 加權合成就是 70.0。
+        #    (舊 fixture 隨手寫 77.7,新裁判會重算並正確地拒收它。)
+        "曲側合成": 70.0,
         "柱分": {k: {"score": 70.0} for k in
                  ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")},
     }
@@ -178,3 +180,53 @@ def test_舊檔不可冒充本輪新產物(tmp_path):
     future = time.time() + 3600
     why = V.validate(p, newer_than=future)
     assert why != "" and "舊" in why, "🔴 舊報告被當成這輪 VerifyModels 的證據"
+
+
+# ── Codex R14:裁判要驗「內部自洽」,不只是八個 score 各自像數字 ─────────
+
+def test_八柱全0卻宣稱合成100要拒收(tmp_path):
+    """🔴 Codex R14:裁判只驗「每柱 score 是數字」,產出端把合成算錯照樣蓋章。
+    裁判要用**自己凍結的權重**重算,不信報告裡可被一起改壞的權重。"""
+    柱分 = {k: {"score": 0.0} for k in V.REQUIRED_PILLARS}
+    why = V.validate(_full_report(tmp_path, 柱分=柱分, 曲側合成=100.0))
+    assert why != "" and "重算" in why, f"🔴 合成與柱分矛盾卻通過:{why!r}"
+
+
+def test_合成正確就過(tmp_path):
+    柱分 = {k: {"score": 70.0} for k in V.REQUIRED_PILLARS}
+    assert V.validate(_full_report(tmp_path, 柱分=柱分, 曲側合成=70.0)) == ""
+
+
+def test_完整評測卻有缺柱權重要拒收(tmp_path):
+    """🔴 完整=true、缺柱=[] 卻寫 缺柱權重合計=99.9 —— 完整性欄位自相矛盾。"""
+    why = V.validate(_full_report(tmp_path, 缺柱權重合計=99.9))
+    assert why != "" and "缺柱權重" in why, f"沒擋住:{why!r}"
+
+
+@pytest.mark.parametrize("壞內層", [
+    {"score": 70.0, "items": []},
+    {"score": 70.0, "items": "junk"},
+    {"score": 70.0, "missing": "junk"},
+    {"score": 70.0, "missing": [1, 2]},
+])
+def test_柱的內層schema壞掉要拒收(tmp_path, 壞內層):
+    柱分 = {k: {"score": 70.0} for k in V.REQUIRED_PILLARS}
+    柱分["和聲"] = 壞內層
+    why = V.validate(_full_report(tmp_path, 柱分=柱分, 曲側合成=70.0))
+    assert why != "" and "和聲" in why, f"沒擋住 {壞內層}:{why!r}"
+
+
+def test_曲側含柱與八柱不一致要拒收(tmp_path):
+    柱分 = {k: {"score": 70.0} for k in V.REQUIRED_PILLARS}
+    why = V.validate(_full_report(tmp_path, 柱分=柱分, 曲側合成=70.0,
+                                  曲側含柱=["人聲", "和聲"]))
+    assert why != "" and "曲側含柱" in why
+
+
+def test_裁判的凍結權重要跟評審團同步():
+    """⚠️ 裁判故意凍一份自己的權重(不信報告)——但那份必須跟產出端一致,
+    否則正常報告會被誤判。這條測試就是兩邊的同步鎖。"""
+    J = load("評審團")
+    for k, w in V.CANON_PILLAR_W.items():
+        assert J.PILLAR_W[k] == w, f"{k} 權重不同步:裁判 {w} vs 評審團 {J.PILLAR_W[k]}"
+    assert set(V.CANON_PILLAR_W) == set(J.PILLAR_W) - {"詞"}

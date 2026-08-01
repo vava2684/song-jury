@@ -398,6 +398,7 @@ if [ "$VERIFY_MODELS" = 1 ]; then
     #    ② 子環境用 env -u 清掉 SKIP_GEMINI/TRUST_LEGACY_STEMS ——
     #       呼叫 shell 遺留的變數會讓驗證跳關或信任舊快取;也不動呼叫者的環境;
     #    ③ 不信 exit 0:用 驗證報告.py 獨立解析 JSON —— stub 寫個 {} 也騙不過。
+    # <verify-block-start>  ⚠️ 這對標記給 tests/test_installer_order.py 抽取用
     VID="verify_$(date +%s)_$$"
     printf "
       ${C_DIM}--verify-models:實跑 評審團.py ${VID}.wav(唯一檔名,強迫全模型路徑;首次會下載數 GB)...${C_OFF}
@@ -425,6 +426,7 @@ if [ "$VERIFY_MODELS" = 1 ]; then
     fi
     _sj_verify_cleanup                       # 正常路徑也清一次
     trap 'rm -f "$SJ_STEP_LOG"' EXIT INT TERM   # 還原原本的 EXIT trap
+    # <verify-block-end>
   else
     bad "--verify-models 需要 .venv 可用" "先完成安裝再驗"; VERIFY_OK=0
   fi

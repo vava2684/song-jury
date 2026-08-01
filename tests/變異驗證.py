@@ -174,6 +174,81 @@ MUTATIONS = [
      "        yield \"ok\"          # 變異:busy/error 全部放行",
      "tests/test_lock_and_gate.py::test_同一把金鑰同時只准一個工作在打"),
 
+    # ── Codex 第十四輪:驗證順序、失敗路徑殺樹、裁判自洽、政策 fail-closed ──
+    ("VerifyModels 先清理才叫裁判(成功路徑必定假陰性)",
+     "install.ps1",
+     '            if ($vrc -eq 0) {\n                & .venv\\Scripts\\python.exe 驗證報告.py',
+     '            if ($false) {\n                & .venv\\Scripts\\python.exe 驗證報告.py',
+     "tests/test_installer_order.py::test_ps1的驗證順序_裁判先看到報告清理在最後",
+     "win32"),
+
+    # ⚠ 殺樹在 Windows 上有兩道:主動 kill_tree + 最外層 finally 的 job.close()
+    #   (KILL_ON_JOB_CLOSE)。只拔一道會被另一道救回 → 兩道一起拔才是真 fail-open。
+    ("非逾時失敗不殺樹(呼叫端已失敗,子程序還在吃 GPU)",
+     "子程序.py",
+     '        except BaseException:\n'
+     '            # ⛔ 任何其他失敗(含 KeyboardInterrupt)也要殺樹再往外拋 ——\n'
+     '            #    「呼叫端失敗了但子程序還在跑」是這個模組存在的理由要防的事。\n'
+     '            kill_tree(p, job)\n'
+     '            try:\n'
+     '                p.communicate(timeout=10)\n'
+     '            except Exception:\n'
+     '                pass\n'
+     '            raise\n'
+     '        return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)\n'
+     '    finally:\n'
+     '        if job is not None:\n'
+     '            job.close()      # KILL_ON_JOB_CLOSE:即使前面漏殺,關 handle 也會收乾淨',
+     '        except _SJ_NEVER:\n'
+     '            pass\n'
+     '        return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)\n'
+     '    finally:\n'
+     '        pass  # 變異:既不殺樹也不關 job',
+     "tests/test_run_tree.py::test_非逾時例外也要殺樹"),
+
+    ("Popen 失敗洩漏 Job handle(長跑服務一路漏核心 handle)",
+     "子程序.py",
+     '    finally:\n        if job is not None:\n            job.close()      # KILL_ON_JOB_CLOSE',
+     '    finally:\n        pass  # 變異:不關 Job handle',
+     "tests/test_run_tree.py::test_Popen失敗不可洩漏Job_handle",
+     "win32"),
+
+    ("裁判不重算曲側合成(八柱全 0 卻宣稱 100 照樣蓋章)",
+     "驗證報告.py",
+     '    if abs(expect - float(v)) > COMPOSITE_TOL:',
+     '    if False:',
+     "tests/test_keyprobe_and_verify.py::test_八柱全0卻宣稱合成100要拒收"),
+
+    ("裁判不驗缺柱權重(完整=true 卻缺柱權重 99.9)",
+     "驗證報告.py",
+     '    if abs(float(lostw)) > 1e-9:',
+     '    if False:',
+     "tests/test_keyprobe_and_verify.py::test_完整評測卻有缺柱權重要拒收"),
+
+    ("裁判不驗柱的內層 schema(items=[]、missing='junk' 照過)",
+     "驗證報告.py",
+     '        if items is not None and not isinstance(items, dict):',
+     '        if False:',
+     "tests/test_keyprobe_and_verify.py::test_柱的內層schema壞掉要拒收"),
+
+    ("拒絕名單不驗格式(打錯一碼就靜默放行,以為擋住其實沒擋)",
+     "金鑰政策.py",
+     '            if not _HEX64.match(tok):',
+     '            if False:',
+     "tests/test_key_policy.py::test_拒絕名單格式錯要fail_closed"),
+
+    (".env 是硬連結照樣採用(借到別條產線的秘密檔)",
+     "金鑰政策.py",
+     '    if getattr(st, "st_nlink", 1) > 1:',
+     '    if False:',
+     "tests/test_key_policy.py::test_env是硬連結要拒絕"),
+
+    ("拒絕名單退回 last-one-wins(後面一行空值清掉前面的 hard deny)",
+     "金鑰政策.py",
+     "        if k == DENY_ENV:",
+     "        if False:",
+     "tests/test_key_policy.py::test_env裡重複的拒絕名單要聯集不可被空值蓋掉"),
+
     # ── Codex 第十三輪:和聲柱假陽性、產線隔離、柱值裁判、脫離程序 ────────
     ("分軌線只驗 demucs 不驗 librosa(缺 librosa 時和聲柱整根降級卻報九柱齊全)",
      "評審團.py",
@@ -218,8 +293,8 @@ MUTATIONS = [
 
     (".env 鍵名不 strip(`KEYS = A` 驗證器讀不到、執行期讀得到)",
      "金鑰政策.py",
-     '        out[k.strip()] = v.strip().strip(\'"\').strip("\'")',
-     '        out[k] = v.strip().strip(\'"\').strip("\'")',
+     '        k = k.strip()\n        v = v.strip()',
+     '        v = v.strip()',
      "tests/test_key_policy.py::test_等號兩邊有空白也讀得到"),
 
     ("多把與單把相加(沒被驗過的金鑰偷渡進真正的呼叫)",
@@ -251,18 +326,22 @@ MUTATIONS = [
     #   只拔一道會被另一道救回(跟 R12 的 symlink 同型),要兩道一起拔才是真 fail-open。
     ("逾時只殺直屬子程序(Demucs/torch 孫程序活著繼續吃 GPU)",
      "子程序.py",
-     '        kill_tree(p, job)\n'
-     '        try:\n'
-     '            out, err = p.communicate(timeout=10)   # 回收,不留殭屍\n'
-     '        except Exception:\n'
-     '            out, err = "", ""\n'
-     '        if job is not None:\n'
-     '            job.close()',
-     '        p.kill()   # 變異:只殺直屬,不殺樹也不關 job\n'
-     '        try:\n'
-     '            out, err = p.communicate(timeout=10)\n'
-     '        except Exception:\n'
-     '            out, err = "", ""',
+     # ⚠ 同上:逾時路徑的 kill_tree 與最外層 finally 的 job.close() 是兩道,
+     #   兩道一起拔才是真的「只殺直屬」。
+     '            kill_tree(p, job)\n'
+     '            try:\n'
+     '                out, err = p.communicate(timeout=10)   # 回收,不留殭屍\n'
+     '            except Exception:\n'
+     '                out, err = "", ""\n'
+     '            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)',
+     '            p.kill()   # 變異:只殺直屬\n'
+     '            try:\n'
+     '                out, err = p.communicate(timeout=10)\n'
+     '            except Exception:\n'
+     '                out, err = "", ""\n'
+     '            if job is not None:\n'
+     '                job.handle = None      # 變異:讓 finally 的 job.close() 失效\n'
+     '            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)',
      "tests/test_run_tree.py::test_逾時要殺整棵樹_孫程序不可存活寫檔"),
 
     ("金鑰驗證退回只驗第一把(第一好第二壞=假陽性)",

@@ -20,6 +20,8 @@
 """
 import hashlib
 import os
+import re
+import stat
 from pathlib import Path
 
 PRIMARY_ENV = "SONG_JURY_GEMINI_API_KEYS"     # 專用變數:process env 與 .env 都認
@@ -41,12 +43,46 @@ def looks_placeholder(k: str) -> bool:
     return k.lower().startswith(("your", "xxx", "todo", "<"))
 
 
+class PolicyError(RuntimeError):
+    """金鑰政策本身不可信(拒絕名單格式壞掉、秘密檔來源可疑)。
+    ⛔ 一律 fail-closed:回零把金鑰,不是「警告後照常用」。"""
+
+
+def _check_secret_file(p: Path):
+    """秘密檔的來源防護:拒 symlink/reparse、拒 hardlink、POSIX 驗擁有者。
+
+    ⛔ Codex R14 實測:把 `.env` 做成指向 `website-production.env` 的 hardlink,
+       金鑰照樣被採用(samefile=True、nlink=2)—— 產線隔離就這樣被繞過去。
+       這多半是同一使用者的配置混用,不是提權,但正是這個政策要防的事故面。
+    ⚠️ 誠實邊界:攻擊者若本來就能改 `.env`,檔內 denylist 不是不可竄改的邊界;
+       真正的 hard deny 請放在 ACL 保護的位置或用受控的 process env 注入。"""
+    if p.is_symlink():
+        raise PolicyError(f"{p.name} 是符號連結,拒絕當秘密檔用 —— 它可能指向別條產線的金鑰檔")
+    st = p.lstat()
+    if os.name == "nt":
+        attrs = getattr(st, "st_file_attributes", 0)
+        if attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            raise PolicyError(f"{p.name} 是 reparse point(junction/symlink),拒絕當秘密檔用")
+    else:
+        if st.st_uid != os.getuid():
+            raise PolicyError(f"{p.name} 不是目前使用者擁有,拒絕當秘密檔用")
+    if getattr(st, "st_nlink", 1) > 1:
+        raise PolicyError(
+            f"{p.name} 有 {st.st_nlink} 個硬連結 —— 它跟另一個檔案是同一份內容,"
+            f"很可能是別條產線的金鑰檔。請改成獨立的一份 .env。")
+
+
 def parse_env_file(path) -> dict:
-    """讀 .env(容忍 BOM、`KEY = value` 的空白、引號、# 註解)。"""
+    """讀 .env(容忍 BOM、`KEY = value` 的空白、引號、# 註解)。
+
+    ⚠️ 重複鍵:一般 dotenv 是 last-one-wins,但**安全敏感的拒絕名單**不能那樣 ——
+       後面一行空值可以無聲清掉前面的 hard deny(Codex R14)。所以拒絕名單改收
+       list(所有非空值聯集),其餘鍵維持 last-one-wins。"""
     out = {}
     p = Path(path)
     if not p.exists():
         return out
+    _check_secret_file(p)
     try:
         text = p.read_text(encoding="utf-8-sig")
     except Exception:
@@ -58,18 +94,44 @@ def parse_env_file(path) -> dict:
         k, v = line.split("=", 1)
         # ⛔ 一定要 strip 鍵名:`GEMINI_API_KEYS = xxx` 這種寫法執行期讀得到、
         #    驗證器讀不到,兩邊就會對不同的金鑰做結論(Codex R13)。
-        out[k.strip()] = v.strip().strip('"').strip("'")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k == DENY_ENV:
+            out.setdefault(k, [])
+            if isinstance(out[k], list):
+                out[k].append(v)          # 聯集,不讓後面的空值蓋掉前面的 deny
+        else:
+            out[k] = v
     return out
 
 
-def deny_fingerprints(env_file=None) -> set:
-    """拒絕名單(SHA-256 小寫 hex)。process env 與 .env 都可設,兩邊聯集。"""
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def deny_fingerprints(env_file=None, envf=None) -> set:
+    """拒絕名單(SHA-256 小寫 hex)。process env 與 .env 都可設,兩邊聯集。
+
+    ⛔ 每個 token 必須是完整的 64 位 hex,否則拋 PolicyError:
+       打錯一碼就靜默放行等於「以為擋住了、其實沒有」——那正是這個名單要防的
+       事故(Codex R14 探針:少一碼/含非 hex 時 effective=1、notes=0)。"""
     vals = [os.environ.get(DENY_ENV, "")]
-    if env_file is not None:
-        vals.append(parse_env_file(env_file).get(DENY_ENV, ""))
+    if envf is None and env_file is not None:
+        envf = parse_env_file(env_file)
+    if envf:
+        v = envf.get(DENY_ENV, "")
+        vals.extend(v if isinstance(v, list) else [v])
     out = set()
     for v in vals:
-        out |= {x.strip().lower() for x in (v or "").split(",") if x.strip()}
+        for tok in (v or "").split(","):
+            tok = tok.strip().lower()
+            if not tok:
+                continue
+            if not _HEX64.match(tok):
+                raise PolicyError(
+                    f"{DENY_ENV} 裡有一個不是 64 位十六進位的項目({tok[:12]}…,長度 {len(tok)})。"
+                    f"⛔ 拒絕名單打錯字會讓你以為擋住了、其實沒擋 —— 請填完整的 SHA-256,"
+                    f"或整個拿掉。")
+            out.add(tok)
     return out
 
 
@@ -78,9 +140,19 @@ def effective_keys(env_file, *, verbose=False):
 
     notes 是給人看的說明(哪些被擋、為什麼),驗證器與執行期印同一份。
     """
-    envf = parse_env_file(env_file)
     notes = []
     raw = []
+    # ⛔ 政策本身出問題(秘密檔來源可疑、拒絕名單格式壞)一律 fail-closed:
+    #    回零把金鑰 + 說清楚原因,絕不「警告後照常用」(Codex R14)。
+    try:
+        envf = parse_env_file(env_file)
+        denied = deny_fingerprints(env_file, envf=envf)
+    except PolicyError as e:
+        notes.append(f"⛔ 金鑰政策無效,本次不使用任何金鑰:{e}")
+        if verbose:
+            for n in notes:
+                print(n)
+        return [], notes
 
     # ① 專用變數:process env 優先,其次 .env
     for src, val in (("環境變數", os.environ.get(PRIMARY_ENV)), (".env", envf.get(PRIMARY_ENV))):
@@ -103,7 +175,6 @@ def effective_keys(env_file, *, verbose=False):
             notes.append(f"⛔ 環境變數 {name} 不被採用(那通常是別條產線的金鑰,借用會吃掉別人的額度)。"
                          f"要給 song-jury 用,請寫進本專案 .env,或改用 {PRIMARY_ENV}。")
 
-    denied = deny_fingerprints(env_file)
     seen, keys = set(), []
     n_placeholder = n_denied = 0
     for k, src in raw:

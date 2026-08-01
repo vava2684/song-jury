@@ -7,6 +7,8 @@
 · 產線隔離只寫在註解裡,程式一行都沒執行 —— 別條產線的金鑰只要 export
   到環境就會被借走(這個專案真的把別人的付費額度打光過)。
 """
+import sys
+
 import pytest
 
 from conftest import load
@@ -86,3 +88,56 @@ def test_拒絕名單也可以寫在env檔裡(tmp_path):
 def test_佔位字串與重複都要濾掉(tmp_path):
     envp = _env(tmp_path, f"GEMINI_API_KEYS=你的第一把金鑰,{A},{A},short")
     assert P.effective_keys(envp)[0] == [A]
+
+
+# ── Codex R14:政策本身壞掉時必須 fail-closed ──────────────────────────
+
+@pytest.mark.parametrize("壞名單", [
+    "a" * 63,                       # 少一碼
+    "z" * 64,                       # 64 個非 hex
+    "g" * 64,
+    P.key_fingerprint("x") + ",badtoken",   # 混一個壞的
+])
+def test_拒絕名單格式錯要fail_closed(tmp_path, monkeypatch, 壞名單):
+    """🔴 Codex R14:打錯一碼時舊碼靜默放行(effective=1、notes=0)——
+    使用者以為擋住了、其實沒有,那正是這個名單要防的事故。"""
+    envp = _env(tmp_path, f"GEMINI_API_KEYS={A}")
+    monkeypatch.setenv(P.DENY_ENV, 壞名單)
+    keys, notes = P.effective_keys(envp)
+    assert keys == [], f"🔴 政策壞掉卻照樣放行 {len(keys)} 把金鑰"
+    assert any("政策無效" in n for n in notes), f"要講清楚原因:{notes}"
+
+
+def test_env裡重複的拒絕名單要聯集不可被空值蓋掉(tmp_path):
+    """🔴 Codex R14:一般 dotenv 是 last-one-wins,後面一行空值就把 hard deny
+    無聲清掉了。安全敏感的設定要取所有非空值的聯集。"""
+    envp = _env(tmp_path, f"GEMINI_API_KEYS={A}\n"
+                          f"{P.DENY_ENV}={P.key_fingerprint(A)}\n"
+                          f"{P.DENY_ENV}=\n")
+    keys, notes = P.effective_keys(envp)
+    assert keys == [], "🔴 後面的空值把前面的 hard deny 清掉了"
+    assert any("拒絕名單" in n for n in notes)
+
+
+def test_env是硬連結要拒絕(tmp_path):
+    """🔴 Codex R14 實測:把 .env 做成指向 website-production.env 的 hardlink,
+    金鑰照樣被採用 —— 產線隔離就這樣被繞過去。"""
+    import os as _os
+    other = tmp_path / "website-production.env"
+    other.write_text(f"GEMINI_API_KEYS={B}", encoding="utf-8")
+    envp = tmp_path / ".env"
+    _os.link(other, envp)
+    keys, notes = P.effective_keys(envp)
+    assert keys == [], "🔴 硬連結到別條產線的秘密檔,金鑰還是被拿去用了"
+    assert any("硬連結" in n for n in notes), f"要說清楚為什麼:{notes}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 建 symlink 需特權")
+def test_env是符號連結要拒絕(tmp_path):
+    other = tmp_path / "other.env"
+    other.write_text(f"GEMINI_API_KEYS={B}", encoding="utf-8")
+    envp = tmp_path / ".env"
+    envp.symlink_to(other)
+    keys, notes = P.effective_keys(envp)
+    assert keys == []
+    assert any("符號連結" in n for n in notes)

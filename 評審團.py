@@ -71,8 +71,14 @@ def _probe_import(py, mods) -> bool:
        (實際在 `<venv>\\Lib\\site-packages`)—— 專案 .venv-demucs 永遠被跳過、
        改用全域 anaconda,還剛好遮住 .venv-demucs 缺 librosa 這件事(Codex R13)。"""
     try:
+        # ⛔ 一定要自己指定 encoding:text=True 會用**父程序的 locale**(繁中 Windows
+        #    是 cp950)去解子程序的輸出,而子程序在 PYTHONIOENCODING=utf-8 下吐的是
+        #    UTF-8 中文 traceback → 背景 reader thread UnicodeDecodeError
+        #    (Codex R14;這也是 pytest 那個 PytestUnhandledThreadExceptionWarning 的來源)。
+        #    我們只看 returncode,但吞掉的例外不該汙染輸出、更不該讓 CI 隨機不穩。
         r = subprocess.run([str(py), "-c", "import " + ", ".join(mods)],
-                           capture_output=True, text=True, timeout=120, **_NO_WINDOW)
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120, **_NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False

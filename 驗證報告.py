@@ -18,6 +18,14 @@ from pathlib import Path
 
 REQUIRED_PILLARS = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")
 
+# ⭐ 裁判**自己凍結**一份曲側八柱權重(重構庭 2026-07-25 定版),用來重算曲側合成。
+# ⛔ 不可以信報告裡的「柱權重」:產出端算錯合成時,權重多半也被一起改壞
+#    (Codex R14:八柱 score 全 0、曲側合成 100,舊裁判照樣 PASS)。
+# ⚠️ 這份要跟 評審團.PILLAR_W 的曲側部分一致;test_packaging 有測試釘住兩邊同步。
+CANON_PILLAR_W = {"人聲": 15.2, "和聲": 13.6, "結構編曲": 12.6, "聲學": 12.1,
+                  "旋律記憶": 6.1, "真實風格": 6.1, "整體": 5.1, "律動": 4.0}
+COMPOSITE_TOL = 0.15      # 產出端 round(...,1) → 容差給到 0.15 足夠,再大就是真的算錯
+
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -60,6 +68,7 @@ def validate(path: Path, newer_than: float = None) -> str:
     # ⛔ 只驗「柱名在不在」是裝飾:柱值換成 None / {} / {"score": NaN} / true / 999
     #    以前全部 PASS(Codex R13 五連探針)。每一柱的 score 都要是
     #    非 bool、有限、0-100 的數字 —— 這才是「九柱真的算出來了」。
+    scores = {}
     for name in REQUIRED_PILLARS:
         det = 柱分.get(name)
         if not isinstance(det, dict):
@@ -69,6 +78,38 @@ def validate(path: Path, newer_than: float = None) -> str:
             return f"柱分[{name}].score 不是數字:{s!r}"
         if not math.isfinite(s) or not (0 <= s <= 100):
             return f"柱分[{name}].score 不是 0-100 的有限數字:{s!r}"
+        scores[name] = float(s)
+        # ⛔ 內層 schema 也要驗:items 必須是 dict、missing 必須是字串 list ——
+        #    不驗的話 items=[]、missing="junk" 這種破結構照樣被蓋章
+        #    (Codex R14:裁判只驗「八個 score 各自像數字」)。
+        items = det.get("items")
+        if items is not None and not isinstance(items, dict):
+            return f"柱分[{name}].items 不是 dict(拿到 {type(items).__name__})"
+        miss = det.get("missing")
+        if miss is not None and (not isinstance(miss, list)
+                                 or any(not isinstance(x, str) for x in miss)):
+            return f"柱分[{name}].missing 不是字串陣列:{miss!r}"
+
+    # ⛔ 完整評測時「缺柱權重合計」必須是 0 —— 完整=true、缺柱=[] 卻寫 99.9
+    #    是內部自相矛盾,代表產出端的完整性計算壞了(Codex R14 探針)。
+    lostw = pt.get("缺柱權重合計", 0)
+    if isinstance(lostw, bool) or not isinstance(lostw, (int, float)) or not math.isfinite(lostw):
+        return f"缺柱權重合計不是有限數字:{lostw!r}"
+    if abs(float(lostw)) > 1e-9:
+        return f"完整評測卻有缺柱權重 {lostw} —— 完整性欄位自相矛盾"
+
+    # ⛔ 曲側合成用**裁判自己的權重**重算一次:八柱 score 全 0 卻宣稱合成 100,
+    #    舊裁判照樣 PASS。權重不信報告裡的(那會被一起改壞)。
+    wsum = sum(CANON_PILLAR_W.values())
+    expect = round(sum(CANON_PILLAR_W[k] * scores[k] for k in REQUIRED_PILLARS) / wsum, 1)
+    if abs(expect - float(v)) > COMPOSITE_TOL:
+        return (f"曲側合成 {v} 與八柱重算值 {expect} 不符(差 {abs(expect - float(v)):.2f})"
+                f" —— 合成算錯或柱分被竄改")
+
+    # 曲側含柱(有的話)要正好是八柱
+    inc = pt.get("曲側含柱")
+    if inc is not None and sorted(inc) != sorted(REQUIRED_PILLARS):
+        return f"曲側含柱與必要八柱不一致:{inc!r}"
     return ""
 
 

@@ -415,42 +415,52 @@ if ($VerifyModels) {
         #       呼叫 shell 遺留的變數會讓驗證跳關或信任舊快取(驗完恢復,不動呼叫者);
         #    ③ 不信 exit 0:用 驗證報告.py 獨立解析 JSON(完整評測/缺柱/曲側合成/
         #       八柱鍵/本輪新產物)—— stub 寫個 {} 也騙不過。
+        # <verify-block-start>  ⚠️ 這對標記給 tests/test_installer_order.py 抽取用
         $vid = "verify_" + [guid]::NewGuid().ToString("N").Substring(0, 8)
         Write-Host "`n      -VerifyModels:實跑 評審團.py $vid.wav(唯一檔名,強迫全模型路徑;首次會下載數 GB)..." -ForegroundColor DarkGray
         $env:PYTHONUTF8 = "1"
         Copy-Item "demo_mix.wav" "$vid.wav"
         $vEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $oldSkip = $env:SONG_JURY_SKIP_GEMINI; $oldTrust = $env:SONG_JURY_TRUST_LEGACY_STEMS
+        $oldUtf8 = $env:PYTHONUTF8
         Remove-Item Env:SONG_JURY_SKIP_GEMINI -EA SilentlyContinue
         Remove-Item Env:SONG_JURY_TRUST_LEGACY_STEMS -EA SilentlyContinue
+        # ⛔ 順序鐵則(Codex R14 抓到的迴歸,而且是我上一輪加清理時自己造成的):
+        #    「跑評審團 → 依退出碼叫裁判」必須在**同一個 try 裡跑完**,
+        #    清理只能在最外層 finally。舊版把清理放在 finally、裁判放在 finally 之後
+        #    → 成功路徑必定先被刪掉報告,裁判永遠 VERIFY_BAD 檔案不存在,
+        #    完整驗證的成功路徑變成必定假陰性。
         try {
             & .venv\Scripts\python.exe 評審團.py "$vid.wav"
             $vrc = $LASTEXITCODE
+            if ($vrc -eq 0) {
+                & .venv\Scripts\python.exe 驗證報告.py "${vid}_評審團.json" --newer-than $vEpoch
+                if ($LASTEXITCODE -eq 0) {
+                    Ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"
+                } else {
+                    Bad "完整驗證:評審團回報成功但 JSON 驗不過(見上一行 VERIFY_BAD)" "退出碼契約與產出內容不一致,不可採信"
+                    $script:VerifyOk = $false
+                }
+            } elseif ($vrc -eq 2) {
+                Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
+                $script:VerifyOk = $false
+            } else {
+                Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"
+                $script:VerifyOk = $false
+            }
         } finally {
+            # 還原呼叫者的環境(⛔ 連 PYTHONUTF8 都要還:安裝腳本不該把環境改動留給呼叫者)
             if ($null -ne $oldSkip)  { $env:SONG_JURY_SKIP_GEMINI = $oldSkip }
             if ($null -ne $oldTrust) { $env:SONG_JURY_TRUST_LEGACY_STEMS = $oldTrust }
-            # ⛔ 清理放 finally,而且要清**所有** $vid 前綴的產物:評測中途炸掉時
-            #    已經寫出的 _評分.json / _編曲層次.json / _和聲分析.json / _伴奏節奏軌.wav…
-            #    都會留在專案裡(Codex R13 故障注入實測)。Ctrl+C 也走這裡。
+            if ($null -eq $oldUtf8) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
+            else { $env:PYTHONUTF8 = $oldUtf8 }
+            # 清所有 $vid 前綴的產物:中途炸掉時已寫出的 _評分.json / _編曲層次.json /
+            # _和聲分析.json / _伴奏節奏軌.wav… 都要清(Codex R13);Ctrl+C 也走這裡。
             Get-ChildItem -File -Filter "$vid*" -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue
             Get-ChildItem "_stems" -Directory -Filter "$vid*" -EA SilentlyContinue |
                 Remove-Item -Recurse -Force -EA SilentlyContinue
         }
-        if ($vrc -eq 0) {
-            & .venv\Scripts\python.exe 驗證報告.py "${vid}_評審團.json" --newer-than $vEpoch
-            if ($LASTEXITCODE -eq 0) {
-                Ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)"
-            } else {
-                Bad "完整驗證:評審團回報成功但 JSON 驗不過(見上一行 VERIFY_BAD)" "退出碼契約與產出內容不一致,不可採信"
-                $script:VerifyOk = $false
-            }
-        } elseif ($vrc -eq 2) {
-            Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
-            $script:VerifyOk = $false
-        } else {
-            Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論其中一環失敗,原始輸出在上面"
-            $script:VerifyOk = $false
-        }
+        # <verify-block-end>
     } else {
         Bad "-VerifyModels 需要 .venv 可用" "先完成安裝再驗"
         $script:VerifyOk = $false
