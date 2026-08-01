@@ -217,28 +217,6 @@ Step "自我檢查 —— 實際確認九根柱子哪些可用"
 
 $hasEnvExe  = Test-Path ".venv\Scripts\python.exe"
 
-# ⛔ 判斷全部交給 分軌線檢查.py(與 install.sh 共用的唯一實作,有測試在守):
-#    ① 用哪支 python 由 評審團.py 決定(唯一真理來源),安裝器不自己猜;
-#    ② 不可以只驗 import demucs —— 和聲分析.py 要 librosa,只驗 demucs 會在缺 librosa 時
-#       印「九柱齊全」(Codex R13 的假陽性);
-#    ③ 失敗要**印出真正的原因**,而且暫時性失敗會自動再試一次 ——
-#       2026-08-02 實跑:自我檢查靜靜判「和聲缺項」exit 1,同一次執行接下來的
-#       -VerifyModels 卻用同一條線跑完九柱、拿到 VERIFY_OK。沒有原因的假警報最難修。
-$hasDemucs = $false
-if ($hasEnvExe) {
-    $env:PYTHONUTF8 = "1"
-    $lineOut = (& .venv\Scripts\python.exe 分軌線檢查.py 2>&1 | Out-String).TrimEnd()
-    $lineRc = $LASTEXITCODE
-    $hasDemucs = ($lineRc -eq 0)
-    if (-not $hasDemucs) {
-        Write-Host $lineOut -ForegroundColor DarkGray
-        if ($lineRc -eq 1) {
-            Bad "分軌環境缺依賴" "有 demucs 但缺 librosa/numpy/soundfile 其一 → 和聲柱會整根降級;請重跑安裝或 uv pip install -r requirements-demucs.txt"
-        } else {
-            Bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "原因印在上面;剛裝完偶爾是暫時性的(防毒正在掃剛寫下去的幾 GB),重跑一次 -CheckOnly 就知道"
-        }
-    }
-}
 # ⛔ 不能只看 python.exe 在不在:`uv venv` 建完就有 python.exe,套件裝失敗時環境是空的
 #    (實測只有 0.5MB),照樣會被判「完整」。一定要實際 import 關鍵套件才算數。
 function Test-Import($venv, $mods) {
@@ -252,6 +230,45 @@ function Test-Import($venv, $mods) {
 }
 # 基礎環境也要真檢查 —— 它撐著聲學、人聲量測與報告,是最不能假的一個
 $hasEnv = Test-Import ".venv" @("librosa", "numpy", "soundfile", "pyloudnorm", "reportlab")
+
+# ── 分軌線(結構編曲柱 + 和聲柱,合計 26.2%)────────────────────────
+# ⛔ 判斷全部交給 分軌線檢查.py(與 install.sh 共用的唯一實作,有測試在守):
+#    ① 用哪支 python 由 評審團.py 決定(唯一真理來源),安裝器不自己猜;
+#    ② 不可以只驗 import demucs —— 和聲分析.py 要 librosa,只驗 demucs 會在缺 librosa 時
+#       印「九柱齊全」(Codex R13 的假陽性);
+#    ③ 失敗要印出真正的原因、暫時性失敗會再試一次、救回來的會標 RECOVERED ——
+#       2026-08-02 實跑:自我檢查靜靜判「和聲缺項」exit 1,同一次執行接下來的
+#       -VerifyModels 卻用同一條線跑完九柱、拿到 VERIFY_OK。沒有原因的假警報最難修。
+# ⚠️ 順序要跟 install.sh 一致(Codex R17-5):base venv 都不成立時不要先去跑
+#    這支可能等好幾分鐘的探針 —— 那時候結論早就註定了。
+if ($hasEnv) {
+    # ⚠️ PYTHONUTF8 要**存了再設、finally 還原**:這是呼叫者的環境,不是我們的
+    #    (同檔金鑰探針那段已經是這個寫法;R17-5 抓到這裡漏了)。
+    $oldUtf8Line = $env:PYTHONUTF8
+    try {
+        $env:PYTHONUTF8 = "1"
+        $lineOut = (& .venv\Scripts\python.exe 分軌線檢查.py 2>&1 | Out-String).TrimEnd()
+        $lineRc = $LASTEXITCODE
+    } finally {
+        if ($null -eq $oldUtf8Line) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
+        else { $env:PYTHONUTF8 = $oldUtf8Line }
+    }
+    $hasDemucs = ($lineRc -eq 0)
+    if ($hasDemucs) {
+        if ($lineOut -match "DEMUCS_LINE_RECOVERED") {
+            # ⛔ 救回來≠沒事:這條線在這台機器上是不穩的,不可以靜靜給綠燈
+            Write-Host $lineOut -ForegroundColor DarkGray
+            Warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(原因見上面)"
+        }
+    } else {
+        Write-Host $lineOut -ForegroundColor DarkGray
+        if ($lineRc -eq 1) {
+            Bad "分軌環境缺套件" "上面那行有指名缺哪個模組 → 重跑安裝,或 uv pip install -r requirements-demucs.txt"
+        } else {
+            Bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "⛔ 不是缺套件 —— 逾時/啟動失敗/DLL 或快取損壞,照上面的『種類』與『實際』查;重裝 requirements 多半沒用"
+        }
+    }
+}
 $hasMl  = Test-Import ".venv-ml"       @("torch", "muq", "audiobox_aesthetics")
 $hasAud = Test-Import ".venv-audition" @("torch", "s3prl", "muq")
 # SongEval 不能只看 eval.py 在不在:它要用 .venv-ml 跑,那個環境沒裝好就等於沒有
@@ -438,9 +455,15 @@ if ($VerifyModels) {
             2   { Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
                   $script:VerifyOk = $false }
             124 { Bad "完整驗證逾時(已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設環境變數 SONG_JURY_VERIFY_TIMEOUT 加長再試"
-                  $script:VerifyOk = $false }
+                  # ⛔ 124/130 **原樣傳到最外層**,兩個平台一模一樣(Codex R17-2):
+                  #    舊版只把 VerifyOk 設 false,最後被一般失敗洗成 1,於是
+                  #    Windows 的自動化分不出「逾時 / 使用者取消 / 真的裝壞」,
+                  #    Linux 卻分得出來 —— 同一個上層工具在兩邊要寫兩套邏輯。
+                  Write-Host "  (退出碼 124:完整驗證逾時)" -ForegroundColor DarkGray
+                  exit 124 }
             130 { Bad "完整驗證被使用者中斷(Ctrl+C)" "已中止並清理;要驗請重跑"
-                  $script:VerifyOk = $false }
+                  Write-Host "  (退出碼 130:使用者中斷)" -ForegroundColor DarkGray
+                  exit 130 }
             default { Bad "完整驗證沒過(退出碼 $vrc)" "模型下載/載入/推論或 JSON 驗證其中一環失敗,原始輸出在上面"
                       $script:VerifyOk = $false }
         }

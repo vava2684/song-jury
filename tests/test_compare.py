@@ -17,8 +17,12 @@ V = load("驗證報告")
 PILLARS = V.REQUIRED_PILLARS
 
 
-def _report(tmp_path, name, scores, contract="2026-07-25-v1"):
-    """造一份會通過獨立裁判的完整報告(scores: 柱名→分數,或單一數字)。"""
+def _report(tmp_path, name, scores, contract="2026-07-25-v1",
+            audio_sha=None, eval_id=None):
+    """造一份會通過獨立裁判的完整報告(scores: 柱名→分數,或單一數字)。
+
+    ⭐ 預設每首歌都有自己的來源身分(evaluation_id / source_audio_sha256)——
+       那是新版產出端會寫的東西,比較器靠它擋複製改名(R17-3)。"""
     if isinstance(scores, (int, float)):
         scores = {k: float(scores) for k in PILLARS}
     w = V.CANON_PILLAR_W
@@ -30,8 +34,13 @@ def _report(tmp_path, name, scores, contract="2026-07-25-v1"):
         "曲側含柱": list(PILLARS),
     }
     p = tmp_path / f"{name}_評審團.json"
-    p.write_text(json.dumps({"scoring_contract": contract, "pillar_totals": pt},
-                            ensure_ascii=False), encoding="utf-8")
+    # ⚠️ 身分要跟**完整路徑**綁,不是檔名:x/same 與 y/same 是兩首不同的歌,
+    #    用檔名當種子會讓它們共用身分,同名那道防線就永遠測不到(自己踩到)。
+    seed = str(p.resolve())
+    doc = {"scoring_contract": contract, "pillar_totals": pt,
+           "source_audio_sha256": audio_sha or (f"{abs(hash(seed)):064x}"[:64]),
+           "evaluation_id": eval_id or f"{abs(hash((seed, 'e'))):032x}"[:32]}
+    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     return p
 
 
@@ -92,6 +101,9 @@ def test_不完整的報告不可以進比較(tmp_path):
     d = json.loads(a.read_text(encoding="utf-8"))
     d["pillar_totals"]["完整評測"] = False
     d["pillar_totals"]["缺柱"] = ["律動"]
+    # ⚠️ 身分要換掉:沿用甲的 evaluation_id 會被「複製改名」那道先攔下來,
+    #    測到的就不是裁判(變異驗證抓到我這個錯)
+    d["evaluation_id"], d["source_audio_sha256"] = "b" * 32, "b" * 64
     bad.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(C.CompareError):
         C.compare_pk([a, bad], "zh")
@@ -163,7 +175,7 @@ def test_不同資料夾的同名報告不可互相覆蓋(tmp_path):
     b = _report(tmp_path / "y", "same", 80)
     with pytest.raises(C.CompareError) as ei:
         C.compare_pk([a, b], "zh")
-    assert "同名" in str(ei.value)
+    assert ei.value.code == "duplicate_label", f"要是同名那道攔的:{ei.value.code}"
     # 改名之後照樣要能比,而且逐柱表要能對回來源檔案
     b2 = _report(tmp_path / "y", "other", 80)
     out = C.compare_pk([a, b2], "zh")
@@ -177,14 +189,16 @@ def test_同一份報告不可以重複上場(tmp_path):
     ⚠️ 要驗**是哪一道防線攔的**:同名檢查也會擋下來,但它給的指示是
     「請把檔案改成不同名字再比」—— 對「同一份放兩次」的人那是**錯的指示**
     (改名字照樣是同一份)。只寫 `pytest.raises(CompareError)` 的版本
-    被變異驗證證明抓不到這條迴歸(兩道防線互相掩護)。"""
+    被變異驗證證明抓不到這條迴歸(兩道防線互相掩護)。
+    ⭐ 但根因不可以綁在中文文案上(Codex R17-7):改寫或翻譯訊息會變成
+       沒有行為迴歸的紅燈,久了就會有人為了讓測試過而不敢改字。用穩定的 code。"""
     a = _report(tmp_path, "甲", 70)
     for call in (lambda: C.compare_pk([a, a], "zh"),
                  lambda: C.compare_takes([a, a], "g")):
         with pytest.raises(C.CompareError) as e:
             call()
-        assert "自己跟自己" in str(e.value), \
-            f"🔴 攔下來的是別道防線,訊息會把人帶錯方向:{e.value}"
+        assert e.value.code == "duplicate_input", \
+            f"🔴 攔下來的是別道防線({e.value.code}),訊息會把人帶錯方向:{e.value}"
 
 
 def test_語言只認四把尺(tmp_path):
@@ -263,3 +277,84 @@ def test_舊格式報告不可以進比較(tmp_path):
     with pytest.raises(C.CompareError) as ei:
         C.compare_pk([a, old], "zh")
     assert "scoring_contract" in str(ei.value)
+
+
+# ── 來源身分(Codex R17-3)────────────────────────────────────────────
+def test_同一份報告複製改名不可以當成兩首(tmp_path):
+    """🔴 Codex R17-3 實測:`copy takeA_評審團.json takeB_評審團.json` 之後
+    compare_pk 收下 n=2 —— 同一次評測變兩票,PK 冠軍與抽卡結論建立在同一份資料上。
+    inode 那道擋不到(複製出來是不同 inode),檔名又不是身分。
+    ⚠️ 這多半不是攻擊,是整理檔案時的順手複製 —— 更需要程式擋。"""
+    import shutil
+    a = _report(tmp_path, "takeA", 70)
+    b = tmp_path / "takeB_評審團.json"
+    shutil.copyfile(a, b)
+    for call in (lambda: C.compare_pk([a, b], "zh"),
+                 lambda: C.compare_takes([a, b], "g")):
+        with pytest.raises(C.CompareError) as e:
+            call()
+        assert e.value.code == "duplicate_source", f"🔴 被別道防線攔的:{e.value.code}"
+
+
+def test_同一個音源的兩份報告不可以同場比(tmp_path):
+    """重跑同一首歌會得到兩份**內容不同**(時間戳/隨機性)的報告 ——
+    bytes 那層擋不住,但音檔 sha256 一樣就是同一個音源,不該互比。"""
+    a = _report(tmp_path, "甲", 70, audio_sha="f" * 64, eval_id="1" * 32)
+    b = _report(tmp_path, "乙", 80, audio_sha="f" * 64, eval_id="2" * 32)
+    with pytest.raises(C.CompareError) as e:
+        C.compare_pk([a, b], "zh")
+    assert e.value.code == "duplicate_source"
+    assert e.value.detail["field"] == "source_audio_sha256"
+
+
+def test_舊格式報告要誠實標示身分防線比較弱(tmp_path):
+    """⛔ 不可以讓人以為舊報告也擋得住:沒有 evaluation_id / 音檔雜湊時,
+    只剩「內容完全相同」那一層,重跑再改名就繞過去了。輸出要講明。"""
+    a = _report(tmp_path, "舊甲", 70)
+    b = _report(tmp_path, "舊乙", 80)
+    for f in (a, b):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        d.pop("source_audio_sha256"), d.pop("evaluation_id")
+        f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    out = C.compare_pk([a, b], "zh")
+    assert out["source_identity"]["level"] == "weak"
+    assert "擋不住" in out["source_identity"]["note"]
+    # 新版報告則要標成 strong
+    c, d_ = _report(tmp_path, "新甲", 70), _report(tmp_path, "新乙", 80)
+    assert C.compare_pk([c, d_], "zh")["source_identity"]["level"] == "strong"
+
+
+def test_產出端真的會寫來源身分():
+    """比較器的防線建立在產出端寫了身分 —— 那一段不可以只存在於比較器的想像裡。"""
+    from conftest import REPO
+    src = (REPO / "評審團.py").read_text(encoding="utf-8")
+    assert 'merged["source_audio_sha256"] = _file_sha256(song)' in src
+    assert 'merged["evaluation_id"]' in src
+
+
+# ── 錯誤碼是對外契約(Codex R17-7)──────────────────────────────────
+def test_每一種拒絕都有自己的機器碼(tmp_path):
+    """⛔ 測試要驗「哪一道防線攔的」,但不可以綁在可編輯的中文文案上。
+    ⚠️ 碼是契約:改字可以,改碼要當成破壞性變更。"""
+    a = _report(tmp_path, "甲", 70)
+    b = _report(tmp_path, "乙", 80)
+    cases = [
+        ("bad_language", lambda: C.compare_pk([a, b], None)),
+        ("bad_language", lambda: C.compare_pk([a, b], "de")),
+        ("too_few_reports", lambda: C.compare_pk([a], "zh")),
+        ("missing_group", lambda: C.compare_takes([a, b], "")),
+        ("duplicate_input", lambda: C.compare_pk([a, a], "zh")),
+        ("unreadable_report", lambda: C.compare_pk([a, tmp_path / "沒有這份_評審團.json"], "zh")),
+    ]
+    for code, call in cases:
+        with pytest.raises(C.CompareError) as e:
+            call()
+        assert e.value.code == code, f"🔴 期望 {code},拿到 {e.value.code}({e.value})"
+
+
+def test_契約不同與不認得的契約要分得開(tmp_path):
+    a = _report(tmp_path, "甲", 70)
+    b = _report(tmp_path, "乙", 80, contract="2099-01-01-vX")
+    with pytest.raises(C.CompareError) as e:
+        C.compare_pk([a, b], "zh")
+    assert e.value.code in ("contract_mismatch", "invalid_report")

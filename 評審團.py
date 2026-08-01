@@ -432,6 +432,23 @@ def _scrub_nonfinite(o):
     return o
 
 
+def _file_sha256(p: Path, chunk=1 << 20) -> str:
+    """整首音檔的 sha256 —— 報告的來源身分(Codex R17-3)。
+
+    ⛔ 不可以只雜湊頭尾:同一批 SUNO 抽卡的開頭常常一模一樣,只看頭尾會把
+       不同的 take 判成同一個音源(分軌快取那邊踩過同一種錯,見 分軌快取.py)。
+    ⚠️ 讀不到就回空字串,不讓身分計算害整次昂貴的評測失敗;比較器對「沒有身分」
+       的報告會退回較弱的防線並在 note 裡講明。"""
+    try:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for blk in iter(lambda: f.read(chunk), b""):
+                h.update(blk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
 def _write_report(merged: dict, out_path: Path):
     """正式報告的唯一出口:清洗非有限值 + allow_nan=False 雙保險 + 原子發布。
     ⛔ 直接 write_text 覆寫的問題:寫到一半中斷/磁碟錯誤會留半截報告,
@@ -1240,6 +1257,14 @@ def _evaluate(song: Path):
     #    不要就地改舊版 —— 否則「合法改版」與「兩邊一起改錯」在裁判眼裡一模一樣,
     #    舊報告也無法被明確拒絕(Codex R15)。
     merged["scoring_contract"] = SCORING_CONTRACT
+    # ⭐ 來源身分(Codex R17-3):比較器要靠它擋掉「同一份報告複製改名當兩票」。
+    #    ⛔ 檔名不是身分 —— 使用者整理檔案時複製改名是很自然的動作,不必是惡意,
+    #       但排名、冠軍、抽卡結論會因此建立在同一份資料上。
+    #    · source_audio_sha256:整首音檔的雜湊 → 同一個音源不可以在同一場比兩次
+    #    · evaluation_id:這次評測的唯一識別 → 複製出來的檔案兩份會完全一樣,
+    #      連同 bytes 相同一起,構成三層可驗證的身分證據。
+    merged["source_audio_sha256"] = _file_sha256(song)
+    merged["evaluation_id"] = uuid.uuid4().hex
     out_path = song.with_name(song.stem + "_評審團.json")
     _write_report(merged, out_path)   # 清洗非有限值 + allow_nan=False + 原子發布
     # ⛔ 以下全部是「顯示」:報告已原子發布並通過清洗,摘要再怎麼炸都不可以

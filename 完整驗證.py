@@ -44,19 +44,41 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def _cleanup(vid: str):
+def _cleanup(vid: str, retries: int = 3, pause: float = 1.0):
     """清掉這次驗證的所有產物:音檔、各階段中間 JSON、報告、分軌快取。
+
     ⛔ 不是只清 wav 與最終報告 —— 中途炸掉時 _評分.json / _編曲層次.json /
-       _和聲分析.json / _伴奏節奏軌.wav… 都會留下(Codex R13)。"""
-    for p in BASE.glob(f"{vid}*"):
-        try:
-            p.unlink() if p.is_file() else shutil.rmtree(p, ignore_errors=True)
-        except Exception:
-            pass
-    stems = BASE / "_stems"
-    if stems.is_dir():
-        for p in stems.glob(f"{vid}*"):
-            shutil.rmtree(p, ignore_errors=True)
+       _和聲分析.json / _伴奏節奏軌.wav… 都會留下(Codex R13)。
+    🔴 Codex R17-6:舊版 `except Exception: pass` + `rmtree(ignore_errors=True)`,
+       刪不掉時**完全沒有人知道** —— helper 照樣回 0/130 並印「已中止並清理」。
+       防毒、索引器、還沒放手的 child handle 都會讓刪除失敗,結果是音檔與分軌快取
+       默默留在磁碟上,而輸出還在跟你保證清乾淨了。
+       → 現在:重試幾次(Windows 的 sharing violation 多半是短暫的)、**重新掃一次**
+         當判準,並把仍然存在的路徑回傳給呼叫者。清理是可觀測的事實,不是宣稱。
+
+    回傳:清完之後仍然存在的路徑清單(空清單=真的乾淨)。"""
+    def _targets():
+        out = list(BASE.glob(f"{vid}*"))
+        stems = BASE / "_stems"
+        if stems.is_dir():
+            out += list(stems.glob(f"{vid}*"))
+        return out
+
+    for i in range(max(1, retries)):
+        if i:
+            time.sleep(pause)
+        left = _targets()
+        if not left:
+            return []
+        for p in left:
+            try:
+                if p.is_file():
+                    p.unlink()
+                else:
+                    shutil.rmtree(p)      # ⛔ 不用 ignore_errors:失敗要看得見
+            except Exception:
+                pass                       # 這一輪刪不掉沒關係,下面重新掃才是判準
+    return [str(p) for p in _targets()]
 
 
 def run(audio: Path, timeout: float, py: str = None) -> int:
@@ -67,6 +89,9 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
     env = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
     env["PYTHONUTF8"] = "1"
     started = time.time()
+    # ⚠️ 用單一 rc 變數走到底(不在 try 裡 return):清理結果可能把 0 降級成 1,
+    #    而 `finally` 改不動「已經 return 出去的值」—— 那樣寫等於沒改(自己踩過)。
+    rc = 1
     try:
         shutil.copy(audio, wav)
         print(f"      實跑 評審團.py {wav.name}(唯一檔名,強迫全模型路徑;"
@@ -76,29 +101,45 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
                          cwd=BASE, env=env, timeout=timeout)
         except subprocess.TimeoutExpired:
             print(f"⛔ 評審團逾時({timeout:.0f}s,已中止整棵程序樹)", file=sys.stderr)
-            return 124
-        sys.stdout.write(r.stdout or "")
-        sys.stderr.write(r.stderr or "")
-        if r.returncode == 2:
-            print("⛔ 評測跑完但缺柱(退出碼 2)—— 缺柱清單見上面評審團的輸出")
-            return 2
-        if r.returncode != 0:
-            print(f"⛔ 評審團失敗(退出碼 {r.returncode})")
-            return 1
-        # ⛔ 不信 exit 0:獨立裁判拆 JSON,而且**必須**自報 scoring_contract ——
-        #    這是「本輪新產物」的安裝證據,不可以套用舊格式相容(Codex R16-5)。
-        why = validate(report, newer_than=started, require_contract=True)
-        if why:
-            print(f"VERIFY_BAD {why}")
-            return 1
-        print("VERIFY_OK 九柱完整、格式合格、本輪新產物")
-        return 0
+            rc = 124
+        else:
+            sys.stdout.write(r.stdout or "")
+            sys.stderr.write(r.stderr or "")
+            if r.returncode == 2:
+                print("⛔ 評測跑完但缺柱(退出碼 2)—— 缺柱清單見上面評審團的輸出")
+                rc = 2
+            elif r.returncode != 0:
+                print(f"⛔ 評審團失敗(退出碼 {r.returncode})")
+                rc = 1
+            else:
+                # ⛔ 不信 exit 0:獨立裁判拆 JSON,而且**必須**自報 scoring_contract ——
+                #    這是「本輪新產物」的安裝證據,不可套用舊格式相容(Codex R16-5)。
+                why = validate(report, newer_than=started, require_contract=True)
+                if why:
+                    print(f"VERIFY_BAD {why}")
+                    rc = 1
+                else:
+                    print("VERIFY_OK 九柱完整、格式合格、本輪新產物")
+                    rc = 0
     except KeyboardInterrupt:
         # ⭐ 這正是收進 python 的理由:中斷有明確語意(130)且清理一定會跑。
-        print("\n⛔ 使用者中斷(Ctrl+C)—— 已中止並清理", file=sys.stderr)
-        return 130
+        print("\n⛔ 使用者中斷(Ctrl+C)—— 已中止", file=sys.stderr)
+        rc = 130
     finally:
-        _cleanup(vid)
+        # ⛔ 清理結果要誠實回報(Codex R17-6):清不掉就把還在的檔案列出來,
+        #    不可以一律印「已清理」。成功路徑清不乾淨 → 降級成失敗(1),
+        #    因為「零殘留」本來就是這條驗證對外宣稱的一部分。
+        left = _cleanup(vid)
+        if left:
+            print("⛔ 清理沒完全成功,這些還在(請自行刪除):", file=sys.stderr)
+            for p_ in left:
+                print(f"     · {p_}", file=sys.stderr)
+            if rc == 0:
+                print("VERIFY_BAD 九柱與格式都過,但驗證產物沒清乾淨(見上面清單)")
+                rc = 1
+        elif rc == 130:
+            print("   (已清理乾淨)", file=sys.stderr)
+    return rc
 
 
 def main(argv=None) -> int:

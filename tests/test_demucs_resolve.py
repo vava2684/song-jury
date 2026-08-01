@@ -108,9 +108,11 @@ def test_安裝腳本自檢要驗整條線而不是只驗demucs():
 
 # ── 分軌線體檢(分軌線檢查.py)的行為 ────────────────────────────────
 # 🔴 2026-08-02 實跑事故:自我檢查印「和聲 13.6% 缺項 → 評不出有效分數」exit 1,
-#    同一次執行接下來的 -VerifyModels 卻用**同一條線**跑完九柱、拿到 VERIFY_OK。
-#    兩個病灶:失敗完全沒說原因、剛裝完的暫時性失敗被當成永久結論。
+#    同一次執行的 -VerifyModels 卻用**同一條線**跑完九柱、拿到 VERIFY_OK。
+# 🔴 Codex R17-1 又抓到第一版四個病:救回來抹掉證據、三次 600s 疊成 30 分沒輸出、
+#    用「單獨 import demucs 成功」反推缺套件、attempts=0 回沒有原因的失敗。
 D = load("分軌線檢查")
+QUIET = lambda _s: None          # noqa: E731  測試不要噴進度
 
 
 class _R:
@@ -128,44 +130,108 @@ def test_暫時性失敗要再給一次機會(monkeypatch):
         return _R(0) if len(calls) > 1 else _R(1, "OSError: [WinError 5] 存取被拒")
 
     monkeypatch.setattr(D.subprocess, "run", fake)
-    ok, why = D.probe("py", pause=0)
-    assert ok is True, f"🔴 第二次就成功了卻判死:{why}"
+    res = D.probe("py", pause=0, log=QUIET)
+    assert res.ok is True, f"🔴 第二次就成功了卻判死:{res.why}"
     assert len(calls) == 2, "要真的重試,不是只把旗標打開"
+
+
+def test_救回來的要留下證據不可以當沒事發生(monkeypatch):
+    """🔴 Codex R17-1:舊版 fail→success 直接回 (True, '') —— 第一次的錯誤消失,
+    安裝器只看到綠燈。間歇性不穩正是「這次沒事、下次評分掉柱」的來源,
+    必須留痕,讓安裝器印成警告。"""
+    seq = iter([_R(1, "ImportError: DLL load failed while importing _C"), _R(0)])
+    monkeypatch.setattr(D.subprocess, "run", lambda *a, **k: next(seq))
+    res = D.probe("py", pause=0, log=QUIET)
+    assert res.ok and res.recovered, "🔴 這是『重試才成功』,不可以跟一次就過的畫上等號"
+    assert "DLL load failed" in res.first_error, f"🔴 第一次的錯誤被抹掉了:{res!r}"
+    assert res.tries == 2
 
 
 def test_失敗一定要講出真正的原因(monkeypatch):
     """沒有原因的「你缺一根柱子」是最難修的訊息 —— 使用者無從查起。"""
     monkeypatch.setattr(D.subprocess, "run",
                         lambda cmd, **kw: _R(1, "ModuleNotFoundError: No module named 'librosa'"))
-    ok, why = D.probe("py", attempts=1, pause=0)
-    assert ok is False
-    assert "librosa" in why, f"🔴 原因被吞掉了:{why!r}"
+    res = D.probe("py", attempts=1, pause=0, log=QUIET)
+    assert res.ok is False
+    assert "librosa" in res.why, f"🔴 原因被吞掉了:{res.why!r}"
 
 
-def test_逾時也要當成有原因的失敗(monkeypatch):
-    def boom(cmd, **kw):
-        raise D.subprocess.TimeoutExpired(cmd, 1)
+def test_缺套件是確定性的不可以重試(monkeypatch):
+    """🔴 Codex R17-1:缺模組重試一百次還是缺 —— 白等一次 pause + 一次冷啟動。
+    只有『可能是暫時的』那兩類(啟動失敗 / import 炸掉)才值得再試。"""
+    calls = []
+    monkeypatch.setattr(D.subprocess, "run", lambda *a, **k: (
+        calls.append(1),
+        _R(1, "ModuleNotFoundError: No module named 'librosa'"))[1])
+    res = D.probe("py", attempts=3, pause=0, log=QUIET)
+    assert len(calls) == 1, f"🔴 缺套件還重試了 {len(calls)} 次"
+    assert res.kind == D.MISSING and res.module == "librosa"
 
-    monkeypatch.setattr(D.subprocess, "run", boom)
-    ok, why = D.probe("py", attempts=1, pause=0, timeout=1)
-    assert ok is False and "逾時" in why
+
+def test_逾時不可以乘成好幾份預算(monkeypatch):
+    """🔴 Codex R17-1 實測:三次各 600s + pause = 1805 秒(30 分)完全沒有輸出,
+    使用者只會覺得安裝器當掉。預算是**整段**的,不是每次各給一份。
+
+    ⚠️ 要**模擬時間真的過去**才測得出來:不然「剩餘預算」與「整份預算」在
+    第一次嘗試時剛好一樣大,把 timeout=left 改成 timeout=budget 也照樣綠
+    (變異驗證抓到我這個裝飾品)。"""
+    seen = []
+    clock = iter(range(0, 10_000, 3))       # 每次讀秒都前進 3 秒
+
+    def fake_run(cmd, **kw):
+        seen.append(kw.get("timeout"))
+        if len(seen) == 1:
+            return _R(1, "ImportError: 剛裝完還沒穩")     # 可重試 → 會有第二次
+        raise D.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+    monkeypatch.setattr(D.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(D.subprocess, "run", fake_run)
+    res = D.probe("py", attempts=3, budget=10, pause=0, log=QUIET)
+    assert res.kind == D.TIMEOUT
+    assert len(seen) == 2, f"逾時之後不該再試:{seen}"
+    assert seen[-1] < 10, \
+        f"🔴 第二次又拿到整份預算({seen[-1]}s)—— 這正是 600+600+600 的來源"
+    # ⚠️ 不可以拿「各次上限相加」當判準:上限是還能等多久,不是真的等了多久
+    #    (第一次很快就失敗,只用掉 3 秒)。要驗的是**每次都不超過剩餘預算**。
+    assert all(x <= 10 for x in seen), f"🔴 有一次的上限超過總預算:{seen}"
 
 
-def test_只缺依賴回1_整條線壞掉回2(monkeypatch, tmp_path, capsys):
-    """兩種壞法要分得開:① 有 demucs 缺 librosa(分軌能跑、和聲柱死)
-    ② 連 demucs 都沒有(結構編曲柱 + 和聲柱一起死)。安裝器靠這個給不同建議。"""
+def test_每次嘗試都要先報進度(monkeypatch):
+    """⛔ 這支最壞會等好幾分鐘 —— 沒有輸出的等待跟當機在使用者眼裡一模一樣。"""
+    lines = []
+    seq = iter([_R(1, "ImportError: boom"), _R(0)])
+    monkeypatch.setattr(D.subprocess, "run", lambda *a, **k: next(seq))
+    D.probe("py", pause=0, log=lines.append)
+    assert len([x for x in lines if "分軌線體檢" in x]) == 2, f"🔴 進度沒印全:{lines}"
+
+
+def test_不驗就不該叫這支():
+    """attempts=0 舊版回 (False, "") —— 一個沒有原因的失敗,違反這支自己的規矩。"""
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        D.probe("py", attempts=0, log=QUIET)
+
+
+def test_非缺套件的錯不可以被說成缺套件(monkeypatch, tmp_path, capsys):
+    """🔴 Codex R17-1:舊版用「單獨 import demucs 成功」反推「缺 librosa/numpy/soundfile」。
+    DLL/ABI 壞掉、權限、快取損壞全被導向「請重裝 requirements」—— 修不好還怪自己。
+    分類要由**錯誤本身**決定。"""
     fake_py = tmp_path / "python.exe"
     fake_py.write_text("", encoding="utf-8")
+    monkeypatch.setattr(D.subprocess, "run",
+                        lambda *a, **k: _R(1, "ImportError: DLL load failed while importing _C"))
+    assert D.main([str(fake_py)]) == 2, "🔴 DLL 壞掉被歸類成缺套件(exit 1)"
+    out = capsys.readouterr().out
+    assert "import_error" in out and "DLL" in out
 
-    def only_demucs(py, mods=D.DEMUCS_LINE_MODS, **kw):
-        return (tuple(mods) == ("demucs",), "缺 librosa")
 
-    monkeypatch.setattr(D, "probe", only_demucs)
+def test_缺套件回1並指名模組(monkeypatch, tmp_path, capsys):
+    fake_py = tmp_path / "python.exe"
+    fake_py.write_text("", encoding="utf-8")
+    monkeypatch.setattr(D.subprocess, "run",
+                        lambda *a, **k: _R(1, "ModuleNotFoundError: No module named 'soundfile'"))
     assert D.main([str(fake_py)]) == 1
-    assert "DEMUCS_LINE_BAD" in capsys.readouterr().out
-
-    monkeypatch.setattr(D, "probe", lambda py, mods=D.DEMUCS_LINE_MODS, **kw: (False, "沒有 demucs"))
-    assert D.main([str(fake_py)]) == 2
+    assert "soundfile" in capsys.readouterr().out
 
 
 def test_找不到直譯器不可以靜靜當成沒事(capsys):
@@ -174,11 +240,36 @@ def test_找不到直譯器不可以靜靜當成沒事(capsys):
     assert "DEMUCS_LINE_BAD" in capsys.readouterr().out
 
 
-def test_成功時要印出用的是哪支python(monkeypatch, tmp_path, capsys):
+def test_成功時要印出用的是哪支python_救回來的要標RECOVERED(monkeypatch, tmp_path, capsys):
     fake_py = tmp_path / "python.exe"
     fake_py.write_text("", encoding="utf-8")
-    monkeypatch.setattr(D, "probe", lambda py, mods=D.DEMUCS_LINE_MODS, **kw: (True, ""))
+    seq = iter([_R(1, "ImportError: 剛裝完還沒穩"), _R(0)])
+    monkeypatch.setattr(D.subprocess, "run", lambda *a, **k: next(seq))
+    monkeypatch.setattr(D, "RETRY_PAUSE", 0)
     assert D.main([str(fake_py)]) == 0
     out = capsys.readouterr().out
     assert "DEMUCS_LINE_OK" in out and str(fake_py) in out, \
         "要講清楚是哪一支 —— 跟實際跑分用的必須是同一支"
+    assert "DEMUCS_LINE_RECOVERED" in out, "🔴 重試才成功卻給了一個乾淨的綠燈"
+
+
+def test_安裝器要把RECOVERED當警告而不是靜靜放行():
+    """⛔ 救回來≠沒事:這台機器的分軌線是不穩的,正式評分可能掉 26.2% 的權重。"""
+    from conftest import REPO
+    for name in ("install.ps1", "install.sh"):
+        src = (REPO / name).read_text(encoding="utf-8")
+        assert "DEMUCS_LINE_RECOVERED" in src, f"🔴 {name} 沒有處理『重試才成功』"
+
+
+def test_分軌探針要排在base環境檢查之後():
+    """🔴 Codex R17-5:PowerShell 只要看到 python.exe 就先跑最壞好幾分鐘的探針,
+    但 base venv 都不成立時結論早就註定了 —— sh 是先驗 HAS_ENV 才跑。
+    兩邊順序要一致,否則同一種壞環境在兩個平台的耗時與訊息都不同。"""
+    from conftest import REPO
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    assert ps1.index('$hasEnv = Test-Import ".venv"') < ps1.index("分軌線檢查.py"), \
+        "🔴 install.ps1 在還沒確認 base venv 之前就跑分軌探針"
+    assert sh.index('HAS_ENV=') < sh.index("分軌線檢查.py")
+    # 呼叫者的環境不可以被改掉(sh 用 `VAR=值 命令` 只作用於 child;PS 要自己存回)
+    assert "$oldUtf8Line" in ps1, "🔴 install.ps1 沒有存回呼叫者的 PYTHONUTF8"

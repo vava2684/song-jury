@@ -42,7 +42,19 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 
 
 class CompareError(RuntimeError):
-    """輸入不符合比較的前提。⛔ 一律不出結果,不做「盡量比一比」。"""
+    """輸入不符合比較的前提。⛔ 一律不出結果,不做「盡量比一比」。
+
+    ⭐ 每個拒絕都帶一個**穩定的機器碼**(Codex R17-7):測試要驗的是
+       「哪一道防線攔的」,不是那句中文長什麼樣。把根因綁在文案上,
+       改寫、翻譯、把訊息寫得更好都會變成沒有行為迴歸的紅燈,
+       久了就會有人為了讓測試過而不敢改文字。
+       ⛔ code 是對外契約的一部分,改字可以,改碼要當成破壞性變更。
+    """
+
+    def __init__(self, message, code="compare_error", detail=None):
+        super().__init__(message)
+        self.code = code
+        self.detail = detail or {}
 
 
 def load_report(path: Path) -> dict:
@@ -56,13 +68,20 @@ def load_report(path: Path) -> dict:
     try:
         raw = path.read_bytes()
     except OSError as e:
-        raise CompareError(f"讀不到 {path.name}:{type(e).__name__}")
+        raise CompareError(f"讀不到 {path.name}:{type(e).__name__}",
+                           "unreadable_report", {"path": str(path)})
     why = validate_data(raw, path.name, require_contract=True)
     if why:
-        raise CompareError(f"{path.name} 不是可比較的完整報告:{why}")
+        raise CompareError(f"{path.name} 不是可比較的完整報告:{why}",
+                           "invalid_report", {"path": str(path), "why": why})
     d = json.loads(raw.decode("utf-8"))
     pt = d["pillar_totals"]
+    import hashlib
     return {
+        # ⭐ 來源身分(Codex R17-3):複製改名的報告不可以當成兩首歌
+        "evaluation_id": d.get("evaluation_id") or "",
+        "source_audio_sha256": d.get("source_audio_sha256") or "",
+        "report_bytes_sha256": hashlib.sha256(raw).hexdigest(),
         # ⛔ report_id 必須不可碰撞:不同資料夾的同名報告會在 per_pillar 互相覆蓋,
         #    高分那份被低分那份用同一個 key 蓋掉(Codex R16-1 實測 n=2 但表只剩一筆)。
         "report_id": str(path.resolve()),
@@ -75,14 +94,48 @@ def load_report(path: Path) -> dict:
 
 
 def _reject_duplicates(paths):
-    """同一份輸入不可重複上場(A 對 A 會被包裝成合法 PK —— Codex R16-2)。"""
+    """同一個檔案不可重複上場(A 對 A 會被包裝成合法 PK —— Codex R16-2)。
+    這一層擋的是**同一個 inode**:同路徑、相對/絕對別名、symlink、hardlink。
+    ⚠️ 擋不到「複製後改名」—— 那是不同 inode,交給 _reject_same_source()。"""
     seen = []
     for p in paths:
         rp = Path(p).resolve()
         for q in seen:
             if rp == q or (rp.exists() and q.exists() and rp.samefile(q)):
-                raise CompareError(f"同一份報告被放進來兩次:{rp.name} —— 不能自己跟自己比")
+                raise CompareError(
+                    f"同一份報告被放進來兩次:{rp.name} —— 不能自己跟自己比",
+                    "duplicate_input", {"path": str(rp)})
         seen.append(rp)
+
+
+def _reject_same_source(items):
+    """🔴 Codex R17-3:把一份合法報告 **複製 + 改名**,就能當兩首歌/兩個 take 上場。
+
+    `_reject_duplicates` 用 inode 判定,byte-for-byte copy 是不同 inode → 通過;
+    報告裡當時只有顯示用的檔名,沒有任何可驗證的來源身分。於是同一次評測可以
+    重複投票、灌出假 PK 或假抽卡結論 —— 而且這多半不是攻擊,是整理檔案時的順手複製。
+
+    三層身分,由強到弱:
+      ① evaluation_id —— 同一次評測的唯一識別(複製出來的一定相同)
+      ② source_audio_sha256 —— 同一個音源不可以在同一場比兩次
+      ③ 報告 bytes —— 舊報告沒有前兩者時的退路
+    ⚠️ 誠實邊界:舊版報告(沒有 ①②)只剩第 ③ 層,兩次重跑同一首歌的 JSON 會因
+       時間戳而不同 → 擋不住。輸出的 note 會講明這件事,不假裝擋得住。"""
+    for field, why in (("evaluation_id", "同一次評測的結果被放進來兩次"),
+                       ("source_audio_sha256", "同一個音源的報告被放進來兩次"),
+                       ("report_bytes_sha256", "內容完全相同的報告被放進來兩次")):
+        seen = {}
+        for it in items:
+            v = it.get(field)
+            if not v:
+                continue
+            if v in seen:
+                raise CompareError(
+                    f"{why}:{seen[v]} 與 {it['file']}({field} 相同)"
+                    f" —— 改檔名不會讓它變成另一首,請確認是不是複製出來的",
+                    "duplicate_source",
+                    {"field": field, "files": [seen[v], it["file"]], "value": v})
+            seen[v] = it["file"]
 
 
 def _reject_dup_labels(items):
@@ -93,7 +146,8 @@ def _reject_dup_labels(items):
         raise CompareError(
             f"有同名的報告:{dup} —— 排名與逐柱表會對不回來源檔案。"
             f"請把檔案改成不同名字再比(來源:"
-            f"{[i['report_id'] for i in items if i['song'] in dup]})")
+            f"{[i['report_id'] for i in items if i['song'] in dup]})",
+            "duplicate_label", {"labels": dup})
 
 
 def _same_contract(items):
@@ -102,10 +156,12 @@ def _same_contract(items):
         # ⛔ 訊息裡不可以 sorted() 混型別(None 與 str 會 TypeError,
         #    連錯誤都噴不出來 —— Codex R16-5)。
         raise CompareError(f"這幾份報告的計分契約不同:"
-                           f"{sorted(map(repr, names))} —— 尺不一樣不能比")
+                           f"{sorted(map(repr, names))} —— 尺不一樣不能比",
+                           "contract_mismatch", {"contracts": sorted(map(repr, names))})
     name = names.pop()
     if name not in CONTRACTS:
-        raise CompareError(f"不認得的計分契約:{name!r}")
+        raise CompareError(f"不認得的計分契約:{name!r}",
+                           "unknown_contract", {"contract": name})
     return name
 
 
@@ -127,6 +183,25 @@ def _rank(items):
     return out
 
 
+def _identity_note(items):
+    """輸出裡明說這一批的身分防線有多強 —— ⛔ 不可以讓人以為舊報告也擋得住。"""
+    n = len(items)
+    with_eval = sum(1 for i in items if i.get("evaluation_id"))
+    with_audio = sum(1 for i in items if i.get("source_audio_sha256"))
+    if with_eval == n and with_audio == n:
+        level, why = "strong", "每份都帶 evaluation_id 與音檔 sha256:複製改名、同音源重複上場都擋得住"
+    elif with_eval or with_audio:
+        level, why = "mixed", (f"只有 {max(with_eval, with_audio)}/{n} 份帶來源身分 —— "
+                               f"沒帶的那幾份只剩「內容完全相同」這一層,"
+                               f"同一首歌重跑產生的兩份報告擋不住")
+    else:
+        level, why = "weak", ("這批都是舊格式報告(沒有 evaluation_id / 音檔 sha256)—— "
+                              "只擋得掉內容完全相同的複製;重跑一次再改名擋不住,"
+                              "請用新版重評再比")
+    return {"level": level, "with_evaluation_id": with_eval,
+            "with_source_audio_sha256": with_audio, "n": n, "note": why}
+
+
 def _winners(items, key):
     """回 (贏家清單, 是否同分)。⛔ 不可以用單一 max ——
     同分時它會依無關的排序或輸入順序任選一個,把真正的平手偽裝成唯一冠軍
@@ -145,11 +220,13 @@ def compare_pk(paths, lang: str):
     if lang not in LANGS:
         raise CompareError(
             f"PK 必須指定有效的 --lang(拿到 {lang!r})—— 只有四把尺 {LANGS},"
-            f"語言不能用猜的:四把尺不可共量")
+            f"語言不能用猜的:四把尺不可共量",
+            "bad_language", {"lang": lang})
     _reject_duplicates(paths)
     items = [load_report(p) for p in paths]
     if len(items) < 2:
-        raise CompareError("PK 至少要兩首")
+        raise CompareError("PK 至少要兩首", "too_few_reports", {"n": len(items)})
+    _reject_same_source(items)      # ⛔ 複製改名不算另一首(R17-3)
     _reject_dup_labels(items)
     contract = _same_contract(items)
     ranked = _rank(items)
@@ -173,16 +250,23 @@ def compare_pk(paths, lang: str):
                  "並列門檻是保守顯示規則(與該並列組最高分比,可傳遞),不是統計檢定。"
                  "⚠️ 語言由呼叫者宣告 —— 報告本身沒有語言欄位,程式無法代為證明。"
                  "詞柱不在曲側合成內。"),
+        # ⚠️ 誠實邊界:身分防線的強度取決於報告有沒有帶 evaluation_id / 音檔雜湊
+        "source_identity": _identity_note(items),
     }
 
 
 def compare_takes(paths, group: str):
     if not group:
-        raise CompareError("抽卡比較必須指定 --group(同一份詞+prompt 的那組)")
+        raise CompareError("抽卡比較必須指定 --group(同一份詞+prompt 的那組)",
+                           "missing_group")
     _reject_duplicates(paths)
     items = [load_report(p) for p in paths]
     if len(items) < 2:
-        raise CompareError("抽卡比較至少要兩個 take")
+        raise CompareError("抽卡比較至少要兩個 take", "too_few_reports",
+                           {"n": len(items)})
+    # ⛔ 抽卡更需要這道:同一份詞+prompt 的多個 take 本來就長得像,
+    #    複製一份改個名字看起來完全合理,結論卻建立在同一次評測上(R17-3)
+    _reject_same_source(items)
     _reject_dup_labels(items)
     contract = _same_contract(items)
     ranked = _rank(items)
@@ -213,6 +297,7 @@ def compare_takes(paths, group: str):
                  "落差大的柱=這個 prompt 在那個面向不穩定。"
                  "⚠️ 『同一份詞+prompt』由呼叫者用 --group 宣告 —— 報告裡沒有"
                  "lyrics/prompt 指紋,程式無法代為證明(要硬保證需產出端寫入)。"),
+        "source_identity": _identity_note(items),
     }
 
 

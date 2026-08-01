@@ -183,8 +183,8 @@ MUTATIONS = [
 
     ("同一份報告可以重複上場(A 對 A 被當成合法 PK)",
      "比較.py",
-     '    _reject_duplicates(paths)\n    items = [load_report(p) for p in paths]\n    if len(items) < 2:\n        raise CompareError("PK 至少要兩首")',
-     '    items = [load_report(p) for p in paths]\n    if len(items) < 2:\n        raise CompareError("PK 至少要兩首")',
+     '    _reject_duplicates(paths)\n    items = [load_report(p) for p in paths]',
+     '    items = [load_report(p) for p in paths]',
      "tests/test_compare.py::test_同一份報告不可以重複上場"),
 
     ("並列退回相鄰比較(三首以上鏈式擴張成全部第一名)",
@@ -853,22 +853,107 @@ MUTATIONS = [
     #    同一次執行的九柱實跑卻用同一條線拿到 VERIFY_OK ──────────────────
     ("分軌線體檢不重試(剛裝完的暫時性失敗被當成永久結論)",
      "分軌線檢查.py",
-     "def probe(py, mods=DEMUCS_LINE_MODS, attempts=2, timeout=PROBE_TIMEOUT,",
-     "def probe(py, mods=DEMUCS_LINE_MODS, attempts=1, timeout=PROBE_TIMEOUT,",
+     "def probe(py, mods=DEMUCS_LINE_MODS, attempts=2, budget=None,",
+     "def probe(py, mods=DEMUCS_LINE_MODS, attempts=1, budget=None,",
      "tests/test_demucs_resolve.py::test_暫時性失敗要再給一次機會"),
 
-    ("分軌線體檢失敗不說原因(使用者只看到『你缺一根柱子』,無從查起)",
+    ("分軌線缺套件時不說是缺哪一個(只留一句『不能用』)",
      "分軌線檢查.py",
-     '        tail = ((r.stderr or r.stdout or "").strip().splitlines() or ["(沒有輸出)"])[-1]\n'
-     '        why = f"退出碼 {r.returncode}:{tail[:300]}"',
-     '        why = ""   # 變異:原因被吞掉',
+     '        return MISSING, m.group(1), f"缺模組 {m.group(1)}(退出碼 {rc})"',
+     '        return MISSING, m.group(1), ""   # 變異:原因被吞掉',
      "tests/test_demucs_resolve.py::test_失敗一定要講出真正的原因"),
 
-    ("分軌線壞掉時不分「缺依賴」與「整條線死」(安裝器給不出對的建議)",
+    ("分軌線其他壞法不說原因(DLL/權限的錯誤訊息被吞掉)",
      "分軌線檢查.py",
-     "    return 1 if has_demucs else 2",
-     "    return 2",
-     "tests/test_demucs_resolve.py::test_只缺依賴回1_整條線壞掉回2"),
+     '    tail = ((out or "").strip().splitlines() or ["(沒有輸出)"])[-1]\n'
+     '    return IMPORT, None, f"退出碼 {rc}:{tail[:300]}"',
+     '    return IMPORT, None, ""   # 變異:原因被吞掉',
+     "tests/test_demucs_resolve.py::test_非缺套件的錯不可以被說成缺套件"),
+
+    ("分軌線壞掉時不分「缺套件」與「其他壞法」(安裝器給不出對的建議)",
+     "分軌線檢查.py",
+     "    return 1 if res.kind == MISSING else 2",
+     "    return 1",
+     "tests/test_demucs_resolve.py::test_非缺套件的錯不可以被說成缺套件"),
+
+    # ── Codex 第十七輪:重試假綠、退出碼分裂、複製灌票、git 假 skip、清理謊報 ──
+    ("救回來的分軌線不留證據(間歇性不穩被洗成完整綠燈)",
+     "分軌線檢查.py",
+     "                return LineResult(True, OK, \"\", None, first_error, i)",
+     "                return LineResult(True, OK, \"\", None, \"\", i)   # 變異:證據抹掉",
+     "tests/test_demucs_resolve.py::test_救回來的要留下證據不可以當沒事發生"),
+
+    ("缺套件也盲目重試(白等一次冷啟動,錯誤還是一樣)",
+     "分軌線檢查.py",
+     "RETRIABLE = (LAUNCH, IMPORT)",
+     "RETRIABLE = (LAUNCH, IMPORT, MISSING)",
+     "tests/test_demucs_resolve.py::test_缺套件是確定性的不可以重試"),
+
+    ("逾時每次都重新給整份預算(最壞 30 分鐘沒有輸出)",
+     "分軌線檢查.py",
+     "                               errors=\"replace\", timeout=left)",
+     "                               errors=\"replace\", timeout=budget)",
+     "tests/test_demucs_resolve.py::test_逾時不可以乘成好幾份預算"),
+
+    ("分軌線體檢不報進度(等好幾分鐘跟當機看起來一樣)",
+     "分軌線檢查.py",
+     '        log(f"      分軌線體檢 {i}/{attempts}(整段上限 {budget:.0f}s,剩 {left:.0f}s)…")',
+     '        pass   # 變異:不報進度',
+     "tests/test_demucs_resolve.py::test_每次嘗試都要先報進度"),
+
+    ("PowerShell 把使用者中斷(130)洗成一般失敗(自動化分不出取消與裝壞)",
+     "install.ps1",
+     '            130 { Bad "完整驗證被使用者中斷(Ctrl+C)" "已中止並清理;要驗請重跑"\n'
+     '                  Write-Host "  (退出碼 130:使用者中斷)" -ForegroundColor DarkGray\n'
+     '                  exit 130 }',
+     '            130 { Bad "完整驗證被使用者中斷(Ctrl+C)" "已中止並清理;要驗請重跑"\n'
+     '                  $script:VerifyOk = $false }',
+     "tests/test_installer_order.py::test_ps1把helper的退出碼照契約傳出",
+     "win32"),
+
+    ("比較器不擋「複製改名」(同一次評測變兩票)",
+     "比較.py",
+     "    _reject_same_source(items)      # ⛔ 複製改名不算另一首(R17-3)",
+     "    pass",
+     "tests/test_compare.py::test_同一份報告複製改名不可以當成兩首"),
+
+    ("產出端不寫來源身分(比較器的防線失去依據)",
+     "評審團.py",
+     '    merged["source_audio_sha256"] = _file_sha256(song)',
+     '    pass',
+     "tests/test_compare.py::test_產出端真的會寫來源身分"),
+
+    ("拒絕理由退回沒有機器碼(測試只能綁中文文案)",
+     "比較.py",
+     '                    "duplicate_input", {"path": str(rp)})',
+     '                    )',
+     "tests/test_compare.py::test_同一份報告不可以重複上場"),
+
+    ("清理失敗被吞掉(仍然宣稱已清理)",
+     "完整驗證.py",
+     "    return [str(p) for p in _targets()]",
+     "    return []   # 變異:一律宣稱乾淨",
+     "tests/test_installer_order.py::test_清不掉的檔案要被回報而不是靜靜留著"),
+
+    ("九柱都過但清不乾淨仍給綠燈(零殘留的宣稱做不到卻不說)",
+     "完整驗證.py",
+     '            if rc == 0:\n'
+     '                print("VERIFY_BAD 九柱與格式都過,但驗證產物沒清乾淨(見上面清單)")\n'
+     '                rc = 1',
+     '            pass   # 變異:殘留不影響結論',
+     "tests/test_installer_order.py::test_九柱都過但清不乾淨要降級成失敗"),
+
+    ("git 故障被冒充成 ZIP skip(打包變異在 clone 裡靜靜關掉)",
+     "tests/變異驗證.py",
+     '        except GitFailure as e:\n'
+     '            print(f"\\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ Git 故障,這條驗不了也不能當沒事:{desc}")\n'
+     '            print(f"        → {e}")\n'
+     '            bad.append(desc + "(git 故障,打包變異沒驗到)")\n'
+     '            continue',
+     '        except GitFailure:\n'
+     '            skipped.append(("zip", desc))\n'
+     '            continue',
+     "tests/test_mutation_harness.py::test_index_lock故障時整支不可以還是綠的"),
 
 ]
 
@@ -895,6 +980,33 @@ GIT_MUTATIONS = [
      "examples/中文範例-貓步友情進行式.mp3",
      "tests/test_packaging.py::test_四語範例歌曲成對且語言對得上"),
 ]
+
+
+def in_worktree() -> bool:
+    """這裡到底有沒有 git worktree —— ⛔ 這是判斷「ZIP 版」的**唯一**依據。
+
+    🔴 Codex R17-4:舊版把「`git rm` 回非零」一律當成 ZIP 版跳過。
+       但 index.lock 競態、index 唯讀、repo 損壞也都回非零(實測 rc=128)——
+       於是**最需要打包變異保護的 clone**,會在 git 故障時把整組打包檢查靜靜關掉,
+       報表還寫著「只是 ZIP 限制」,而整支照樣 exit 0。"""
+    r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                       cwd=REPO, capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+class GitFailure(RuntimeError):
+    """在 worktree 裡跑 git 卻失敗 —— 這是硬錯誤,不是「這個環境驗不了」。"""
+
+
+def git_must(args):
+    """跑一個一定要成功的 git 指令;失敗就帶著 rc/stderr 炸出來。
+    ⛔ 還原用的 `git add` 也要驗:還原失敗卻宣稱乾淨,比不還原更糟。"""
+    r = subprocess.run(["git"] + args, cwd=REPO, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise GitFailure(f"git {' '.join(args)} 失敗(rc={r.returncode}):"
+                         f"{(r.stderr or r.stdout or '').strip()[:300]}")
+    return r
 
 
 def run_pytest(target):
@@ -1009,20 +1121,28 @@ def main():
 
     # ── 打包類:用 git rm --cached 模擬「這個檔沒進 repo」 ──────────────
     n0 = len(MUTATIONS)
+    is_repo = in_worktree()
     for j, (desc, fname, target) in enumerate(GIT_MUTATIONS, n0 + 1):
-        rm = subprocess.run(["git", "rm", "--cached", "-q", "--", fname],
-                            cwd=REPO, capture_output=True, text=True)
-        if rm.returncode != 0:
-            # ⛔ 這是「這個環境驗不了」(ZIP 沒有 .git),不是「測試沒抓到」——
-            #    算進 bad 會讓 ZIP 版永遠報 4 條缺陷沒抓到,那是假警報。
+        if not is_repo:
+            # ⛔ 只有「明確不是 worktree」才算環境限制(ZIP 版沒有 .git)——
+            #    算進 bad 會讓 ZIP 版永遠報一堆缺陷沒抓到,那是假警報。
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}")
-            print(f"        → 這個環境沒有 git index(ZIP 版),打包類變異只能在 clone 裡驗")
+            print(f"        → 這個環境沒有 git worktree(ZIP 版),打包類變異只能在 clone 裡驗")
             skipped.append(("zip", desc))
+            continue
+        try:
+            # ⛔ 在 worktree 裡 git 還失敗 = 硬錯誤(index.lock / 唯讀 / 損壞),
+            #    不可以偽裝成 ZIP skip(Codex R17-4)
+            git_must(["rm", "--cached", "-q", "--", fname])
+        except GitFailure as e:
+            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ Git 故障,這條驗不了也不能當沒事:{desc}")
+            print(f"        → {e}")
+            bad.append(desc + "(git 故障,打包變異沒驗到)")
             continue
         try:
             failed, ran, picked = run_pytest(target)
         finally:
-            subprocess.run(["git", "add", "--", fname], cwd=REPO, capture_output=True)
+            git_must(["add", "--", fname])          # 還原失敗也要炸,不可以靜靜留著
         if picked == 0:
             print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ 選不到測試:{target}")
             bad.append(desc + "(目標測試不存在)")

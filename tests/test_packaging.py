@@ -459,7 +459,10 @@ def test_VerifyModels要有外層timeout():
     helper = (REPO / "完整驗證.py").read_text(encoding="utf-8")
     assert 'os.environ.get("SONG_JURY_VERIFY_TIMEOUT"' in helper,         "完整驗證.py 沒有真的讀 SONG_JURY_VERIFY_TIMEOUT"
     assert "run_tree" in helper, "jury 沒有用可殺整棵樹的 runner 包住"
-    assert "return 124" in helper and "return 130" in helper,         "逾時(124)與使用者中斷(130)要有各自的退出碼"
+    # ⚠️ 退出碼是**行為**,不是字串:真的跑一次的驗在
+    #    tests/test_installer_order.py(逾時→124、中斷→130、矩陣傳到安裝器最外層)。
+    #    這裡只確認 helper 自己把契約寫在文件裡,兩邊都要有(改一邊就會被抓)。
+    assert "124 = 逾時" in helper and "130 = 使用者中斷" in helper,         "完整驗證.py 的退出碼契約要寫在檔頭"
     for name in ("install.ps1", "install.sh"):
         src = (REPO / name).read_text(encoding="utf-8")
         assert "完整驗證.py" in src, f"{name} 沒有呼叫共用的驗證流程"

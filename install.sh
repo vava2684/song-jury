@@ -271,7 +271,7 @@ fi
 #    ① 用哪支 python 由 評審團.py 決定(唯一真理來源),安裝器不自己猜;
 #    ② 不可以只驗 import demucs —— 和聲分析.py 要 librosa,只驗 demucs 會在缺 librosa 時
 #       印「九柱齊全」(Codex R13 的假陽性);
-#    ③ 失敗要**印出真正的原因**,而且暫時性失敗會自動再試一次 ——
+#    ③ 失敗要印出真正的原因、暫時性失敗會再試一次、救回來的會標 RECOVERED ——
 #       2026-08-02 實跑:自我檢查靜靜判「和聲缺項」exit 1,同一次執行接下來的
 #       --verify-models 卻用同一條線跑完九柱、拿到 VERIFY_OK。沒有原因的假警報最難修。
 HAS_DEMUCS=0
@@ -280,12 +280,18 @@ if [ "$HAS_ENV" = 1 ]; then
   LINE_RC=$?
   if [ "$LINE_RC" = 0 ]; then
     HAS_DEMUCS=1
+    case "$LINE_OUT" in
+      *DEMUCS_LINE_RECOVERED*)
+        # ⛔ 救回來≠沒事:這條線在這台機器上是不穩的,不可以靜靜給綠燈
+        printf "${C_DIM}%s${C_OFF}\n" "$LINE_OUT"
+        warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(原因見上面)" ;;
+    esac
   else
     printf "${C_DIM}%s${C_OFF}\n" "$LINE_OUT"
     if [ "$LINE_RC" = 1 ]; then
-      bad "分軌環境缺依賴" "有 demucs 但缺 librosa/numpy/soundfile 其一 → 和聲柱會整根降級;請重跑安裝或 uv pip install -r requirements-demucs.txt"
+      bad "分軌環境缺套件" "上面那行有指名缺哪個模組 → 重跑安裝,或 uv pip install -r requirements-demucs.txt"
     else
-      bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "原因印在上面;剛裝完偶爾是暫時性的(防毒正在掃剛寫下去的幾 GB),重跑一次 --check-only 就知道"
+      bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "⛔ 不是缺套件 —— 逾時/啟動失敗/DLL 或快取損壞,照上面的『種類』與『實際』查;重裝 requirements 多半沒用"
     fi
   fi
 fi
@@ -406,10 +412,12 @@ if [ "$VERIFY_MODELS" = 1 ]; then
     case "$VRC" in
       0)   ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)" ;;
       2)   bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"; VERIFY_OK=0 ;;
-      124) bad "完整驗證逾時(已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設 SONG_JURY_VERIFY_TIMEOUT 加長再試"; VERIFY_OK=0 ;;
+      # ⛔ 124/130 **原樣傳到最外層**,兩個平台一模一樣(Codex R17-2):
+      #    折成 1 的話自動化分不出「逾時 / 使用者取消 / 真的裝壞」。
+      124) bad "完整驗證逾時(已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設 SONG_JURY_VERIFY_TIMEOUT 加長再試"; VERIFY_OK=0
+           printf "${C_DIM}  (退出碼 124:完整驗證逾時)${C_OFF}\n"; exit 124 ;;
       130) bad "完整驗證被使用者中斷(Ctrl+C)" "已中止並清理;要驗請重跑"; VERIFY_OK=0
-           printf "${C_DIM}  (使用者中斷 → 安裝器以 130 結束)${C_OFF}
-"; exit 130 ;;
+           printf "${C_DIM}  (退出碼 130:使用者中斷)${C_OFF}\n"; exit 130 ;;
       *)   bad "完整驗證沒過(退出碼 $VRC)" "模型下載/載入/推論或 JSON 驗證其中一環失敗,原始輸出在上面"; VERIFY_OK=0 ;;
     esac
     # <verify-block-end>
