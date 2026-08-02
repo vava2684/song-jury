@@ -245,10 +245,16 @@ if ($hasEnv) {
     # ⚠️ PYTHONUTF8 要**存了再設、finally 還原**:這是呼叫者的環境,不是我們的
     #    (同檔金鑰探針那段已經是這個寫法;R17-5 抓到這裡漏了)。
     $oldUtf8Line = $env:PYTHONUTF8
+    $lineOut = ""
     try {
         $env:PYTHONUTF8 = "1"
-        $lineOut = (& .venv\Scripts\python.exe 分軌線檢查.py 2>&1 | Out-String).TrimEnd()
+        # ⛔ 不可以用 (… | Out-String):那會把整段輸出**收進變數**,helper 再怎麼
+        #    flush 使用者也是全程看不到,最壞 15 分鐘像當機(Codex R18-1 實測)。
+        #    Tee-Object 一邊即時顯示、一邊留下文字給下面判斷。
+        $lines = @()
+        & .venv\Scripts\python.exe 分軌線檢查.py 2>&1 | Tee-Object -Variable lines | Out-Host
         $lineRc = $LASTEXITCODE
+        $lineOut = ($lines | Out-String).TrimEnd()
     } finally {
         if ($null -eq $oldUtf8Line) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
         else { $env:PYTHONUTF8 = $oldUtf8Line }
@@ -257,16 +263,15 @@ if ($hasEnv) {
     if ($hasDemucs) {
         if ($lineOut -match "DEMUCS_LINE_RECOVERED") {
             # ⛔ 救回來≠沒事:這條線在這台機器上是不穩的,不可以靜靜給綠燈
-            Write-Host $lineOut -ForegroundColor DarkGray
             Warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(原因見上面)"
         }
+    } elseif ($lineRc -eq 3) {
+        # ⛔ 設定錯誤要跟「機器壞掉」分開(Codex R18-3):一個 typo 不該叫人重裝幾 GB
+        Bad "分軌線體檢的設定值有問題" "看上面的『實際』那行改設定(例如 SONG_JURY_DEMUCS_PROBE_TIMEOUT 要填正數秒數);⛔ 這跟缺套件無關"
+    } elseif ($lineRc -eq 1 -and $lineOut -match "missing_module") {
+        Bad "分軌環境缺套件" "上面那行有指名缺哪個模組 → 重跑安裝,或 uv pip install -r requirements-demucs.txt"
     } else {
-        Write-Host $lineOut -ForegroundColor DarkGray
-        if ($lineRc -eq 1) {
-            Bad "分軌環境缺套件" "上面那行有指名缺哪個模組 → 重跑安裝,或 uv pip install -r requirements-demucs.txt"
-        } else {
-            Bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "⛔ 不是缺套件 —— 逾時/啟動失敗/DLL 或快取損壞,照上面的『種類』與『實際』查;重裝 requirements 多半沒用"
-        }
+        Bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "⛔ 不是缺套件 —— 逾時/啟動失敗/DLL 或快取損壞,照上面的『種類』與『實際』查;重裝 requirements 多半沒用"
     }
 }
 $hasMl  = Test-Import ".venv-ml"       @("torch", "muq", "audiobox_aesthetics")

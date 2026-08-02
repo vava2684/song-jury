@@ -150,3 +150,31 @@ def test_凍結項不在計分細項裡():
     names = [n for rows in items.values() for n, _, _ in rows]
     assert not any("節奏準度" in n or "rhythm" in n.lower() for n in names)
     assert not any("離調" in n or "non_diatonic" in n.lower() for n in names)
+
+
+# ── 來源身分:檔案 bytes vs 解碼後聲音(Codex R18-4)────────────────────
+def test_換容器的同一段聲音_解碼後雜湊要相同(tmp_path):
+    """🔴 實測過的繞過方式:wav 尾端追加 18 bytes → 檔案 sha256 變了,
+    ffmpeg 解碼出來的 PCM 一模一樣。所以「檔案雜湊」不能當成聲音身分。"""
+    import shutil as _sh
+    import sys as _sys
+    from conftest import REPO as R, load as _load
+    if not _sh.which("ffmpeg"):
+        pytest.skip("這台沒有 ffmpeg —— 解碼後雜湊是 best effort")
+    J = _load("評審團")
+    a, b = tmp_path / "a.wav", tmp_path / "b.wav"
+    _sh.copyfile(R / "demo_mix.wav", a)
+    _sh.copyfile(R / "demo_mix.wav", b)
+    with b.open("ab") as f:
+        f.write(b"JUNK_METADATA_ONLY")
+    assert J._file_sha256(a) != J._file_sha256(b), "這個 fixture 本來就該讓檔案雜湊不同"
+    pa, pb = J._pcm_sha256(a), J._pcm_sha256(b)
+    assert pa and pa == pb, f"🔴 解碼後雜湊沒認出是同一段聲音:{pa} vs {pb}"
+
+
+def test_沒有ffmpeg時解碼雜湊回空字串而不是炸掉(tmp_path, monkeypatch):
+    """⚠️ best effort:算不出來就留空,報告照樣發布,比較器會標較弱的等級。"""
+    from conftest import REPO as R, load as _load
+    J = _load("評審團")
+    monkeypatch.setattr(J.shutil, "which", lambda *a, **k: None)
+    assert J._pcm_sha256(R / "demo_mix.wav") == ""

@@ -24,8 +24,13 @@
    0 = 整條線可用(若是重試才成功,會多印一行 DEMUCS_LINE_RECOVERED)
    1 = **明確缺套件**(錯誤訊息指名了哪個模組沒裝)→ 補裝就好
    2 = 其他不可用(逾時 / 啟動失敗 / DLL 或 ABI 壞掉 / 找不到 python)→ 看原因,不是重裝套件
+   3 = **設定錯誤**(SONG_JURY_DEMUCS_PROBE_TIMEOUT 填了非數字/NaN/0/負數)
+       🔴 Codex R18-3:舊版這種 typo 會變成未捕捉例外(rc=1),而安裝器把 1
+          讀成「缺套件」→ 叫人去重裝 requirements。設定錯誤要有自己的碼。
+   ⛔ 任何預期外的例外也一律收斂成 3(帶 kind=internal_error),絕不讓
+      裸 traceback 的 rc=1 被誤讀成缺套件。
 """
-import os
+import math
 import re
 import subprocess
 import sys
@@ -38,22 +43,31 @@ sys.path.insert(0, str(BASE))
 # ⛔ 模組清單與「用哪支 python」都跟評審團.py 拿,不可以在這裡另抄一份 ——
 #    抄了就會有「安裝器說可以、實際跑分說不行」的兩套真理(Codex R13 的老 bug)。
 from 評審團 import DEMUCS_LINE_MODS, DEMUCS_PY   # noqa: E402
+from 設定讀取 import ConfigError, positive_finite   # noqa: E402
 
 RETRY_PAUSE = 5.0
+BUDGET_ENV = "SONG_JURY_DEMUCS_PROBE_TIMEOUT"
 # ⛔ 這是**整段體檢的總預算**,不是每次嘗試各給一份(Codex R17-1:舊版三次各 600s
 #    疊成 30 分鐘)。冷啟動第一次 import torch+numba 確實可能要好幾分鐘,
 #    所以預設給得寬,但封頂而且可調。
-TOTAL_BUDGET = float(os.environ.get("SONG_JURY_DEMUCS_PROBE_TIMEOUT", "900"))
+# ⛔ 不可以在 import 時 float(env):設定打錯會讓整支在載入階段就爆 rc=1,
+#    被安裝器讀成「缺套件」(Codex R18-3)。改成用時才讀、壞掉有自己的碼。
+DEFAULT_BUDGET = 900.0
 
 # 錯誤種類 —— ⛔ 分類要由錯誤本身決定,不可以用「換個 import 再試」反推
 OK = "ok"
+CONFIG = "config_error"     # 設定值壞掉(不是機器壞掉)
+INTERNAL = "internal_error"  # 這支自己出事(也不可以被說成缺套件)
 MISSING = "missing_module"      # 指名了哪個模組沒裝 → 補裝
 TIMEOUT = "timeout"             # 卡住(下載中?死鎖?)
 LAUNCH = "launch_error"         # 連 python 都起不來(權限/檔案被鎖)
 IMPORT = "import_error"         # import 得動但炸了(DLL/ABI/損壞快取)
 
-# 只有這兩種值得再給一次機會:剛裝完幾 GB 剛寫下去、防毒正在掃的時候會出現。
+# 只有這兩種值得**再確認一次**:剛裝完幾 GB 剛寫下去、防毒正在掃的時候會出現。
 # ⛔ MISSING 是確定性的(重試一百次還是缺);TIMEOUT 已經把預算吃掉了。
+# ⚠️ 誠實用詞(Codex R18-7):我們**無法**從 PermissionError / ImportError 本身
+#    斷定它是暫時的 —— 永久的權限問題、ABI 不相容長得一模一樣。所以這不是
+#    「判定為暫時故障」,而是「再給一次確認機會」,而且只給一次、還要吃預算。
 RETRIABLE = (LAUNCH, IMPORT)
 
 _MISSING_RE = re.compile(r"No module named ['\"]([\w.]+)['\"]")
@@ -84,6 +98,11 @@ def _classify(rc, out):
     return IMPORT, None, f"退出碼 {rc}:{tail[:300]}"
 
 
+def budget_from_env(env=None) -> float:
+    """讀總預算 —— 壞掉時丟 ConfigError(呼叫端要翻成 rc=3,不是 rc=1)。"""
+    return positive_finite(BUDGET_ENV, DEFAULT_BUDGET, lo=0.0, hi=86400.0, env=env)
+
+
 def probe(py, mods=DEMUCS_LINE_MODS, attempts=2, budget=None,
           pause=RETRY_PAUSE, log=None) -> LineResult:
     """真的用那支直譯器 import 一次整條線。
@@ -93,7 +112,10 @@ def probe(py, mods=DEMUCS_LINE_MODS, attempts=2, budget=None,
     """
     if attempts < 1:
         raise ValueError(f"attempts 至少要 1(拿到 {attempts})—— 不驗就不該叫這支")
-    budget = TOTAL_BUDGET if budget is None else budget
+    budget = budget_from_env() if budget is None else float(budget)
+    # ⛔ API 參數也要驗:NaN/inf/0 會在 subprocess/time 那層才炸,離現場太遠
+    if not math.isfinite(budget) or budget <= 0:
+        raise ConfigError(f"budget={budget!r} 必須是有限的正數秒數")
     log = log if log is not None else (lambda s: print(s, flush=True))
     deadline = time.monotonic() + budget
     first_error = ""
@@ -124,17 +146,34 @@ def probe(py, mods=DEMUCS_LINE_MODS, attempts=2, budget=None,
         res.first_error = first_error
         if res.kind not in RETRIABLE or i == attempts:
             return res
-        log(f"      ↻ 可能是暫時的({res.kind}),{pause:.0f}s 後再試一次:{res.why[:120]}")
-        time.sleep(pause)
+        # ⛔ 等待也要吃預算(Codex R18-7:budget=0.05 / pause=0.2 實測跑了 0.203s)。
+        #    封頂的是**牆上時間**,不是「幾次 import」。
+        nap = max(0.0, min(pause, deadline - time.monotonic()))
+        log(f"      ↻ 再給一次確認機會({res.kind};無法從錯誤本身判斷是不是暫時的),"
+            f"{nap:.0f}s 後重試:{res.why[:120]}")
+        time.sleep(nap)
     return res
 
 
 def main(argv=None) -> int:
     py = (argv or sys.argv[1:] or [DEMUCS_PY])[0]
     if not py or not Path(py).exists():
-        print(f"DEMUCS_LINE_BAD 找不到可用的 python:{py!r}")
+        print(f"DEMUCS_LINE_BAD 找不到可用的 python:{py!r}\n"
+              f"           種類:{LAUNCH}")
         return 2
-    res = probe(py)
+    try:
+        res = probe(py)
+    except ConfigError as e:
+        # ⛔ 設定錯誤有自己的碼:被歸進 rc=1 的話,安裝器會叫人重裝 requirements
+        print(f"DEMUCS_LINE_BAD 設定值有問題\n"
+              f"           種類:{CONFIG}\n"
+              f"           實際:{e}")
+        return 3
+    except Exception as e:      # noqa: BLE001 —— 這支自己出事也不能被說成缺套件
+        print(f"DEMUCS_LINE_BAD 分軌線體檢自己出錯了\n"
+              f"           種類:{INTERNAL}\n"
+              f"           實際:{type(e).__name__}: {e}")
+        return 3
     if res.ok:
         print(f"DEMUCS_LINE_OK {py}")
         if res.recovered:

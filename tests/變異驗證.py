@@ -339,9 +339,9 @@ MUTATIONS = [
     #   後者是另一種缺陷,描述與注入不一致就等於沒驗到那個 bug(Codex R15)。
     ("VerifyModels 先清理才叫裁判(成功路徑必定假陰性)",
      "完整驗證.py",
-     '        why = validate(report, newer_than=started, require_contract=True)',
-     '        _cleanup(vid)   # 變異:清理跑到裁判前面\n'
-     '        why = validate(report, newer_than=started, require_contract=True)',
+     '                why = validate(report, newer_than=started, require_contract=True,',
+     '                _cleanup(vid)   # 變異:清理跑到裁判前面\n'
+     '                why = validate(report, newer_than=started, require_contract=True,',
      "tests/test_installer_order.py::test_成功路徑_裁判看得到報告且收工後全清乾淨"),
 
     # ⚠ 殺樹在 Windows 上有兩道:主動 kill_tree + 最外層 finally 的 job.close()
@@ -481,7 +481,8 @@ MUTATIONS = [
      "子程序.py",
      '            job = _WinJob()',
      '            raise RuntimeError("變異:不建 Job Object")',
-     "tests/test_run_tree.py::test_Windows下脫離又被孤兒化的後代也要被殺掉"),
+     "tests/test_run_tree.py::test_Windows下脫離又被孤兒化的後代也要被殺掉",
+     "win32"),   # ⚠ 標平台是為了讓 Windows CI 的 --only-platform 抓得到它
 
     # ── Codex 第十二輪:程序樹、逐把驗金鑰、獨立 JSON 裁判、目錄防線 ──────
     # ⚠ 殺樹有兩道:主動 kill_tree + job.close() 的 KILL_ON_JOB_CLOSE 兜底。
@@ -919,7 +920,7 @@ MUTATIONS = [
 
     ("產出端不寫來源身分(比較器的防線失去依據)",
      "評審團.py",
-     '    merged["source_audio_sha256"] = _file_sha256(song)',
+     '    merged["source_file_sha256"] = _file_sha256(song)',
      '    pass',
      "tests/test_compare.py::test_產出端真的會寫來源身分"),
 
@@ -946,7 +947,7 @@ MUTATIONS = [
     ("git 故障被冒充成 ZIP skip(打包變異在 clone 裡靜靜關掉)",
      "tests/變異驗證.py",
      '        except GitFailure as e:\n'
-     '            print(f"\\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ Git 故障,這條驗不了也不能當沒事:{desc}")\n'
+     '            print(f"\\n[{j}/{n0 + len(git_items)}] ❌ Git 故障,這條驗不了也不能當沒事:{desc}")\n'
      '            print(f"        → {e}")\n'
      '            bad.append(desc + "(git 故障,打包變異沒驗到)")\n'
      '            continue',
@@ -954,6 +955,91 @@ MUTATIONS = [
      '            skipped.append(("zip", desc))\n'
      '            continue',
      "tests/test_mutation_harness.py::test_index_lock故障時整支不可以還是綠的"),
+
+    # ── Codex 第十八輪:進度被緩衝、身分沒 schema、設定 typo 被說成缺套件、
+    #    整檔雜湊不等於聲音、成功標記太早發布、pause 不受預算限制 ────────────
+    ("安裝器把分軌體檢的輸出整段緩衝(執行中看不到進度,像當機)",
+     "install.ps1",
+     "        & .venv\\Scripts\\python.exe 分軌線檢查.py 2>&1 | Tee-Object -Variable lines | Out-Host\n"
+     "        $lineRc = $LASTEXITCODE\n"
+     "        $lineOut = ($lines | Out-String).TrimEnd()",
+     "        $lineOut = (& .venv\\Scripts\\python.exe 分軌線檢查.py 2>&1 | Out-String).TrimEnd()\n"
+     "        $lineRc = $LASTEXITCODE",
+     "tests/test_installer_order.py::test_ps1要即時顯示分軌體檢的進度",
+     "win32"),
+
+    ("install.sh 把分軌體檢的輸出整段緩衝(同上,POSIX 版)",
+     "install.sh",
+     '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py 2>&1 | tee "$_line_log"\n'
+     "  LINE_RC=${PIPESTATUS[0]}\n"
+     '  LINE_OUT=$(cat "$_line_log" 2>/dev/null)',
+     "  LINE_OUT=$(PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py 2>&1)\n"
+     "  LINE_RC=$?",
+     "tests/test_installer_order.py::test_sh要即時顯示分軌體檢的進度"),
+
+    ("裁判不驗來源身分的格式(list / 'x' 都被當成有效證據)",
+     "驗證報告.py",
+     "    why_id = identity_problem(d)\n"
+     "    if why_id:\n"
+     "        return why_id",
+     "    pass   # 變異:身分欄位不驗格式",
+     "tests/test_compare.py::test_裁判自己就要擋掉畸形身分"),
+
+    ("比較器不再自己防守畸形身分(裁判一迴歸就變 raw TypeError)",
+     "比較.py",
+     "    why_id = identity_problem(d)\n"
+     "    if why_id:\n"
+     "        raise CompareError(f\"{path.name} 的來源身分不合法:{why_id}\",\n"
+     "                           \"invalid_source_identity\", {\"path\": str(path)})",
+     "    pass   # 變異:不防守",
+     "tests/test_compare.py::test_畸形的身分值不可以讓比較器噴traceback"),
+
+    ("安裝證據不要求來源身分(產出端迴歸也照樣 VERIFY_OK)",
+     "完整驗證.py",
+     "                why = validate(report, newer_than=started, require_contract=True,\n"
+     "                                       require_identity=True)",
+     "                why = validate(report, newer_than=started, require_contract=True)",
+     "tests/test_installer_order.py::test_本輪新產物沒有來源身分要被擋下"),
+
+    ("設定值不驗有限正數(abc/nan/inf 變成未捕捉例外 → 被說成缺套件)",
+     "設定讀取.py",
+     "    if not math.isfinite(val):\n"
+     "        raise ConfigError(f\"{name}={txt!r} 不是有限的數字(NaN/Infinity 不能當秒數)\")",
+     "    pass   # 變異:NaN/Infinity 放行",
+     "tests/test_設定讀取.py::test_NaN與Infinity不是秒數"),
+
+    ("設定錯誤退回一般失敗碼(安裝器又會叫人重裝 requirements)",
+     "分軌線檢查.py",
+     "        return 3\n"
+     "    except Exception as e:      # noqa: BLE001 —— 這支自己出事也不能被說成缺套件",
+     "        return 1\n"
+     "    except Exception as e:      # noqa: BLE001 —— 這支自己出事也不能被說成缺套件",
+     "tests/test_installer_order.py::test_設定打錯不可以被說成缺套件"),
+
+    ("產出端不算解碼後的聲音雜湊(換個容器就變成另一首歌)",
+     "評審團.py",
+     '    merged["source_audio_pcm_sha256"] = _pcm_sha256(song)',
+     '    merged["source_audio_pcm_sha256"] = ""   # 變異:不算解碼後身分',
+     "tests/test_compare.py::test_產出端要寫出解碼後的聲音身分"),
+
+    ("比較器不看解碼後身分(重新封裝的同一段聲音會被當兩個來源)",
+     "比較.py",
+     '                       ("source_audio_pcm_sha256", "同一段聲音(解碼後完全相同)被放進來兩次"),\n',
+     "",
+     "tests/test_compare.py::test_換個容器的同一段聲音不可以當兩首"),
+
+    ("成功標記在清理之前就發布(清理失敗時同時有 OK 與 BAD)",
+     "完整驗證.py",
+     "                    verified = True      # ⛔ 先記著,清理確認乾淨後才發布",
+     '                    print("VERIFY_OK 九柱完整、格式合格、本輪新產物")\n'
+     "                    verified = True",
+     "tests/test_installer_order.py::test_清理沒過時不可以出現成功標記"),
+
+    ("重試的等待不受總預算限制(封頂的不再是牆上時間)",
+     "分軌線檢查.py",
+     "        nap = max(0.0, min(pause, deadline - time.monotonic()))",
+     "        nap = pause   # 變異:等待不吃預算",
+     "tests/test_demucs_resolve.py::test_等待也要吃預算"),
 
 ]
 
@@ -1049,9 +1135,21 @@ def run_pytest(target):
     return n_fail > 0, (n_fail + n_pass) > 0, n_fail + n_pass + n_skip
 
 
-def main():
+def main(argv=None):
+    """--only-platform win32:只跑標了那個平台的變異(給 Windows CI 用)。
+
+    🔴 Codex R18-6:CI 的變異工作固定在 ubuntu,Windows 專屬的變異(Job handle、
+       venv layout、PowerShell 130)在那裡一律誠實跳過 —— 於是「兩平台合起來
+       全覆蓋」實際上是「ubuntu CI + 某次人工 Windows 執行」,不是每次 commit 的保證。
+       有了這個開關,Windows job 只跑那幾條,幾十秒就跑完,不必重跑整套。"""
+    argv = sys.argv[1:] if argv is None else argv
+    only_platform = None
+    if "--only-platform" in argv:
+        only_platform = argv[argv.index("--only-platform") + 1]
+
     print("=" * 66)
-    print("  變異驗證:把真實 bug 塞回去,確認測試抓得到")
+    print("  變異驗證:把真實 bug 塞回去,確認測試抓得到"
+          + (f"(只跑 {only_platform} 專屬那幾條)" if only_platform else ""))
     print("=" * 66)
 
     # 先確認乾淨狀態全綠,否則後面的結果沒有意義
@@ -1071,6 +1169,8 @@ def main():
         #    硬算進 bad 會逼人去修一個假問題(CI ubuntu 實際踩到)。
         desc, fname, old, new, target = item[:5]
         only = item[5] if len(item) > 5 else None
+        if only_platform and only != only_platform:
+            continue          # --only-platform:只跑指定平台專屬的那幾條
         if only and sys.platform != only:
             print(f"\n[{i}/{len(MUTATIONS)}] ⏭ 無法驗證:{desc}")
             print(f"        → 這條是 {only} 專屬的缺陷,本平台({sys.platform})不成立")
@@ -1122,11 +1222,12 @@ def main():
     # ── 打包類:用 git rm --cached 模擬「這個檔沒進 repo」 ──────────────
     n0 = len(MUTATIONS)
     is_repo = in_worktree()
-    for j, (desc, fname, target) in enumerate(GIT_MUTATIONS, n0 + 1):
+    git_items = [] if only_platform else GIT_MUTATIONS   # 打包類不分平台,只在全跑時做
+    for j, (desc, fname, target) in enumerate(git_items, n0 + 1):
         if not is_repo:
             # ⛔ 只有「明確不是 worktree」才算環境限制(ZIP 版沒有 .git)——
             #    算進 bad 會讓 ZIP 版永遠報一堆缺陷沒抓到,那是假警報。
-            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}")
+            print(f"\n[{j}/{n0 + len(git_items)}] ⏭ 無法驗證:{desc}")
             print(f"        → 這個環境沒有 git worktree(ZIP 版),打包類變異只能在 clone 裡驗")
             skipped.append(("zip", desc))
             continue
@@ -1135,7 +1236,7 @@ def main():
             #    不可以偽裝成 ZIP skip(Codex R17-4)
             git_must(["rm", "--cached", "-q", "--", fname])
         except GitFailure as e:
-            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ Git 故障,這條驗不了也不能當沒事:{desc}")
+            print(f"\n[{j}/{n0 + len(git_items)}] ❌ Git 故障,這條驗不了也不能當沒事:{desc}")
             print(f"        → {e}")
             bad.append(desc + "(git 故障,打包變異沒驗到)")
             continue
@@ -1144,15 +1245,15 @@ def main():
         finally:
             git_must(["add", "--", fname])          # 還原失敗也要炸,不可以靜靜留著
         if picked == 0:
-            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ 選不到測試:{target}")
+            print(f"\n[{j}/{n0 + len(git_items)}] ❌ 選不到測試:{target}")
             bad.append(desc + "(目標測試不存在)")
         elif failed:
-            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ✅ 抓到了:{desc}")
+            print(f"\n[{j}/{n0 + len(git_items)}] ✅ 抓到了:{desc}")
         elif not ran:
-            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ⏭ 無法驗證:{desc}(被 skip,不是通過)")
+            print(f"\n[{j}/{n0 + len(git_items)}] ⏭ 無法驗證:{desc}(被 skip,不是通過)")
             skipped.append(("platform", desc))
         else:
-            print(f"\n[{j}/{n0 + len(GIT_MUTATIONS)}] ❌ 沒抓到:{desc}")
+            print(f"\n[{j}/{n0 + len(git_items)}] ❌ 沒抓到:{desc}")
             print(f"        → {target} 在缺陷存在時仍然通過,這條測試是裝飾品")
             bad.append(desc)
 
@@ -1162,7 +1263,9 @@ def main():
         for b in bad:
             print(f"     · {b}")
         return 1
-    total = len(MUTATIONS) + len(GIT_MUTATIONS)
+    total = (len([m for m in MUTATIONS
+                  if (len(m) > 5 and m[5] == only_platform)]) if only_platform
+             else len(MUTATIONS) + len(GIT_MUTATIONS))
     if skipped:
         # ⛔ 有沒驗到的就不可以宣稱「全部抓到」——那是把 skip 當成通過,正是這支要防的事
         # ⛔ 跳過的原因不同,能做的事也不同 —— 混成一句「請在 git clone 跑」會誤導:

@@ -32,7 +32,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from 驗證報告 import CONTRACTS, REQUIRED_PILLARS, validate_data   # noqa: E402
+from 驗證報告 import (CONTRACTS, REQUIRED_PILLARS, identity_problem,   # noqa: E402
+                     validate_data)
 
 COMPARE_CONTRACT = "compare-v1"
 TIE_THRESHOLD = 1.0     # 曲側合成差距 < 1.0 分 → 顯示為並列(保守顯示規則,非統計檢定)
@@ -77,10 +78,21 @@ def load_report(path: Path) -> dict:
     d = json.loads(raw.decode("utf-8"))
     pt = d["pillar_totals"]
     import hashlib
+    # ⛔ 再驗一次身分格式(Codex R18-2):畸形值(list/短字串)以前會一路帶到
+    #    set 裡才 raw TypeError,CLI 的 except CompareError 接不到 —— 使用者拿到
+    #    traceback,自動化拿到不是契約的錯。這裡轉成有 code 的拒絕。
+    why_id = identity_problem(d)
+    if why_id:
+        raise CompareError(f"{path.name} 的來源身分不合法:{why_id}",
+                           "invalid_source_identity", {"path": str(path)})
     return {
-        # ⭐ 來源身分(Codex R17-3):複製改名的報告不可以當成兩首歌
+        # ⭐ 三層來源身分(R17-3 起,R18-4 補上「解碼後」那層):
+        #    file  = 檔案 bytes(換容器/改 metadata 就不同,擋不到重新封裝)
+        #    pcm   = 解碼後聲音(這才是「同一段聲音」)
         "evaluation_id": d.get("evaluation_id") or "",
-        "source_audio_sha256": d.get("source_audio_sha256") or "",
+        "source_file_sha256": (d.get("source_file_sha256")
+                               or d.get("source_audio_sha256") or ""),
+        "source_audio_pcm_sha256": d.get("source_audio_pcm_sha256") or "",
         "report_bytes_sha256": hashlib.sha256(raw).hexdigest(),
         # ⛔ report_id 必須不可碰撞:不同資料夾的同名報告會在 per_pillar 互相覆蓋,
         #    高分那份被低分那份用同一個 key 蓋掉(Codex R16-1 實測 n=2 但表只剩一筆)。
@@ -122,7 +134,8 @@ def _reject_same_source(items):
     ⚠️ 誠實邊界:舊版報告(沒有 ①②)只剩第 ③ 層,兩次重跑同一首歌的 JSON 會因
        時間戳而不同 → 擋不住。輸出的 note 會講明這件事,不假裝擋得住。"""
     for field, why in (("evaluation_id", "同一次評測的結果被放進來兩次"),
-                       ("source_audio_sha256", "同一個音源的報告被放進來兩次"),
+                       ("source_audio_pcm_sha256", "同一段聲音(解碼後完全相同)被放進來兩次"),
+                       ("source_file_sha256", "同一個音檔的報告被放進來兩次"),
                        ("report_bytes_sha256", "內容完全相同的報告被放進來兩次")):
         seen = {}
         for it in items:
@@ -184,22 +197,34 @@ def _rank(items):
 
 
 def _identity_note(items):
-    """輸出裡明說這一批的身分防線有多強 —— ⛔ 不可以讓人以為舊報告也擋得住。"""
+    """輸出裡明說這一批的身分證據**強到哪裡為止** ——
+    ⛔ 不可以讓人以為「有欄位」就等於「同一首歌一定認得出來」(Codex R18-4)。"""
     n = len(items)
     with_eval = sum(1 for i in items if i.get("evaluation_id"))
-    with_audio = sum(1 for i in items if i.get("source_audio_sha256"))
-    if with_eval == n and with_audio == n:
-        level, why = "strong", "每份都帶 evaluation_id 與音檔 sha256:複製改名、同音源重複上場都擋得住"
-    elif with_eval or with_audio:
-        level, why = "mixed", (f"只有 {max(with_eval, with_audio)}/{n} 份帶來源身分 —— "
-                               f"沒帶的那幾份只剩「內容完全相同」這一層,"
-                               f"同一首歌重跑產生的兩份報告擋不住")
+    with_file = sum(1 for i in items if i.get("source_file_sha256"))
+    with_pcm = sum(1 for i in items if i.get("source_audio_pcm_sha256"))
+    if with_eval == n and with_pcm == n:
+        level = "decoded-audio"
+        why = ("每份都帶 evaluation_id 與**解碼後**音訊雜湊:複製改名、換容器、"
+               "改 metadata 之後再上場都擋得住。⚠️ 擋不到 lossy 重壓(那需要 "
+               "acoustic fingerprint,本系統不做)。")
+    elif with_eval == n and with_file == n:
+        level = "exact-file"
+        why = ("每份都帶 evaluation_id 與**檔案** sha256,但缺解碼後雜湊 ——"
+               "同一段聲音只要換個容器或改 metadata 就會被當成兩個來源。"
+               "(產出端沒有 ffmpeg 時會這樣;裝好 ffmpeg 重評即可升級。)")
+    elif with_eval or with_file or with_pcm:
+        level = "mixed"
+        why = (f"只有部分報告帶身分(id {with_eval}/{n}、檔案 {with_file}/{n}、"
+               f"解碼 {with_pcm}/{n})—— 沒帶的那幾份只剩「內容完全相同」這一層,"
+               f"同一首歌重跑產生的兩份報告擋不住")
     else:
-        level, why = "weak", ("這批都是舊格式報告(沒有 evaluation_id / 音檔 sha256)—— "
-                              "只擋得掉內容完全相同的複製;重跑一次再改名擋不住,"
-                              "請用新版重評再比")
+        level = "weak"
+        why = ("這批都是舊格式報告(沒有任何來源身分)—— 只擋得掉內容完全相同的複製;"
+               "重跑一次再改名擋不住,請用新版重評再比")
     return {"level": level, "with_evaluation_id": with_eval,
-            "with_source_audio_sha256": with_audio, "n": n, "note": why}
+            "with_source_file_sha256": with_file,
+            "with_source_audio_pcm_sha256": with_pcm, "n": n, "note": why}
 
 
 def _winners(items, key):

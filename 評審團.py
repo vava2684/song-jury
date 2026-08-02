@@ -433,12 +433,15 @@ def _scrub_nonfinite(o):
 
 
 def _file_sha256(p: Path, chunk=1 << 20) -> str:
-    """整首音檔的 sha256 —— 報告的來源身分(Codex R17-3)。
+    """整首**檔案 bytes** 的 sha256。
 
-    ⛔ 不可以只雜湊頭尾:同一批 SUNO 抽卡的開頭常常一模一樣,只看頭尾會把
-       不同的 take 判成同一個音源(分軌快取那邊踩過同一種錯,見 分軌快取.py)。
-    ⚠️ 讀不到就回空字串,不讓身分計算害整次昂貴的評測失敗;比較器對「沒有身分」
-       的報告會退回較弱的防線並在 note 裡講明。"""
+    ⚠️ 誠實命名(Codex R18-4):這是**檔案**身分,不是**聲音**身分 ——
+       同一段聲音重新封裝、改 ID3/RIFF metadata、尾端多幾個 byte,
+       檔案雜湊就不同,但解碼出來的 PCM 完全一樣。實測:demo_mix.wav 尾端
+       追加 18 bytes 後,檔案 SHA 不同、ffmpeg 解碼後 PCM SHA 完全相同。
+       所以「同音源」要靠下面的 _pcm_sha256,這一支只保證 bytes 相同。
+    ⛔ 不可以只雜湊頭尾:同一批 SUNO 抽卡的開頭常常一模一樣(分軌快取踩過)。
+    ⚠️ 讀不到就回空字串,不讓身分計算害整次昂貴的評測失敗。"""
     try:
         h = hashlib.sha256()
         with open(p, "rb") as f:
@@ -446,6 +449,28 @@ def _file_sha256(p: Path, chunk=1 << 20) -> str:
                 h.update(blk)
         return h.hexdigest()
     except OSError:
+        return ""
+
+
+def _pcm_sha256(p: Path) -> str:
+    """**解碼後**聲音內容的 sha256(固定 44.1k / 立體聲 / s16le 這個標準面)。
+
+    ⭐ 這才是「同一段聲音」的身分:換容器、改 metadata、重新封裝都不會改變它,
+       比較器據此擋掉「同一首歌換個殼再上場」(Codex R18-4)。
+    ⚠️ 邊界要說清楚:它擋的是**解碼後位元相同**;lossy 重壓(320k → 192k)
+       會得到不同的 PCM,那需要 acoustic fingerprint,本系統不假裝做得到。
+    ⚠️ 沒有 ffmpeg 或解碼失敗 → 回空字串,報告仍可發布(比較器會標較弱等級)。"""
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        return ""
+    try:
+        r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),
+                            "-map", "0:a:0", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"],
+                           capture_output=True, timeout=900)
+        if r.returncode != 0 or not r.stdout:
+            return ""
+        return hashlib.sha256(r.stdout).hexdigest()
+    except Exception:
         return ""
 
 
@@ -1260,10 +1285,12 @@ def _evaluate(song: Path):
     # ⭐ 來源身分(Codex R17-3):比較器要靠它擋掉「同一份報告複製改名當兩票」。
     #    ⛔ 檔名不是身分 —— 使用者整理檔案時複製改名是很自然的動作,不必是惡意,
     #       但排名、冠軍、抽卡結論會因此建立在同一份資料上。
-    #    · source_audio_sha256:整首音檔的雜湊 → 同一個音源不可以在同一場比兩次
-    #    · evaluation_id:這次評測的唯一識別 → 複製出來的檔案兩份會完全一樣,
-    #      連同 bytes 相同一起,構成三層可驗證的身分證據。
-    merged["source_audio_sha256"] = _file_sha256(song)
+    #    · source_file_sha256:檔案 bytes → 只保證「同一個檔案」
+    #    · source_audio_pcm_sha256:**解碼後**的聲音 → 換容器/改 metadata 也認得出
+    #      (Codex R18-4:只靠檔案雜湊,尾端加幾個 byte 就變成「另一首歌」)
+    #    · evaluation_id:這次評測的唯一識別 → 複製出來的兩份會完全一樣
+    merged["source_file_sha256"] = _file_sha256(song)
+    merged["source_audio_pcm_sha256"] = _pcm_sha256(song)
     merged["evaluation_id"] = uuid.uuid4().hex
     out_path = song.with_name(song.stem + "_評審團.json")
     _write_report(merged, out_path)   # 清洗非有限值 + allow_nan=False + 原子發布

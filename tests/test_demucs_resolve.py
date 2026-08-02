@@ -273,3 +273,15 @@ def test_分軌探針要排在base環境檢查之後():
     assert sh.index('HAS_ENV=') < sh.index("分軌線檢查.py")
     # 呼叫者的環境不可以被改掉(sh 用 `VAR=值 命令` 只作用於 child;PS 要自己存回)
     assert "$oldUtf8Line" in ps1, "🔴 install.ps1 沒有存回呼叫者的 PYTHONUTF8"
+
+
+def test_等待也要吃預算(monkeypatch):
+    """🔴 Codex R18-7 實測:budget=0.05 / pause=0.2 時實際跑了 0.203s ——
+    封頂的必須是**牆上時間**,不是「幾次 import」。重試前的等待也要扣預算。"""
+    import time as _t
+    monkeypatch.setattr(D.subprocess, "run",
+                        lambda *a, **k: _R(1, "PermissionError: 被鎖住"))
+    slept = []
+    monkeypatch.setattr(D.time, "sleep", lambda s: slept.append(s))
+    D.probe("py", attempts=3, budget=0.05, pause=5.0, log=QUIET)
+    assert all(s <= 0.05 + 1e-6 for s in slept),         f"🔴 等待超過總預算:{slept}(預算只有 0.05s)"

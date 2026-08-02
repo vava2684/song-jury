@@ -13,6 +13,7 @@
 """
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -48,7 +49,8 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def validate(path: Path, newer_than: float = None, require_contract: bool = False) -> str:
+def validate(path: Path, newer_than: float = None, require_contract: bool = False,
+             require_identity: bool = False) -> str:
     """回空字串=通過;否則回第一個不合格的原因(講人話)。
 
     require_contract=True:報告**必須**自報 scoring_contract。
@@ -64,10 +66,37 @@ def validate(path: Path, newer_than: float = None, require_contract: bool = Fals
         raw = path.read_bytes()
     except OSError as e:
         return f"讀不到檔案:{type(e).__name__}"
-    return validate_data(raw, path.name, require_contract=require_contract)
+    return validate_data(raw, path.name, require_contract=require_contract,
+                         require_identity=require_identity)
 
 
-def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = False) -> str:
+# ── 來源身分的 schema(Codex R18-2)──────────────────────────────────
+# 🔴 實測:evaluation_id 寫成 list 時裁判照樣說合格,比較器一進 set 就 raw TypeError;
+#    把雜湊寫成 "x"、id 寫成 "ev-A" 也會被宣稱成 strong —— 那是對不存在的證據蓋章。
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+# 欄位名 → (正則, 說明)。⚠️ source_audio_sha256 是 R17 的舊名,只讀不寫(檔案雜湊)。
+IDENTITY_FIELDS = {
+    "evaluation_id": (_HEX32, "32 位小寫 hex"),
+    "source_file_sha256": (_HEX64, "64 位小寫 hex"),
+    "source_audio_pcm_sha256": (_HEX64, "64 位小寫 hex"),
+    "source_audio_sha256": (_HEX64, "64 位小寫 hex(R17 舊名)"),
+}
+
+
+def identity_problem(d: dict) -> str:
+    """回一句話說明身分欄位哪裡不合法;完全沒有身分欄位不算錯(舊報告)。"""
+    for name, (rx, how) in IDENTITY_FIELDS.items():
+        if name not in d:
+            continue
+        v = d[name]
+        if isinstance(v, bool) or not isinstance(v, str) or not rx.match(v):
+            return f"{name} 不是合法的身分值(要 {how},拿到 {type(v).__name__} {v!r:.40})"
+    return ""
+
+
+def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = False,
+                  require_identity: bool = False) -> str:
     """驗**已經讀進記憶體的那一份 bytes**(給比較器用)。
 
     ⛔ 為什麼要拆出來(Codex R16-6):比較器舊版先 validate(path) 再自己
@@ -89,6 +118,18 @@ def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = F
     pt = d.get("pillar_totals")
     if not isinstance(pt, dict):
         return "缺 pillar_totals(舊格式或產出不完整)"
+
+    # ⭐ 來源身分(Codex R18-2):有寫就必須合法 —— 「有欄位但是垃圾」比沒有更危險,
+    #    因為下游會把它當成證據(實測:寫 "x" 也會被宣稱成 strong)。
+    why_id = identity_problem(d)
+    if why_id:
+        return why_id
+    if require_identity:
+        # 本輪新產物(安裝證據)必須帶得出身分,不可以退回舊格式相容
+        need = [k for k in ("evaluation_id", "source_file_sha256") if k not in d]
+        if need:
+            return (f"報告缺少來源身分欄位 {need} —— 這個模式要求新版產出端的證據"
+                    f"(舊格式相容只給既有報告用)")
 
     # ⭐ 計分契約:報告自報版本 → 裁判查表拿權重與柱集合。
     # ⛔ 不認得的版本一律拒收:那可能是新契約(裁判要跟上)或竄改,

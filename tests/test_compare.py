@@ -18,7 +18,7 @@ PILLARS = V.REQUIRED_PILLARS
 
 
 def _report(tmp_path, name, scores, contract="2026-07-25-v1",
-            audio_sha=None, eval_id=None):
+            audio_sha=None, eval_id=None, pcm_sha=None):
     """造一份會通過獨立裁判的完整報告(scores: 柱名→分數,或單一數字)。
 
     ⭐ 預設每首歌都有自己的來源身分(evaluation_id / source_audio_sha256)——
@@ -38,7 +38,8 @@ def _report(tmp_path, name, scores, contract="2026-07-25-v1",
     #    用檔名當種子會讓它們共用身分,同名那道防線就永遠測不到(自己踩到)。
     seed = str(p.resolve())
     doc = {"scoring_contract": contract, "pillar_totals": pt,
-           "source_audio_sha256": audio_sha or (f"{abs(hash(seed)):064x}"[:64]),
+           "source_file_sha256": audio_sha or (f"{abs(hash(seed)):064x}"[:64]),
+           "source_audio_pcm_sha256": pcm_sha or (f"{abs(hash((seed, 'p'))):064x}"[:64]),
            "evaluation_id": eval_id or f"{abs(hash((seed, 'e'))):032x}"[:32]}
     p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     return p
@@ -103,7 +104,8 @@ def test_不完整的報告不可以進比較(tmp_path):
     d["pillar_totals"]["缺柱"] = ["律動"]
     # ⚠️ 身分要換掉:沿用甲的 evaluation_id 會被「複製改名」那道先攔下來,
     #    測到的就不是裁判(變異驗證抓到我這個錯)
-    d["evaluation_id"], d["source_audio_sha256"] = "b" * 32, "b" * 64
+    d["evaluation_id"] = "b" * 32
+    d["source_file_sha256"], d["source_audio_pcm_sha256"] = "b" * 64, "d" * 64
     bad.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(C.CompareError):
         C.compare_pk([a, bad], "zh")
@@ -299,12 +301,12 @@ def test_同一份報告複製改名不可以當成兩首(tmp_path):
 def test_同一個音源的兩份報告不可以同場比(tmp_path):
     """重跑同一首歌會得到兩份**內容不同**(時間戳/隨機性)的報告 ——
     bytes 那層擋不住,但音檔 sha256 一樣就是同一個音源,不該互比。"""
-    a = _report(tmp_path, "甲", 70, audio_sha="f" * 64, eval_id="1" * 32)
-    b = _report(tmp_path, "乙", 80, audio_sha="f" * 64, eval_id="2" * 32)
+    a = _report(tmp_path, "甲", 70, audio_sha="f" * 64, eval_id="1" * 32, pcm_sha="9" * 64)
+    b = _report(tmp_path, "乙", 80, audio_sha="f" * 64, eval_id="2" * 32, pcm_sha="8" * 64)
     with pytest.raises(C.CompareError) as e:
         C.compare_pk([a, b], "zh")
     assert e.value.code == "duplicate_source"
-    assert e.value.detail["field"] == "source_audio_sha256"
+    assert e.value.detail["field"] == "source_file_sha256"
 
 
 def test_舊格式報告要誠實標示身分防線比較弱(tmp_path):
@@ -314,21 +316,22 @@ def test_舊格式報告要誠實標示身分防線比較弱(tmp_path):
     b = _report(tmp_path, "舊乙", 80)
     for f in (a, b):
         d = json.loads(f.read_text(encoding="utf-8"))
-        d.pop("source_audio_sha256"), d.pop("evaluation_id")
+        for k in ("source_file_sha256", "source_audio_pcm_sha256", "evaluation_id"):
+            d.pop(k, None)
         f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
     out = C.compare_pk([a, b], "zh")
     assert out["source_identity"]["level"] == "weak"
     assert "擋不住" in out["source_identity"]["note"]
-    # 新版報告則要標成 strong
+    # 新版報告(含解碼後雜湊)才是最強的那一級
     c, d_ = _report(tmp_path, "新甲", 70), _report(tmp_path, "新乙", 80)
-    assert C.compare_pk([c, d_], "zh")["source_identity"]["level"] == "strong"
+    assert C.compare_pk([c, d_], "zh")["source_identity"]["level"] == "decoded-audio"
 
 
 def test_產出端真的會寫來源身分():
     """比較器的防線建立在產出端寫了身分 —— 那一段不可以只存在於比較器的想像裡。"""
     from conftest import REPO
     src = (REPO / "評審團.py").read_text(encoding="utf-8")
-    assert 'merged["source_audio_sha256"] = _file_sha256(song)' in src
+    assert 'merged["source_file_sha256"] = _file_sha256(song)' in src
     assert 'merged["evaluation_id"]' in src
 
 
@@ -358,3 +361,73 @@ def test_契約不同與不認得的契約要分得開(tmp_path):
     with pytest.raises(C.CompareError) as e:
         C.compare_pk([a, b], "zh")
     assert e.value.code in ("contract_mismatch", "invalid_report")
+
+
+# ── 身分欄位的 schema 與證據等級(Codex R18-2 / R18-4)────────────────
+def test_畸形的身分值不可以讓比較器噴traceback(tmp_path, monkeypatch):
+    """🔴 Codex R18-2 實測:evaluation_id 寫成 list 時裁判說合格,比較器進 set
+    直接 `TypeError: unhashable type: 'list'` —— CLI 的 except CompareError 接不到,
+    使用者拿到 traceback、自動化拿到不是契約的錯。
+
+    ⚠️ 這裡**故意把裁判停用**:兩道防線都在時,裁判會先擋下來,
+    比較器自己那道拿掉了也測不出來(互相掩護 = 裝飾品)。"""
+    a = _report(tmp_path, "甲", 70)
+    d = json.loads(a.read_text(encoding="utf-8"))
+    d["evaluation_id"] = ["not", "hashable"]
+    a.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    b = _report(tmp_path, "乙", 80)
+    monkeypatch.setattr(C, "validate_data", lambda *a_, **k: "")   # 假裝裁判迴歸了
+    with pytest.raises(C.CompareError) as e:
+        C.compare_pk([a, b], "zh")
+    assert e.value.code == "invalid_source_identity", e.value.code
+
+
+def test_裁判自己就要擋掉畸形身分(tmp_path):
+    """裁判是第一道:有身分欄位就必須合法,「有欄位但是垃圾」比沒有更危險 ——
+    因為下游會把它當成證據。"""
+    a = _report(tmp_path, "甲", 70)
+    base = json.loads(a.read_text(encoding="utf-8"))
+    for bad in ({"evaluation_id": ["x"]}, {"evaluation_id": "ev-A"},
+                {"source_file_sha256": "x"}, {"source_file_sha256": "A" * 64},
+                {"source_audio_pcm_sha256": 123}, {"evaluation_id": True}):
+        d = {**base, **bad}
+        raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
+        why = V.validate_data(raw, "t.json", require_contract=True)
+        assert why, f"🔴 裁判放行了畸形身分:{bad}"
+        assert "身分值" in why
+
+
+def test_換個容器的同一段聲音不可以當兩首(tmp_path):
+    """🔴 Codex R18-4 實測:同一個 wav 尾端加幾個 byte,檔案 sha256 就不同,
+    但 ffmpeg 解碼後的 PCM 完全相同 —— 只靠檔案雜湊,重新封裝就能繞過。
+    現在報告另外帶解碼後雜湊,這一層要擋得住。"""
+    same_pcm = "c" * 64
+    a = _report(tmp_path, "原檔", 70, audio_sha="a" * 64, pcm_sha=same_pcm)
+    b = _report(tmp_path, "改殼", 80, audio_sha="b" * 64, pcm_sha=same_pcm)
+    with pytest.raises(C.CompareError) as e:
+        C.compare_pk([a, b], "zh")
+    assert e.value.code == "duplicate_source"
+    assert e.value.detail["field"] == "source_audio_pcm_sha256"
+
+
+def test_證據等級要說清楚強到哪裡(tmp_path):
+    """⛔ 「有欄位」不等於「同一首歌一定認得出來」:沒有解碼後雜湊時,
+    換容器就會被當成兩個來源 —— 輸出必須誠實標成 exact-file 而不是最強等級。"""
+    a, b = _report(tmp_path, "甲", 70), _report(tmp_path, "乙", 80)
+    assert C.compare_pk([a, b], "zh")["source_identity"]["level"] == "decoded-audio"
+
+    for f in (a, b):                      # 拿掉解碼後雜湊 → 降級
+        d = json.loads(f.read_text(encoding="utf-8"))
+        d.pop("source_audio_pcm_sha256")
+        f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    out = C.compare_pk([a, b], "zh")
+    assert out["source_identity"]["level"] == "exact-file"
+    assert "換個容器" in out["source_identity"]["note"] or "metadata" in out["source_identity"]["note"]
+
+
+def test_產出端要寫出解碼後的聲音身分():
+    """比較器最強的那一層建立在產出端真的算了 PCM 雜湊。"""
+    from conftest import REPO as R
+    src = (R / "評審團.py").read_text(encoding="utf-8")
+    assert 'merged["source_audio_pcm_sha256"] = _pcm_sha256(song)' in src
+    assert 'merged["source_file_sha256"] = _file_sha256(song)' in src

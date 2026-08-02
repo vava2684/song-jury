@@ -92,6 +92,10 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
     # ⚠️ 用單一 rc 變數走到底(不在 try 裡 return):清理結果可能把 0 降級成 1,
     #    而 `finally` 改不動「已經 return 出去的值」—— 那樣寫等於沒改(自己踩過)。
     rc = 1
+    # ⛔ 成功標記**只能在最後發布一次**(Codex R18-5):舊版在裁判過關當下就印
+    #    VERIFY_OK,清理失敗時同一份輸出會同時有 OK 與 BAD —— 退出碼雖然對,
+    #    但任何 grep 成功字串的日誌工具/腳本都會假綠,人讀起來也自相矛盾。
+    verified = False
     try:
         shutil.copy(audio, wav)
         print(f"      實跑 評審團.py {wav.name}(唯一檔名,強迫全模型路徑;"
@@ -114,12 +118,13 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
             else:
                 # ⛔ 不信 exit 0:獨立裁判拆 JSON,而且**必須**自報 scoring_contract ——
                 #    這是「本輪新產物」的安裝證據,不可套用舊格式相容(Codex R16-5)。
-                why = validate(report, newer_than=started, require_contract=True)
+                why = validate(report, newer_than=started, require_contract=True,
+                                       require_identity=True)
                 if why:
                     print(f"VERIFY_BAD {why}")
                     rc = 1
                 else:
-                    print("VERIFY_OK 九柱完整、格式合格、本輪新產物")
+                    verified = True      # ⛔ 先記著,清理確認乾淨後才發布
                     rc = 0
     except KeyboardInterrupt:
         # ⭐ 這正是收進 python 的理由:中斷有明確語意(130)且清理一定會跑。
@@ -137,8 +142,12 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
             if rc == 0:
                 print("VERIFY_BAD 九柱與格式都過,但驗證產物沒清乾淨(見上面清單)")
                 rc = 1
+                verified = False
         elif rc == 130:
             print("   (已清理乾淨)", file=sys.stderr)
+    # ⭐ 唯一一次成功標記:九柱過 + 格式過 + 本輪新產物 + **零殘留**都成立才印
+    if verified and rc == 0:
+        print("VERIFY_OK 九柱完整、格式合格、本輪新產物、零殘留")
     return rc
 
 
