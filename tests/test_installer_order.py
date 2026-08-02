@@ -561,7 +561,10 @@ def test_狀態檔要原子寫入且用完就清(tmp_path):
     #    test_ps1的狀態檔清理必須在finally區塊裡(AST)、
     #    test_ps1中途被中斷時狀態檔不可以留在磁碟上(真的 Stop 一個執行中的 pipeline)。
     assert "Remove-Item -LiteralPath $statusFile" in ps1, "🔴 PS 沒有清狀態檔"
-    assert "trap 'rm -f \"$_line_status\"'" in sh, "🔴 sh 沒有 trap 清理"
+    # ⛔ sh 這邊同樣不用 grep 驗行為(R24-P2-1 起清理統一由 cleanup_all 負責):
+    #    正常 / INT / TERM 三條路都有真跑的測試掃「TMPDIR 必須是空的」——
+    #    這裡只確認那個統一入口還在,行為由那三條守。
+    assert "cleanup_all()" in sh and "trap 'cleanup_all' EXIT" in sh,         "🔴 sh 沒有全域清理入口(cleanup_all)"
 
 
 def test_helper的未預期例外一律收斂成4(tmp_path):
@@ -1095,7 +1098,38 @@ def test_sh在分軌體檢被中斷時要立刻停下來(tmp_path, sig, rc_want)
     assert beat1 and beat1 == beat2, \
         f"🔴 探針還活著(心跳從 {beat1!r} 走到 {beat2!r})—— handler 沒把訊號轉下去"
     assert not natural.exists(), "🔴 探針其實跑完了(沒有被中斷)"
-    assert list(tmpdir.glob("song-jury-demucs.*")) == [], "🔴 狀態檔沒清掉"
+    # ⛔ 兩種 prefix 都要掃(Codex R24-P2-1):只掃狀態檔的話,被局部 EXIT trap
+    #    蓋掉的**全域** sj_step 清理照樣沒人管,而測試全綠。
+    left = sorted(x.name for x in tmpdir.iterdir())
+    assert left == [], f"🔴 中斷後 TMPDIR 還有殘留:{left}"
     for marker in ("冒煙測試", "接下來怎麼用"):
         assert marker not in out, \
             f"🔴 中斷之後還繼續往下跑(看到「{marker}」):\n{out[-600:]}"
+
+
+def test_sh正常跑完不可以留下任何暫存檔(tmp_path):
+    """🔴 Codex R24-P2-1:shell 的 `trap` **不是堆疊** —— 分軌探針那段自己裝了
+    `trap ... EXIT`,把開頭那份 `$SJ_STEP_LOG` 的清理整個蓋掉,結束前再
+    `trap - EXIT` 把它清空。結果:每跑一次就在 TEMP 留一份 sj_step.*
+    (裡面可能有失敗命令的診斷與本機路徑)。⛔ 而當時的中斷測試只掃
+    song-jury-demucs.*,所以完全看不到。"""
+    bash = _git_bash()
+    if not bash:
+        pytest.skip("這台沒有 Git Bash")
+    d = _stub_repo(tmp_path, 0)
+    (d / "分軌線檢查.py").write_text(
+        "import json, sys\n"
+        "a = sys.argv[1:]\n"
+        "p = a[a.index('--status-json') + 1] if '--status-json' in a else None\n"
+        "if p:\n"
+        "    json.dump({'ok': True, 'kind': 'ok', 'rc': 0, 'why': ''},\n"
+        "              open(p, 'w', encoding='utf-8'))\n"
+        "sys.exit(0)\n", encoding="utf-8")
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    r = subprocess.run([bash, str(d / "install.sh"), "--check-only", "--no-auto-tools"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=600, cwd=str(d),
+                       env={**os.environ, "TMPDIR": str(tmpdir).replace(chr(92), "/")})
+    left = sorted(x.name for x in tmpdir.iterdir())
+    assert left == [], f"🔴 正常跑完 TMPDIR 還有殘留:{left}\n{r.stdout[-400:]}"

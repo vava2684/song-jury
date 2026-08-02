@@ -49,7 +49,17 @@ have() { command -v "$1" >/dev/null 2>&1; }
 #    truncate,失敗原因顯示成別人那一步的;固定名稱也有 symlink 風險(Codex R10)。
 #    mktemp 專屬檔 + trap 收尾。
 SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || SJ_STEP_LOG="${TMPDIR:-/tmp}/sj_step_$$.log"
-trap 'rm -f "$SJ_STEP_LOG"' EXIT
+# ⛔ shell 的 trap **不是堆疊**(Codex R24-P2-1 實測):後面的區塊若自己
+#    `trap ... EXIT`,就會把這一份整個蓋掉,之後再 `trap - EXIT` 連帶把它清空 ——
+#    於是 sj_step.* 每跑一次就留一份在 TEMP(裡面可能有命令診斷與本機路徑)。
+#    → 全程只有這一個 EXIT trap;要清的東西都收進 cleanup_all。
+_line_status=""            # 分軌線體檢的狀態檔(那一段才會設)
+cleanup_all() {
+  rm -f "$SJ_STEP_LOG"
+  [ -n "$_line_status" ] && rm -f "$_line_status"
+  return 0
+}
+trap 'cleanup_all' EXIT
 try_step() {
   local what="$1"; shift
   if "$@" >"$SJ_STEP_LOG" 2>&1; then return 0; fi
@@ -279,7 +289,7 @@ if [ "$HAS_ENV" = 1 ]; then
   # ⛔ 輸出直接給終端(即時、不經手);判斷讀機器可讀的 UTF-8 JSON,不 grep 人類訊息
   #    (Codex R19-3:靠解析中文訊息本來就不該是契約,換個 code page 就會壞)
   # ⛔ mktemp 已經是私密隨機名;再加 trap 保證中斷也清掉(Codex R20-P2-1)
-  _line_status="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX")"
+  _line_status="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX")"   # cleanup_all 會清
   # ⛔ INT/TERM 不可以只清檔就繼續(Codex R22-P2-4 實測):handler 沒有 exit
   #    的話,shell 清掉狀態檔之後**照樣往下裝**,Ctrl+C 變成「什麼都沒發生」,
   #    最外層還回 0 —— 與 --verify-models 的 130 契約、與 PowerShell 都不一致。
@@ -296,11 +306,11 @@ if [ "$HAS_ENV" = 1 ]; then
       kill -TERM -"$_line_pid" 2>/dev/null || kill -TERM "$_line_pid" 2>/dev/null
       wait "$_line_pid" 2>/dev/null
     fi
-    rm -f "$_line_status"
+    cleanup_all            # ⛔ 清**全部**(含 SJ_STEP_LOG),不是只清自己那一個
     trap - "$1"
     kill -"$1" $$
   }
-  trap 'rm -f "$_line_status"' EXIT
+  # ⛔ 這裡**不可以**再裝 EXIT trap:那會蓋掉全域的 cleanup_all(R24-P2-1)
   trap '_line_stop INT' INT
   trap '_line_stop TERM' TERM
   PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status" &
@@ -324,7 +334,8 @@ if [ "$HAS_ENV" = 1 ]; then
     esac
   fi
   rm -f "$_line_status"
-  trap - EXIT INT TERM
+  _line_status=""
+  trap - INT TERM        # ⛔ 只還原這兩個;EXIT 是全域契約,不歸這一段管
   if [ "$LINE_RC" = 0 ]; then
     HAS_DEMUCS=1
     if [ -n "$LINE_RECOVERED" ]; then

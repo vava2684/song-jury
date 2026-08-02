@@ -1221,6 +1221,76 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R24 ────────────────────────────────────────────────
+    ('快照改回 copy2(連唯讀屬性一起複製 → 收工刪不掉)',
+     '評審團.py',
+     '            shutil.copyfile(song, snap)',
+     '            shutil.copy2(song, snap)',
+     'tests/test_來源身分.py::test_唯讀來源的快照也要刪得掉'),
+
+    ('快照收尾改回 ignore_errors(刪不掉整個吞掉,音訊留在 TEMP)',
+     '評審團.py',
+     '    for i in range(retries):\n        if not d.exists():\n            return ""',
+     '    for i in range(0):\n        if not d.exists():\n            return ""',
+     'tests/test_來源身分.py::test_唯讀來源的快照也要刪得掉'),
+
+    ('快照沒收乾淨時沿用正常退出碼(自動化永遠不知道 TEMP 留了音訊)',
+     '評審團.py',
+     '    if _SNAPSHOT_LEFT:',
+     '    if False:   # 變異:當作沒事',
+     'tests/test_來源身分.py::test_快照刪不掉時要大聲講而且退出碼要不一樣'),
+
+    ('快照建不出來時直接讓 OSError 冒出去(使用者只拿到 traceback)',
+     '評審團.py',
+     '        except OSError as e:\n            # ⛔ 空間不足/權限/路徑太長要給人話,不是裸 traceback(那是給機器讀的介面)\n            _force_rmtree(d)',
+     '        except ZeroDivisionError as e:\n            _force_rmtree(d)',
+     'tests/test_來源身分.py::test_快照建不出來時要給人話不是traceback'),
+
+    ('降級 shape 不驗完整欄位(殘缺的證據也算數)',
+     '驗證報告.py',
+     '    missing = [k for k in SHAPE_KEYS if k not in shape]',
+     '    missing = []   # 變異:不驗完整性',
+     'tests/test_來源身分.py::test_降級的shape要完整而且自洽'),
+
+    ('canonical 只驗有沒有寫,不驗是不是那個格式該有的值',
+     '驗證報告.py',
+     '    if canonical != want_canonical:',
+     '    if False:   # 變異:canonical 隨便寫都行',
+     'tests/test_來源身分.py::test_降級的shape要完整而且自洽'),
+
+    ('canonical_speakers 不驗(把已知的 5.1 說成講不出配置也收)',
+     '驗證報告.py',
+     '    if speakers != want_speakers:',
+     '    if False:   # 變異:喇叭亂寫都行',
+     'tests/test_來源身分.py::test_降級的shape要完整而且自洽'),
+
+    ('未知版本的宣告照樣套這一版的語意去判(升級產出端變破壞性事件)',
+     '驗證報告.py',
+     '    if gc not in PCM_CONTRACTS:',
+     '    if False:   # 變異:不分版',
+     'tests/test_來源身分.py::test_未來版本的宣告不可以被這一版的規則整份擋掉'),
+
+    ('裁判 CLI 靜靜忽略不認得的參數(strict 拼錯退成相容驗證)',
+     '驗證報告.py',
+     '        print(f"VERIFY_BAD 不認得的參數:{tok!r} —— 認得的是 "\n              f"{list(_VALUED_FLAGS) + list(_KNOWN_FLAGS)}")\n        return 1',
+     '        _i += 1\n        continue',
+     'tests/test_來源身分.py::test_裁判不可以靜靜忽略打錯的參數'),
+
+    ('install.sh 在探針那段又自己裝 EXIT trap(蓋掉全域清理 → sj_step 留下)',
+     'install.sh',
+     "  # ⛔ 這裡**不可以**再裝 EXIT trap:那會蓋掉全域的 cleanup_all(R24-P2-1)\n  trap '_line_stop INT' INT",
+     '  trap \'rm -f "$_line_status"\' EXIT\n  trap \'_line_stop INT\' INT',
+     'tests/test_installer_order.py::test_sh正常跑完不可以留下任何暫存檔'),
+
+    # ⚠️ 這條原本改的是**測試自己**的斷言,再用同一條測試去驗 —— 永遠抓不到
+    #    (把守門員拿掉,守門員當然不會抗議)。要驗的是「產品表少一列時 runtime
+    #    那條也會紅」:golden 那條已經守整份,這條守「跟真的 ffmpeg 對答案」。
+    ("喇叭表少一列(runtime 對答案那條也要抓到)",
+     "評審團.py",
+     '    "cube": "FL+FR+BL+BR+TFL+TFR+TBL+TBR",\n',
+     "",
+     "tests/test_pillars.py::test_喇叭表要對得上這台ffmpeg的分解"),
+
     # ── Codex R23 ────────────────────────────────────────────────
     ('身分改回算使用者給的路徑(評測中途換檔 → 分數 A、身分 B)',
      '評審團.py',
@@ -1240,11 +1310,11 @@ MUTATIONS = [
      '        snap = d / ("snap" + song.suffix)',
      'tests/test_來源身分.py::test_評分階段與來源身分只讀同一份不可變快照'),
 
-    ('降級宣告不驗 reason 與 shape 是否互相成立(漏寫 PCM 換個殼就過關)',
-     '驗證報告.py',
-     '    return _shape_matches_reason(reason, shape)',
+    ("降級宣告不驗 reason 與 shape 是否互相成立(漏寫 PCM 換個殼就過關)",
+     "驗證報告.py",
+     '    return _shape_matches_reason(reason, shape, "shape" in st)',
      '    return ""   # 變異:只驗型別',
-     'tests/test_來源身分.py::test_降級原因要跟shape互相成立'),
+     "tests/test_來源身分.py::test_降級原因要跟shape互相成立"),
 
     ('兩個互斥的身分旗標同時給時不擋(比較鬆的那個無聲勝出)',
      '驗證報告.py',

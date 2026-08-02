@@ -104,10 +104,46 @@ PCM_UNAVAILABLE_REASONS = (
 IDENTITY_DECODED = "decoded"
 IDENTITY_DECLARED = "declared"
 
-# 裁判**自己**的一份「產出端認得的樣本格式」(⛔ 不 import 產出端:裁判要能單獨
-# 驗一份外來 JSON;兩邊各自維護,對不上就是有人改壞了 —— 那正是要被抓到的事)。
-SUPPORTED_SAMPLE_FMTS = ("u8", "u8p", "s16", "s16p", "s32", "s32p",
-                         "flt", "fltp", "dbl", "dblp")
+# 裁判**自己**的兩張表(⛔ 不 import 產出端:裁判要能單獨驗一份外來 JSON;
+# 兩邊各自維護,對不上就是有人改壞了 —— 那正是要被抓到的事,有測試盯著)。
+CANONICAL_BY_FMT = {
+    "u8": "s32le", "u8p": "s32le", "s16": "s32le", "s16p": "s32le",
+    "s32": "s32le", "s32p": "s32le",
+    "s64": "", "s64p": "",          # 沒有無損容器 → 產出端刻意不發布身分
+    "flt": "f64le", "fltp": "f64le", "dbl": "f64le", "dblp": "f64le",
+}
+SUPPORTED_SAMPLE_FMTS = tuple(k for k, v in CANONICAL_BY_FMT.items() if v)
+SPEAKERS_BY_LAYOUT = {
+    "mono": "FC", "stereo": "FL+FR", "downmix": "DL+DR",
+    "2.1": "FL+FR+LFE", "3.0": "FL+FR+FC", "3.0(back)": "FL+FR+BC",
+    "4.0": "FL+FR+FC+BC", "quad": "FL+FR+BL+BR", "quad(side)": "FL+FR+SL+SR",
+    "3.1": "FL+FR+FC+LFE", "5.0": "FL+FR+FC+BL+BR", "5.0(side)": "FL+FR+FC+SL+SR",
+    "4.1": "FL+FR+FC+LFE+BC",
+    "5.1": "FL+FR+FC+LFE+BL+BR", "5.1(side)": "FL+FR+FC+LFE+SL+SR",
+    "6.0": "FL+FR+FC+BC+SL+SR", "6.0(front)": "FL+FR+FLC+FRC+SL+SR",
+    "3.1.2": "FL+FR+FC+LFE+TFL+TFR", "hexagonal": "FL+FR+FC+BL+BR+BC",
+    "6.1": "FL+FR+FC+LFE+BC+SL+SR", "6.1(back)": "FL+FR+FC+LFE+BL+BR+BC",
+    "6.1(front)": "FL+FR+LFE+FLC+FRC+SL+SR",
+    "7.0": "FL+FR+FC+BL+BR+SL+SR", "7.0(front)": "FL+FR+FC+FLC+FRC+SL+SR",
+    "7.1": "FL+FR+FC+LFE+BL+BR+SL+SR", "7.1(wide)": "FL+FR+FC+LFE+BL+BR+FLC+FRC",
+    "7.1(wide-side)": "FL+FR+FC+LFE+FLC+FRC+SL+SR",
+    "5.1.2": "FL+FR+FC+LFE+BL+BR+TFL+TFR",
+    "octagonal": "FL+FR+FC+BL+BR+BC+SL+SR",
+    "cube": "FL+FR+BL+BR+TFL+TFR+TBL+TBR",
+    "5.1.4": "FL+FR+FC+LFE+BL+BR+TFL+TFR+TBL+TBR",
+    "7.1.2": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR",
+    "7.1.4": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBL+TBR",
+    "7.2.3": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBC+LFE2",
+    "9.1.4": "FL+FR+FC+LFE+BL+BR+FLC+FRC+SL+SR+TFL+TFR+TBL+TBR",
+    "hexadecagonal": "FL+FR+FC+BL+BR+BC+SL+SR+TFL+TFC+TFR+TBL+TBC+TBR+WL+WR",
+    "22.2": ("FL+FR+FC+LFE+BL+BR+FLC+FRC+BC+SL+SR+TC+TFL+TFC+TFR+TBL+TBC+TBR"
+             "+LFE2+TSL+TSR+BFC+BFL+BFR"),
+}
+DEFAULT_SPEAKERS = {1: "FC", 2: "FL+FR"}
+UNKNOWN_LAYOUTS = ("", "unknown", "unspecified", "none")
+# 產出端一定會寫齊的 shape 欄位(⛔ 缺一個就不是「明確宣告」,是殘缺的證據)
+SHAPE_KEYS = ("sample_rate", "channels", "channel_layout", "sample_fmt",
+              "canonical", "canonical_speakers")
 # 每個降級原因**必然**長什麼樣(Codex R23-P1-2):
 #   · no_ffmpeg / probe_failed  → 根本探測不到,所以不可能附得出 shape
 #   · unsupported_sample_fmt    → 探測得到,但格式不在支援表 → canonical 必須是空的
@@ -175,36 +211,94 @@ def status_problem(d: dict) -> str:
     if d.get("source_audio_pcm_sha256"):
         return "同時寫了解碼雜湊與『算不出解碼身分』的宣告 —— 這兩件事不可能同時成立"
     reason = st.get("reason")
-    if reason not in PCM_UNAVAILABLE_REASONS:
-        return (f"source_audio_pcm_status.reason 不在白名單:{reason!r:.40}"
-                f"(認得的是 {list(PCM_UNAVAILABLE_REASONS)})")
     gc = st.get("generator_contract")
     if not isinstance(gc, str) or not gc.strip():
         return f"source_audio_pcm_status 缺 generator_contract(拿到 {gc!r:.40})"
+    if gc not in PCM_CONTRACTS:
+        # ⭐ 未知版本(可能是**未來**的產出端)只驗結構,不用「我們這版的語意」判它的
+        #    內容(Codex R24-P1-2):那和解碼雜湊的政策要一致 —— 未知版本**不當證據**
+        #    (declared_downgrade 回空 → strict 照樣擋),但不該讓整份報告變不合法。
+        if not isinstance(reason, str) or not reason.strip():
+            return f"source_audio_pcm_status.reason 不是字串:{reason!r:.40}"
+        sh = st.get("shape")
+        if sh is not None and not isinstance(sh, dict):
+            return f"source_audio_pcm_status.shape 不是物件({type(sh).__name__})"
+        return ""
+    if reason not in PCM_UNAVAILABLE_REASONS:
+        return (f"source_audio_pcm_status.reason 不在白名單:{reason!r:.40}"
+                f"(認得的是 {list(PCM_UNAVAILABLE_REASONS)})")
     shape = st.get("shape")
     if shape is not None and not isinstance(shape, dict):
         return f"source_audio_pcm_status.shape 不是物件({type(shape).__name__})"
-    return _shape_matches_reason(reason, shape)
+    return _shape_matches_reason(reason, shape, "shape" in st)
 
 
 def _int_field(shape, key):
-    """shape 的數值欄位是字串(ffprobe 就是給字串);回 int 或 None。"""
+    """shape 的數值欄位是字串(ffprobe 就是給字串);回 int 或 None(含 <=0)。"""
     v = shape.get(key)
     if isinstance(v, bool) or not isinstance(v, (str, int)):
         return None
     try:
-        return int(str(v).strip())
+        n = int(str(v).strip())
     except (TypeError, ValueError):
         return None
+    return n if n > 0 else None
 
 
-def _shape_matches_reason(reason: str, shape) -> str:
-    """reason 與 shape 必須**互相成立**(Codex R23-P1-2 實測四組矛盾都被收下)。
+def _expected_speakers(layout: str, channels: int) -> str:
+    """pcm-v5 的規則:認得的配置查表;1/2 聲道講不出來時用產品規則補;其餘為空。"""
+    name = (layout or "").strip().lower()
+    if name and name not in UNKNOWN_LAYOUTS:
+        return SPEAKERS_BY_LAYOUT.get(name, "")
+    return DEFAULT_SPEAKERS.get(channels, "")
+
+
+def _shape_self_consistent(shape) -> str:
+    """shape 本身要**完整且自洽**(Codex R24-P1-2)。
+
+    🔴 舊版只挑幾個欄位看,於是這些都被正式批次收下:只有 sample_fmt 的 shape、
+       缺 rate/channels/layout 的 shape、canonical 亂寫的 shape、
+       把已知的 5.1 說成「講不出配置」。⛔ 那等於「受支援格式沒算 PCM」換個殼過關。"""
+    missing = [k for k in SHAPE_KEYS if k not in shape]
+    if missing:
+        return f"shape 缺欄位 {missing} —— 產出端一定會寫齊(缺了就不是明確宣告)"
+    for k in SHAPE_KEYS:
+        v = shape[k]
+        if isinstance(v, bool) or not isinstance(v, (str, int)):
+            return f"shape.{k} 不是字串/數字({type(v).__name__})"
+    rate, ch = _int_field(shape, "sample_rate"), _int_field(shape, "channels")
+    if rate is None:
+        return f"shape.sample_rate 不是正整數:{shape['sample_rate']!r:.20}"
+    if ch is None:
+        return f"shape.channels 不是正整數:{shape['channels']!r:.20}"
+    fmt = str(shape["sample_fmt"]).strip().lower()
+    if not fmt:
+        return "shape.sample_fmt 是空的"
+    canonical = str(shape["canonical"]).strip()
+    # ⛔ canonical 不是「有寫就好」:它必須是**這個樣本格式**該有的那個值,
+    #    否則 decode_failed 之類的宣告可以隨便填一個字串就成立。
+    want_canonical = CANONICAL_BY_FMT.get(fmt, "")
+    if canonical != want_canonical:
+        return (f"shape.canonical={canonical!r:.20} 與 sample_fmt={fmt!r} 對不上"
+                f"(pcm-v5 對這個格式是 {want_canonical!r})")
+    speakers = str(shape["canonical_speakers"]).strip()
+    want_speakers = _expected_speakers(str(shape["channel_layout"]), ch)
+    if speakers != want_speakers:
+        return (f"shape.canonical_speakers={speakers!r:.30} 與 "
+                f"channel_layout={shape['channel_layout']!r:.20}/{ch} 聲道對不上"
+                f"(pcm-v5 算出來是 {want_speakers!r:.30})")
+    return ""
+
+
+def _shape_matches_reason(reason: str, shape, has_shape_key: bool) -> str:
+    """reason 與 shape 必須**互相成立**(Codex R23-P1-2 / R24-P1-2)。
 
     ⛔ 裁判是獨立的:不能假設 JSON 一定來自現在這版產出端。只驗型別的話,
        「格式其實有支援」的降級宣告會變成繞過 strict 的後門。"""
     if reason in _SHAPE_FORBIDDEN:
-        if shape:
+        # ⛔ 連空 dict 都不行(R24):`shape: {}` 與「沒有 shape」是兩種不同的宣告,
+        #    前者是「我探測過、結果是空的」—— 探測不到的時候不可能寫得出來。
+        if has_shape_key:
             return (f"{reason} 卻附了 shape —— 探測不到音訊結構時不可能有 shape"
                     f"(這兩件事不可能同時成立)")
         return ""
@@ -212,27 +306,20 @@ def _shape_matches_reason(reason: str, shape) -> str:
         return ""
     if not isinstance(shape, dict) or not shape:
         return f"{reason} 一定要附 shape(說得出是哪個格式/配置算不出來)"
-    for k, v in shape.items():
-        if not isinstance(k, str) or isinstance(v, bool) or not isinstance(v, (str, int)):
-            return f"shape.{k!r:.20} 不是字串/數字({type(v).__name__})"
-    fmt = str(shape.get("sample_fmt", "")).strip().lower()
-    canonical = str(shape.get("canonical", "")).strip()
-    speakers = str(shape.get("canonical_speakers", "")).strip()
+    why = _shape_self_consistent(shape)
+    if why:
+        return why
+    fmt = str(shape["sample_fmt"]).strip().lower()
+    canonical = str(shape["canonical"]).strip()
+    speakers = str(shape["canonical_speakers"]).strip()
     ch = _int_field(shape, "channels")
-    if not fmt:
-        return f"{reason} 的 shape 缺 sample_fmt"
     if reason == "unsupported_sample_fmt":
-        if fmt in SUPPORTED_SAMPLE_FMTS:
+        if canonical:
             return (f"宣告 unsupported_sample_fmt,但 sample_fmt={fmt!r} 是支援的 ——"
                     f" 這是「受支援格式卻沒算 PCM」,不是刻意降級")
-        if canonical:
-            return f"宣告 unsupported_sample_fmt,卻同時給了 canonical={canonical!r:.20}"
         return ""
-    # 以下兩種都以「格式支援」為前提
-    if fmt not in SUPPORTED_SAMPLE_FMTS:
-        return f"{reason} 的 sample_fmt={fmt!r} 不在支援表 —— 那應該回報 unsupported_sample_fmt"
     if not canonical:
-        return f"{reason} 的 shape 缺 canonical(格式支援就一定算得出來)"
+        return f"{reason} 的 sample_fmt={fmt!r} 不在支援表 —— 那應該回報 unsupported_sample_fmt"
     if reason == "unknown_multichannel_layout":
         if ch is None or ch < 3:
             return (f"宣告 unknown_multichannel_layout,但 channels={shape.get('channels')!r:.20}"
@@ -418,6 +505,31 @@ def main(argv) -> int:
     if len(argv) < 2:
         print("用法:python 驗證報告.py <報告.json> [--newer-than <epoch>] "
               "[--require-contract] [--require-identity | --allow-declared-downgrade]")
+        return 1
+    # ⛔ 未知旗標不可以靜靜忽略(Codex R24-P2-2):`--require-identit` 少打一個 y
+    #    會退成 rc=0 的相容驗證,只看退出碼的自動化把「參數打錯」當成功。
+    _KNOWN_FLAGS = ("--require-contract", "--require-identity",
+                    "--allow-declared-downgrade")
+    _VALUED_FLAGS = ("--newer-than",)
+    _i, _seen = 2, set()
+    while _i < len(argv):
+        tok = argv[_i]
+        if tok in _VALUED_FLAGS:
+            if tok in _seen:
+                print(f"VERIFY_BAD 重複的參數:{tok}")
+                return 1
+            _seen.add(tok)
+            _i += 2
+            continue
+        if tok in _KNOWN_FLAGS:
+            if tok in _seen:
+                print(f"VERIFY_BAD 重複的參數:{tok}")
+                return 1
+            _seen.add(tok)
+            _i += 1
+            continue
+        print(f"VERIFY_BAD 不認得的參數:{tok!r} —— 認得的是 "
+              f"{list(_VALUED_FLAGS) + list(_KNOWN_FLAGS)}")
         return 1
     newer = None
     if "--newer-than" in argv:

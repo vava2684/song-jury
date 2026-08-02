@@ -271,7 +271,8 @@ _SHAPE_OK = {"sample_rate": "48000", "channels": "6", "channel_layout": "unknown
     ("probe_failed", {**_SHAPE_OK}, "不可能同時成立"),
     # 說不出是哪個格式/配置算不出來 = 沒有證據
     ("unsupported_sample_fmt", {}, "一定要附 shape"),
-    ("unknown_multichannel_layout", {**_SHAPE_OK, "canonical": ""}, "缺 canonical"),
+    # ⚠️ R24 起這條會更早被「canonical 必須等於該格式的值」抓到(訊息也更明確)
+    ("unknown_multichannel_layout", {**_SHAPE_OK, "canonical": ""}, "對不上"),
     # decode_failed 的前提是前面每一關都過了
     ("decode_failed", {**_SHAPE_OK, "canonical_speakers": ""}, "配置問題"),
 ])
@@ -338,3 +339,160 @@ def test_兩個互斥的身分旗標不可以同時給(tmp_path, order):
     p = _report(tmp_path, **_declared())
     rc, out = _cli(p, "--newer-than", str(time.time() - 60), "--require-contract", *order)
     assert rc == 1 and out.startswith("VERIFY_BAD") and "互斥" in out, out
+
+
+# ── 快照的收尾(Codex R24-P1-1)────────────────────────────────────
+def test_唯讀來源的快照也要刪得掉(tmp_path):
+    """🔴 R24-P1-1 實測:copy2 會把**唯讀屬性**一起複製過來,rmtree 因此失敗,
+    而 ignore_errors=True 把失敗整個吞掉 —— 一整份可能還沒公開的歌就留在 TEMP。
+    (Windows 上「來源是唯讀」非常普通:雲端同步、備份還原、防寫的素材夾。)"""
+    import os as _os
+    import stat as _stat
+    J = load("評審團")
+    src = tmp_path / "唯讀.wav"
+    src.write_bytes(b"RIFF" + b"x" * 300)
+    _os.chmod(src, _stat.S_IREAD)
+    try:
+        with J._immutable_input(src) as snap:
+            d = snap.parent
+            assert snap.read_bytes() == src.read_bytes()
+            # ⛔ 快照不該繼承唯讀:我們只需要 bytes 與檔名
+            assert _os.access(snap, _os.W_OK), "🔴 快照是唯讀的 —— 收工時會刪不掉"
+        assert not d.exists(), f"🔴 快照目錄沒刪掉:{d}"
+    finally:
+        _os.chmod(src, _stat.S_IWRITE)
+
+
+def test_快照刪不掉時要大聲講而且退出碼要不一樣(tmp_path, monkeypatch, capsys):
+    """⛔ 刪不掉不可以無聲帶過(那是一整份音訊留在 TEMP),也不可以沿用
+    「一切正常」的退出碼 —— 只看退出碼的自動化永遠不會知道。"""
+    import types as _types
+    J = load("評審團")
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF" + b"y" * 300)
+    # ⚠️ 這條會**故意**製造一個刪不掉的快照 → 一定要把暫存目錄導進 tmp_path,
+    #    不然殘留就留在真的 TEMP 裡(自己踩到:測試自己變成殘留來源)。
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(var, str(iso))
+    monkeypatch.setattr(J, "_force_rmtree", lambda d, **kw: str(d))   # 假裝刪不掉
+    monkeypatch.setattr(J, "_SNAPSHOT_LEFT", [])
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: song)
+    monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(J, "_evaluate", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+    monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
+    with pytest.raises(SystemExit) as e:
+        J.main()
+    out = capsys.readouterr().out
+    assert e.value.code == 4, f"🔴 快照沒收乾淨卻回 {e.value.code}(要 4)"
+    assert "快照沒清乾淨" in out and "song-jury-src-" in out, out
+    # 真的把那個目錄清掉(這條測試自己製造的殘留不可以留下;它在 tmp_path 裡,
+    # 就算這裡漏了 pytest 也會收走 —— 兩層保險)
+    for d in J._SNAPSHOT_LEFT:
+        __import__("shutil").rmtree(d, ignore_errors=True)
+
+
+def test_快照建不出來時要給人話不是traceback(tmp_path, monkeypatch):
+    """⛔ 空間不足/權限/路徑太長是一般使用者會遇到的事;裸 traceback 幫不上忙。"""
+    J = load("評審團")
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF")
+    # ⚠️ 把暫存目錄導到自己的 tmp_path:去掃**全域** TEMP 會被別的程序(或上一輪
+    #    重現)干擾 —— 那種測試會為了別人的垃圾亂紅,也可能因為別人清掉而假綠。
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(var, str(iso))
+
+    def _boom(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(J.shutil, "copyfile", _boom)
+    with pytest.raises(SystemExit) as e:
+        with J._immutable_input(song):
+            pass
+    msg = str(e.value.code)
+    assert "快照" in msg and "空間" in msg, f"🔴 訊息不是人話:{msg!r}"
+    assert "Traceback" not in msg
+    # 建立失敗時暫存目錄也要清掉
+    left = sorted(x.name for x in iso.glob("song-jury-src-*"))
+    assert left == [], f"🔴 建立失敗卻留下暫存目錄:{left}"
+
+
+# ── 降級 shape 要完整且自洽(Codex R24-P1-2)──────────────────────
+_FULL = {"sample_rate": "48000", "channels": "6", "channel_layout": "unknown",
+         "sample_fmt": "s32", "canonical": "s32le", "canonical_speakers": ""}
+
+
+@pytest.mark.parametrize("reason,shape,expect", [
+    # 空 dict 不等於「沒有 shape」:探測不到就不可能寫得出來
+    ("no_ffmpeg", {}, "不可能同時成立"),
+    ("probe_failed", {}, "不可能同時成立"),
+    # 只給一半的 shape = 殘缺的證據
+    ("unsupported_sample_fmt", {"sample_fmt": "s64"}, "缺欄位"),
+    ("decode_failed", {"sample_fmt": "s16", "canonical": "s32le",
+                       "canonical_speakers": "FL+FR"}, "缺欄位"),
+    # canonical 亂寫:它必須是**那個樣本格式**該有的值
+    ("decode_failed", {**_FULL, "channel_layout": "5.1",
+                       "canonical": "亂寫", "canonical_speakers": "FL+FR+FC+LFE+BL+BR"},
+     "對不上"),
+    # 把已知的 5.1 說成「講不出配置」
+    ("unknown_multichannel_layout", {**_FULL, "channel_layout": "5.1"}, "對不上"),
+    # 數值欄位要是正整數
+    ("unknown_multichannel_layout", {**_FULL, "channels": "0"}, "正整數"),
+    ("unknown_multichannel_layout", {**_FULL, "sample_rate": "很快"}, "正整數"),
+])
+def test_降級的shape要完整而且自洽(tmp_path, reason, shape, expect):
+    """🔴 Codex R24-P1-2:五組殘缺/不可能的 shape 全被正式批次收下。
+    ⛔ 裁判是獨立的 —— 不能假設 JSON 一定來自現在這版產出端。"""
+    st = {"status": "unavailable", "reason": reason,
+          "generator_contract": _GOOD_CONTRACT}
+    if shape or shape == {}:
+        st["shape"] = shape
+    p = _report(tmp_path, source_audio_pcm_status=st)
+    why = V.validate(p, require_contract=True, require_identity="declared")
+    assert why and expect in why, f"🔴 {reason} + {shape} 被收下了:{why!r}"
+
+
+def test_未來版本的宣告不可以被這一版的規則整份擋掉(tmp_path):
+    """⭐ 與解碼雜湊的政策一致(Codex R24-P1-2):未知版本**不當證據**,
+    但也不該讓整份報告變成不合法 —— 那會讓「升級產出端」變成破壞性事件。"""
+    st = {"status": "unavailable", "reason": "decode_failed",
+          "generator_contract": "pcm-v6/未來的標準面",
+          "shape": {"sample_rate": "48000", "channels": "1", "channel_layout": "mono",
+                    "sample_fmt": "s64", "canonical": "s64le",
+                    "canonical_speakers": "FC"}}
+    p = _report(tmp_path, source_audio_pcm_status=st)
+    assert V.validate(p) == "", "🔴 未來版本的宣告在相容模式被整份擋掉"
+    # 但它**不是**證據:正式批次仍要擋
+    why = V.validate(p, require_contract=True, require_identity="declared")
+    assert why, "🔴 未知版本的宣告被當成合法降級"
+
+
+def test_裁判與產出端的兩張表不可以漂移():
+    """⛔ 裁判**故意**維護自己的一份(要能單獨驗外來 JSON),所以更要有人盯著
+    兩邊一致 —— 漂移了就是「產品算得出來、裁判說不合法」或反過來。"""
+    J = load("評審團")
+    assert V.CANONICAL_BY_FMT == J._CANONICAL_BY_FMT, "🔴 樣本格式表漂移了"
+    assert V.SPEAKERS_BY_LAYOUT == J._SPEAKERS_BY_LAYOUT, "🔴 喇叭表漂移了"
+    assert V.DEFAULT_SPEAKERS == J._DEFAULT_SPEAKERS, "🔴 1/2 聲道的產品規則漂移了"
+    assert tuple(V.PCM_UNAVAILABLE_REASONS) == tuple(J.PCM_UNAVAILABLE_REASONS), \
+        "🔴 降級原因白名單漂移了"
+    assert V.PCM_CONTRACTS[0] == J.PCM_IDENTITY_CONTRACT, "🔴 契約字串漂移了"
+
+
+# ── CLI 參數(Codex R24-P2-2)─────────────────────────────────────
+@pytest.mark.parametrize("args", [
+    ("--require-contract", "--require-identit"),      # 少打一個 y
+    ("--require-contract", "--unknown-flag"),
+    ("--require-contract", "--require-contract"),     # 重複
+    ("--newer-than", "1", "--newer-than", "2"),       # 重複帶值
+])
+def test_裁判不可以靜靜忽略打錯的參數(tmp_path, args):
+    """🔴 R24-P2-2 實測:`--require-identit` 會退成 rc=0 的相容驗證 ——
+    只看退出碼的自動化把「參數打錯」當成功,以為自己要求了最強證據。"""
+    p = _report(tmp_path, source_audio_pcm_sha256="c" * 64,
+                source_audio_pcm_contract=_GOOD_CONTRACT)
+    rc, out = _cli(p, *args)
+    assert rc == 1 and out.startswith("VERIFY_BAD"), f"{args} → rc={rc} {out!r}"

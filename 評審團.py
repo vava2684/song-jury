@@ -16,6 +16,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import contextlib
 import subprocess
 import sys
@@ -1239,9 +1240,55 @@ def main():
         sys.exit("用法: python 評審團.py <歌曲檔路徑 或 SUNO/YouTube 連結>\n"
                  "  含空白的路徑請用引號括起。")
     song = resolve_input(sys.argv[1])
+    rc = 0
     # ⛔ 鎖 → 快照 → 評測:順序不能反過來(先鎖住才輪得到我們複製那一份)
     with _job_lock(song), _immutable_input(song) as audio:
-        _evaluate(song, audio)
+        try:
+            _evaluate(song, audio)      # 它自己 sys.exit(0/2)
+        except SystemExit as e:
+            rc = e.code if isinstance(e.code, int) else 1
+    if _SNAPSHOT_LEFT:
+        # ⛔ 收尾失敗要有**自己的**退出碼(Codex R24-P1-1):沿用 0/2 等於
+        #    「一切正常」,只看退出碼的自動化永遠不會知道 TEMP 裡留了一份音訊。
+        print(f"⛔ 退出碼 4:評測完成,但快照沒收乾淨({len(_SNAPSHOT_LEFT)} 個)")
+        sys.exit(4)
+    sys.exit(rc)
+
+
+# 快照沒收乾淨的路徑(⛔ 全域,因為 main 要據此改退出碼 —— 不可以無聲結束)
+_SNAPSHOT_LEFT = []
+
+
+def _force_rmtree(d: Path, retries: int = 3, pause: float = 0.25) -> str:
+    """盡力刪掉整個目錄;回「還在的路徑」(空字串 = 真的乾淨了)。
+
+    🔴 Codex R24-P1-1 實測:舊版是 `shutil.rmtree(d, ignore_errors=True)` ——
+       Windows 上兩種很普通的情況都會刪失敗,而那個旗標把失敗**整個吞掉**:
+       ① 來源是唯讀檔(copy2 連唯讀屬性一起複製過來);
+       ② 快照還被某個 handle 開著(防毒、索引、剛結束的子程序)。
+       結果是一整份**可能還沒公開**的歌留在系統 TEMP 裡,而且完全沒有訊息。
+    ⭐ 所以:唯讀就 chmod 再刪、短暫重試、最後**回報真相**由呼叫端決定怎麼辦。"""
+    def _fix_and_retry(func, path, _exc):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass                       # 這一輪失敗沒關係,外層還會再試
+
+    # ⚠️ onerror 在 3.12 起被 onexc 取代:兩個都給不行(TypeError),要挑一個
+    kw = ({"onexc": _fix_and_retry} if sys.version_info >= (3, 12)
+          else {"onerror": _fix_and_retry})
+    for i in range(retries):
+        if not d.exists():
+            return ""
+        try:
+            shutil.rmtree(d, **kw)
+        except OSError:
+            pass
+        if not d.exists():
+            return ""
+        time.sleep(pause)
+    return str(d) if d.exists() else ""
 
 
 @contextlib.contextmanager
@@ -1257,13 +1304,33 @@ def _immutable_input(song: Path):
     ⚠️ 誠實邊界:這道防線處理的是**評測中途換檔**造成的不一致,不是防篡改 ——
        同一個 OS 使用者本來就能改快照,那不在威脅模型內。
     """
-    d = Path(tempfile.mkdtemp(prefix="song-jury-src-"))
+    try:
+        d = Path(tempfile.mkdtemp(prefix="song-jury-src-"))
+    except OSError as e:
+        sys.exit(f"✗ 建不出暫存目錄({type(e).__name__}: {e})。\n"
+                 f"→ 檢查 TEMP/TMPDIR 的空間與權限(評測需要先把來源複製一份)。")
     try:
         snap = d / song.name
-        shutil.copy2(song, snap)
+        try:
+            # ⛔ 用 copyfile 不用 copy2(Codex R24-P1-1):我們只需要 bytes 與檔名,
+            #    copy2 會把**唯讀屬性**一起帶過來,收工時就刪不掉了。
+            shutil.copyfile(song, snap)
+        except OSError as e:
+            # ⛔ 空間不足/權限/路徑太長要給人話,不是裸 traceback(那是給機器讀的介面)
+            _force_rmtree(d)
+            sys.exit(f"✗ 建立來源快照失敗({type(e).__name__}: {e})。\n"
+                     f"→ 評測會先把來源複製到暫存目錄再跑;請確認 TEMP/TMPDIR "
+                     f"有足夠空間與寫入權限(需要約等於音檔大小)。")
         yield snap
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        left = _force_rmtree(d)
+        if left:
+            # ⛔ 刪不掉不可以無聲帶過:那是一整份音訊留在 TEMP。大聲講,
+            #    而且讓 main 用一個**不同的退出碼**收場(見 _final_exit_code 旁的說明)。
+            print(f"\n⛔ 來源快照沒清乾淨:{left}\n"
+                  f"   評測本身已完成,但那個目錄裡有一份完整音訊 —— 請手動刪掉。\n"
+                  f"   (常見原因:來源是唯讀檔、或還有程式開著那個檔案)")
+            _SNAPSHOT_LEFT.append(left)
 
 
 def _evaluate(song: Path, audio: Path):
@@ -1645,7 +1712,8 @@ def _evaluate(song: Path, audio: Path):
 
 def _final_exit_code(merged: dict) -> int:
     """程序退出碼要跟評測完整性一致(Codex R11):
-    0 = 完整評測;2 = **報告已完整發布**但缺柱(可讀、不可互比/排行);其他 = 失敗。
+    0 = 完整評測;2 = **報告已完整發布**但缺柱(可讀、不可互比/排行);
+    4 = 評測完成但**來源快照沒收乾淨**(TEMP 裡留了一份音訊,見 main);其他 = 失敗。
     ⛔ 不完整卻回 0,任何只看退出碼的外部自動化都會把無效分數當成功。
        批次/網頁版看到 2 要照樣讀報告,顯示「已完成但不可採信」,不是丟掉昂貴產物。"""
     pt = merged.get("pillar_totals")

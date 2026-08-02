@@ -461,6 +461,12 @@ _GOLDEN_SPEAKERS = {
 }
 
 
+# 這台 ffmpeg 有、而我們**刻意**不收的配置(今天是空的:37 筆全收)
+_MISSING_OK = frozenset()
+# 允許共用同一組喇叭的「同義別名」(今天沒有;要加請一併更新 README)
+_ALIAS_OK = frozenset()
+
+
 def test_喇叭表是鎖住的契約_整份都要對():
     """🔴 Codex R23-P2-3:舊測試只比「產品表 ∩ 這台 ffmpeg」的交集 ——
     把整列 `22.2` 刪掉,四條相關測試照樣全綠(實測)。那正是最稀有、最沒人會
@@ -476,12 +482,16 @@ def test_喇叭表是鎖住的契約_整份都要對():
     assert not missing, f"🔴 喇叭表少了幾列(那些配置會靜靜降級):{missing}"
     assert not extra, f"🔴 喇叭表多了幾列(身分定義變了,要升 contract):{extra}"
     assert not changed, f"🔴 有列被改過(同一個名字換了喇叭集合):{changed}"
-    # 分解不可以重複:兩個名字對到同一組喇叭 = 同一個身分的兩條路,遲早撞號
+    # 分解目前不可以重複 —— ⚠️ 但這不是永恆定律(Codex R24 觀察):真正的**同義
+    # 別名**(同一組喇叭、兩個名字)映到同一組 canonical speakers 正是正規化的目的,
+    # 不是碰撞。今天表裡沒有這種別名,所以先鎖住;要加別名時,把它列進 _ALIAS_OK
+    # 並在 README 說明,不要默默放寬。
     rev = {}
     for k, v in got.items():
         rev.setdefault(v, []).append(k)
-    dup = {v: ks for v, ks in rev.items() if len(ks) > 1}
-    assert not dup, f"🔴 有兩個配置名對到同一組喇叭:{dup}"
+    dup = {v: ks for v, ks in rev.items()
+           if len(ks) > 1 and tuple(sorted(ks)) not in _ALIAS_OK}
+    assert not dup, f"🔴 有兩個配置名對到同一組喇叭(不在別名清單裡):{dup}"
 
 
 def test_喇叭表要對得上這台ffmpeg的分解():
@@ -510,10 +520,16 @@ def test_喇叭表要對得上這台ffmpeg的分解():
     changed = {k: (v, real[k]) for k, v in got.items() if k in real and real[k] != v}
     missing = sorted(k for k in real if k not in got and k != "NAME")
     assert not changed, f"🔴 喇叭表與這台 ffmpeg 的分解對不上:{changed}"
-    # ⚠️ missing 不算失敗(新版 ffmpeg 多出來的配置會 fail closed,那是安全方向)——
-    #    但要印出來讓人知道有東西沒被涵蓋,不可以靜靜地當作全對。
-    if missing:
-        print(f"⚠ 這台 ffmpeg 有而表裡沒有的配置(會誠實降級,不發布身分):{missing}")
+    # ⛔ missing 要**紅**,不可以只 print(Codex R24-P2-3):CI 跑的是
+    #    `pytest -q` 再加 pytest.ini 的 -q(等於 -qq)且開著 capture ——
+    #    通過的測試印什麼都看不到,「覆蓋面悄悄縮小」就沒人會知道。
+    #    新版 ffmpeg 多出配置時,產品會誠實降級(安全方向),但那是**要有人決定**
+    #    的事:補進表裡、或寫進下面這個明列的例外清單。
+    assert not [k for k in missing if k not in _MISSING_OK], (
+        f"🔴 這台 ffmpeg 有、而喇叭表沒有的配置:{missing}\n"
+        "   → 那些來源會被降級成 exact-file(不發布解碼身分)。請把它們補進\n"
+        "     評審團._SPEAKERS_BY_LAYOUT、tests 的 golden、驗證報告.SPEAKERS_BY_LAYOUT,\n"
+        "     或明確加進 _MISSING_OK 並寫清楚為什麼。")
 
 
 def test_探測音訊結構不可以用系統code_page解輸出(monkeypatch, tmp_path):
