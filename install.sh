@@ -280,7 +280,13 @@ if [ "$HAS_ENV" = 1 ]; then
   #    (Codex R19-3:靠解析中文訊息本來就不該是契約,換個 code page 就會壞)
   # ⛔ mktemp 已經是私密隨機名;再加 trap 保證中斷也清掉(Codex R20-P2-1)
   _line_status="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX")"
-  trap 'rm -f "$_line_status"' EXIT INT TERM
+  # ⛔ INT/TERM 不可以只清檔就繼續(Codex R22-P2-4 實測):handler 沒有 exit
+  #    的話,shell 清掉狀態檔之後**照樣往下裝**,Ctrl+C 變成「什麼都沒發生」,
+  #    最外層還回 0 —— 與 --verify-models 的 130 契約、與 PowerShell 都不一致。
+  #    正確寫法是清完把訊號**原樣重送**給自己(預設處置 → 130 / 143)。
+  trap 'rm -f "$_line_status"' EXIT
+  trap 'rm -f "$_line_status"; trap - INT; kill -INT $$' INT
+  trap 'rm -f "$_line_status"; trap - TERM; kill -TERM $$' TERM
   PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"
   LINE_RC=$?
   LINE_KIND=""

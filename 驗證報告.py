@@ -45,6 +45,8 @@ CONTRACTS = {
 }
 DEFAULT_CONTRACT = "2026-07-25-v1"   # 報告沒自報版本時(舊格式)用這個,但會留痕
 
+from 設定讀取 import ConfigError, finite_number   # noqa: E402
+
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -85,7 +87,37 @@ IDENTITY_FIELDS = {
 # 認得的解碼身分版本(⛔ 換標準面 = 換一把尺,新舊不可互比 —— Codex R19-1)
 # ⛔ v2(一律 s32le)已被證明會把不同的浮點來源撞成同一個身分(Codex R20-P1-1),
 #    所以**不列在認得的版本裡** —— 舊 v2 報告會誠實退回 exact-file,不再當同源硬證據。
-PCM_CONTRACTS = ("pcm-v4/native-rate/channels/native-sample-fmt",)
+PCM_CONTRACTS = ("pcm-v5/native-rate/canonical-speakers/native-sample-fmt",)
+# ⛔ v4(layout 完全不入雜湊)會把 5.1 與 5.1(side) 撞成同一個身分(Codex R22-P1-1),
+#    所以同樣不列在認得的版本裡 —— 舊 v4 報告誠實退回 exact-file。
+
+# 產出端「刻意不發布解碼身分」時的原因白名單(⛔ 與 評審團.PCM_UNAVAILABLE_REASONS
+# 同一份定義;這裡是**裁判**端的複製,不 import 產出端 —— 裁判要能單獨驗一份 JSON)
+PCM_UNAVAILABLE_REASONS = (
+    "no_ffmpeg", "probe_failed", "unsupported_sample_fmt",
+    "unknown_multichannel_layout", "decode_failed",
+)
+# 身分政策(⛔ 不可以用一個布林代表兩種政策 —— Codex R22-P2-1):
+#   "decoded"  = 一定要有解碼身分(安裝證據:demo 是 s16,算得出來才叫裝好)
+#   "declared" = 解碼身分,**或**一份合法的顯式降級宣告(正式批次:s64 之類的
+#                來源產品本來就刻意不發布身分,不該因此連完整九柱都不算數)
+IDENTITY_DECODED = "decoded"
+IDENTITY_DECLARED = "declared"
+
+
+def _identity_policy(require_identity):
+    """把呼叫端給的值正規化成 None / "decoded" / "declared"。
+
+    ⚠️ True 沿用舊語意(= decoded,安裝證據),但**新的呼叫端請直接寫字串**:
+       一個布林同時代表兩種政策正是 Codex R22-P2-1 指出的問題。"""
+    if require_identity in (None, False, ""):
+        return None
+    if require_identity is True:
+        return IDENTITY_DECODED
+    if require_identity in (IDENTITY_DECODED, IDENTITY_DECLARED):
+        return require_identity
+    raise ValueError(f"不認得的身分政策:{require_identity!r}"
+                     f"(要 None / {IDENTITY_DECODED!r} / {IDENTITY_DECLARED!r})")
 
 
 def identity_problem(d: dict) -> str:
@@ -109,7 +141,46 @@ def identity_problem(d: dict) -> str:
     # ⛔ 有版本卻沒雜湊是無意義的組合(Codex R20-P1-2):版本是用來描述那個雜湊的
     if c and not d.get("source_audio_pcm_sha256"):
         return "有 source_audio_pcm_contract 卻沒有對應的 source_audio_pcm_sha256"
+    return status_problem(d)
+
+
+def status_problem(d: dict) -> str:
+    """驗 source_audio_pcm_status(顯式降級宣告)的 schema —— Codex R22-P2-1。
+
+    ⛔ 這個欄位會被下游當成「產品刻意降級」的證據,所以「有欄位但是垃圾」
+       比沒有更危險:原因要在白名單裡、產出端版本要認得、而且不可以與
+       「其實有解碼雜湊」矛盾(兩個都寫等於在講兩件相反的事)。"""
+    st = d.get("source_audio_pcm_status")
+    if st is None:
+        return ""
+    if not isinstance(st, dict):
+        return f"source_audio_pcm_status 不是物件({type(st).__name__})"
+    if st.get("status") != "unavailable":
+        return f"source_audio_pcm_status.status 只能是 'unavailable'(拿到 {st.get('status')!r:.40})"
+    if d.get("source_audio_pcm_sha256"):
+        return "同時寫了解碼雜湊與『算不出解碼身分』的宣告 —— 這兩件事不可能同時成立"
+    reason = st.get("reason")
+    if reason not in PCM_UNAVAILABLE_REASONS:
+        return (f"source_audio_pcm_status.reason 不在白名單:{reason!r:.40}"
+                f"(認得的是 {list(PCM_UNAVAILABLE_REASONS)})")
+    gc = st.get("generator_contract")
+    if not isinstance(gc, str) or not gc.strip():
+        return f"source_audio_pcm_status 缺 generator_contract(拿到 {gc!r:.40})"
+    shape = st.get("shape")
+    if shape is not None and not isinstance(shape, dict):
+        return f"source_audio_pcm_status.shape 不是物件({type(shape).__name__})"
     return ""
+
+
+def declared_downgrade(d: dict) -> str:
+    """回「這份報告宣告的降級原因」;不是合法宣告就回 ""。"""
+    st = d.get("source_audio_pcm_status")
+    if not isinstance(st, dict) or st.get("status") != "unavailable":
+        return ""
+    if st.get("reason") not in PCM_UNAVAILABLE_REASONS:
+        return ""
+    # ⛔ 產出端版本要認得:不然「舊產出端漏寫」可以偽裝成「新產出端刻意降級」
+    return st.get("reason", "") if st.get("generator_contract") in PCM_CONTRACTS else ""
 
 
 def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = False,
@@ -141,19 +212,35 @@ def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = F
     why_id = identity_problem(d)
     if why_id:
         return why_id
-    if require_identity:
+    policy = _identity_policy(require_identity)
+    if policy:
         # 本輪新產物(安裝證據)必須帶得出**完整**身分,不可以退回舊格式相容。
         # ⛔ 一定要含解碼後雜湊(Codex R19-2):安裝本來就強制 ffmpeg,
         #    產出端若迴歸成不算 PCM,九柱照樣 VERIFY_OK,下游卻只剩最弱的證據。
-        need = [k for k in ("evaluation_id", "source_file_sha256",
-                            "source_audio_pcm_sha256", "source_audio_pcm_contract")
-                if not d.get(k)]
-        if need:
-            return (f"報告缺少來源身分欄位 {need} —— 這個模式要求新版產出端的完整證據"
-                    f"(舊格式相容只給既有報告用;PCM 雜湊要有 ffmpeg/ffprobe)")
+        base = [k for k in ("evaluation_id", "source_file_sha256") if not d.get(k)]
+        if base:
+            return (f"報告缺少來源身分欄位 {base} —— 這個模式要求新版產出端的完整證據"
+                    f"(舊格式相容只給既有報告用)")
+        why_declared = declared_downgrade(d)
+        if not d.get("source_audio_pcm_sha256"):
+            # ⭐ 兩種政策要分開(Codex R22-P2-1):
+            #    「產出端迴歸、忘了算 PCM」與「新版產出端明確說算不出來(s64)」
+            #    不是同一件事 —— 前者永遠要擋,後者在正式批次要能過。
+            if policy == IDENTITY_DECLARED and why_declared:
+                return ""
+            if why_declared:
+                return (f"這個模式要求解碼身分,但報告宣告降級({why_declared})"
+                        f" —— 安裝證據不接受降級(demo 是 s16,算得出來才叫裝好)")
+            return ("報告缺少來源身分欄位 ['source_audio_pcm_sha256', "
+                    "'source_audio_pcm_contract'] —— 這個模式要求新版產出端的完整證據"
+                    "(算不出來時要寫 source_audio_pcm_status 明確宣告原因)")
         # ⛔ 雜湊與版本一定要**成對**,而且版本必須是認得的(Codex R20-P1-2):
         #    「有雜湊、沒版本」以前照樣過 strict,下游還會把它當成最高等級的證據。
         pc = d.get("source_audio_pcm_contract")
+        if pc is None or (isinstance(pc, str) and not pc.strip()):
+            # ⛔ 訊息要講得出**缺哪個欄位**:呼叫端(與測試)是照欄位名判斷的
+            return ("報告缺少來源身分欄位 ['source_audio_pcm_contract'] ——"
+                    " 有解碼雜湊就一定要有版本,否則新舊標準面會被硬比")
         if pc not in PCM_CONTRACTS:
             return (f"不認得的解碼身分版本:{pc!r} —— 認得的是 {list(PCM_CONTRACTS)}"
                     f"(換過標準面的舊報告請用新版重評)")
@@ -254,23 +341,38 @@ def main(argv) -> int:
     舊版不管怎麼呼叫都印「本輪新產物」—— 連 pcm-v2 的舊報告、
     完全沒有身分欄位的舊格式,都被說成本輪新產物。相容可讀 ≠ 新產物證據。"""
     if len(argv) < 2:
-        print("用法:python 驗證報告.py <報告.json> "
-              "[--newer-than <epoch>] [--require-contract] [--require-identity]")
+        print("用法:python 驗證報告.py <報告.json> [--newer-than <epoch>] "
+              "[--require-contract] [--require-identity | --allow-declared-downgrade]")
         return 1
     newer = None
     if "--newer-than" in argv:
-        newer = float(argv[argv.index("--newer-than") + 1])
+        i = argv.index("--newer-than") + 1
+        try:
+            # ⛔ 一定要驗有限值(Codex R22-P2-2):`nan` 會讓 mtime 比較永遠不成立,
+            #    一份一天前的舊報告照樣被蓋上「本輪新產物」。
+            newer = finite_number("newer-than", argv[i] if i < len(argv) else None)
+        except ConfigError as e:
+            print(f"VERIFY_BAD --newer-than 的值不合法:{e}")
+            return 1
     strict_contract = "--require-contract" in argv
-    strict_identity = "--require-identity" in argv
+    strict_identity = ("--require-identity" in argv
+                       or "--allow-declared-downgrade" in argv)
+    policy = (IDENTITY_DECLARED if "--allow-declared-downgrade" in argv
+              else IDENTITY_DECODED if "--require-identity" in argv else None)
     path = Path(argv[1])
     why = validate(path, newer, require_contract=strict_contract,
-                   require_identity=strict_identity)
+                   require_identity=policy)
     if why:
         print(f"VERIFY_BAD {why}")
         return 1
     # 「本輪新產物」只有在**三個條件都要求過**時才能講
     if newer is not None and strict_contract and strict_identity:
-        print("VERIFY_OK 九柱完整、格式合格、本輪新產物")
+        try:
+            dd = declared_downgrade(json.loads(path.read_bytes().decode("utf-8")))
+        except Exception:       # noqa: BLE001 —— 到這裡一定解析得開,保險而已
+            dd = ""
+        extra = f";來源身分=宣告降級({dd})" if dd else ""
+        print(f"VERIFY_OK 九柱完整、格式合格、本輪新產物{extra}")
         return 0
     # 相容模式:講清楚驗了什麼、身分證據到哪一級
     try:

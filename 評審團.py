@@ -455,7 +455,7 @@ def _file_sha256(p: Path, chunk=1 << 20) -> str:
 # 解碼身分的**演算法版本**:標準面換了就是換了一把尺,新舊不可互比。
 # ⛔ 沒有版本欄位的話,日後改標準面時,新舊報告會被當成同一種 identity 硬比
 #    (Codex R19-1)。
-PCM_IDENTITY_CONTRACT = "pcm-v4/native-rate/channels/native-sample-fmt"
+PCM_IDENTITY_CONTRACT = "pcm-v5/native-rate/canonical-speakers/native-sample-fmt"
 
 # 原始樣本格式 → 解碼時要用哪個**可逆**的容器格式(⛔ 白名單,不可以有 fallback)
 # 🔴 Codex R20-P1-1:一律 s32le 會把 1e-12 的浮點量化成 0(與靜音撞號)、
@@ -485,8 +485,63 @@ def _canonical_fmt(sample_fmt: str) -> str:
 
 
 _SHAPE_KEYS = ("sample_rate", "channels", "channel_layout", "sample_fmt")
-# ⛔ 只有這幾個進身分雜湊;channel_layout 只留在報告裡供稽核(見 _pcm_sha256)
+# ⛔ 進身分雜湊的是這幾個 + **canonical 喇叭集合**(不是 ffprobe 的 layout 字面值)
 _IDENTITY_SHAPE_KEYS = ("sample_rate", "channels", "sample_fmt")
+
+# ── canonical 喇叭語意(Codex R22-P1-1)────────────────────────────
+# 🔴 上一版把 channel_layout **整個**移出身分,矯枉過正:layout 字串固然會隨
+#    容器/探測器漂移,但對多聲道它同時承載「第 N 個交錯聲道送去哪個喇叭」的語意。
+#    實測:同一段 6 聲道 PCM,只把 WAV 的 dwChannelMask 從 0x003F(5.1 後置 BL/BR)
+#    改成 0x060F(5.1(side) 側置 SL/SR),身分雜湊完全相同 → 比較器直接喊
+#    duplicate_source 拒絕兩者同場。那是**假陽性**:同一串數字送去不同喇叭
+#    本來就是不同的作品。
+# ⭐ 解法:不吃字面值,吃**我們自己版本化的喇叭集合**(= `ffmpeg -layouts` 的
+#    DECOMPOSITION)。名字改版(5.1 ↔ 5.1(back))不影響身分,喇叭真的不同才不同。
+# ⛔ 白名單:表裡沒有的配置**不發布**解碼身分(見 _canonical_speakers)。
+_SPEAKERS_BY_LAYOUT = {
+    "mono": "FC", "stereo": "FL+FR", "downmix": "DL+DR",
+    "2.1": "FL+FR+LFE", "3.0": "FL+FR+FC", "3.0(back)": "FL+FR+BC",
+    "4.0": "FL+FR+FC+BC", "quad": "FL+FR+BL+BR", "quad(side)": "FL+FR+SL+SR",
+    "3.1": "FL+FR+FC+LFE", "5.0": "FL+FR+FC+BL+BR", "5.0(side)": "FL+FR+FC+SL+SR",
+    "4.1": "FL+FR+FC+LFE+BC",
+    "5.1": "FL+FR+FC+LFE+BL+BR", "5.1(side)": "FL+FR+FC+LFE+SL+SR",
+    "6.0": "FL+FR+FC+BC+SL+SR", "6.0(front)": "FL+FR+FLC+FRC+SL+SR",
+    "3.1.2": "FL+FR+FC+LFE+TFL+TFR", "hexagonal": "FL+FR+FC+BL+BR+BC",
+    "6.1": "FL+FR+FC+LFE+BC+SL+SR", "6.1(back)": "FL+FR+FC+LFE+BL+BR+BC",
+    "6.1(front)": "FL+FR+LFE+FLC+FRC+SL+SR",
+    "7.0": "FL+FR+FC+BL+BR+SL+SR", "7.0(front)": "FL+FR+FC+FLC+FRC+SL+SR",
+    "7.1": "FL+FR+FC+LFE+BL+BR+SL+SR", "7.1(wide)": "FL+FR+FC+LFE+BL+BR+FLC+FRC",
+    "7.1(wide-side)": "FL+FR+FC+LFE+FLC+FRC+SL+SR",
+    "5.1.2": "FL+FR+FC+LFE+BL+BR+TFL+TFR",
+    "octagonal": "FL+FR+FC+BL+BR+BC+SL+SR",
+    "cube": "FL+FR+BL+BR+TFL+TFR+TBL+TBR",
+    "5.1.4": "FL+FR+FC+LFE+BL+BR+TFL+TFR+TBL+TBR",
+    "7.1.2": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR",
+    "7.1.4": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBL+TBR",
+    "7.2.3": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBC+LFE2",
+    "9.1.4": "FL+FR+FC+LFE+BL+BR+FLC+FRC+SL+SR+TFL+TFR+TBL+TBR",
+    "hexadecagonal": "FL+FR+FC+BL+BR+BC+SL+SR+TFL+TFC+TFR+TBL+TBC+TBR+WL+WR",
+    "22.2": ("FL+FR+FC+LFE+BL+BR+FLC+FRC+BC+SL+SR+TC+TFL+TFC+TFR+TBL+TBC+TBR"
+             "+LFE2+TSL+TSR+BFC+BFL+BFR"),
+}
+# 1/2 聲道:探測器講不出來時的**產品規則**(寫進契約,不靠 ffprobe 某版的猜測)。
+# ⛔ 這正是換容器漂移的來源:同一段 mono PCM 裝 WAV 被寫成 unknown、裝 MOV 寫成 mono。
+#    單聲道/立體聲沒有「送去哪個喇叭」的歧義,所以補預設是安全的;
+#    3 聲道以上講不出配置 → 一律 fail closed(見 _canonical_speakers)。
+_DEFAULT_SPEAKERS = {1: "FC", 2: "FL+FR"}
+_UNKNOWN_LAYOUTS = ("", "unknown", "unspecified", "none")
+
+
+def _canonical_speakers(layout: str, channels) -> str:
+    """回 canonical 喇叭集合;講不出來回 ""(= 不發布解碼身分)。"""
+    name = (layout or "").strip().lower()
+    if name and name not in _UNKNOWN_LAYOUTS:
+        return _SPEAKERS_BY_LAYOUT.get(name, "")
+    try:
+        n = int(str(channels).strip())
+    except (TypeError, ValueError):
+        return ""
+    return _DEFAULT_SPEAKERS.get(n, "")
 
 
 def _audio_shape(exe_probe, p: Path):
@@ -516,6 +571,59 @@ def _audio_shape(exe_probe, p: Path):
         return None
 
 
+# 降級原因白名單(⛔ 報告裡只能出現這幾種;下游依此顯示真正的原因)
+PCM_UNAVAILABLE_REASONS = (
+    "no_ffmpeg",                    # 這台沒有 ffmpeg/ffprobe
+    "probe_failed",                 # 探測不到音訊結構
+    "unsupported_sample_fmt",       # 白名單外的樣本格式(s64/未知)
+    "unknown_multichannel_layout",  # 3 聲道以上但講不出喇叭配置
+    "decode_failed",                # 解碼本身失敗
+)
+
+
+def _pcm_identity(p: Path):
+    """回 (雜湊, 算不出來的原因, 探測到的結構)。
+
+    ⭐ 為什麼要回原因(Codex R22-P2-1):「沒有雜湊」有好幾種完全不同的意思 ——
+       這台沒裝 ffmpeg、格式不支援所以**產品刻意不發布**、解碼壞掉。
+       只看欄位缺席的話,下游只能猜,實測比較器就把「格式不支援」說成
+       「產出端沒有 ffmpeg,裝好重評即可升級」—— 叫人去做一件沒有用的事。"""
+    exe = shutil.which("ffmpeg")
+    probe = shutil.which("ffprobe")
+    if not exe or not probe:
+        return "", "no_ffmpeg", None
+    shape = _audio_shape(probe, p)
+    if not shape:
+        return "", "probe_failed", None
+    fmt = _canonical_fmt(shape.get("sample_fmt", ""))
+    if not fmt:
+        # 不認得的樣本格式 → 寧可沒有解碼身分,也不要一個會撞號的身分
+        return "", "unsupported_sample_fmt", shape
+    speakers = _canonical_speakers(shape.get("channel_layout", ""),
+                                   shape.get("channels", ""))
+    if not speakers:
+        # 3 聲道以上卻講不出喇叭配置 → 同上,寧可沒有身分
+        return "", "unknown_multichannel_layout", shape
+    try:
+        r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),
+                            "-map", "0:a:0", "-f", fmt, "-"],
+                           capture_output=True, timeout=900)
+        if r.returncode != 0 or not r.stdout:
+            return "", "decode_failed", shape
+        h = hashlib.sha256()
+        # 固定順序組字串:dict 的順序不該影響身分
+        # ⛔ 進雜湊的是 **canonical 喇叭集合**,不是 ffprobe 的 layout 字面值:
+        #    字面值會隨容器/探測器漂移(WAV=unknown、MOV=mono),
+        #    但喇叭語意本身要保留 —— 5.1 與 5.1(side) 必須是兩個身分。
+        shape_txt = "|".join(f"{k}={shape.get(k, '')}" for k in _IDENTITY_SHAPE_KEYS)
+        h.update(f"{PCM_IDENTITY_CONTRACT}|{shape_txt}|speakers={speakers}"
+                 f"|canonical={fmt}|".encode("utf-8"))
+        h.update(r.stdout)
+        return h.hexdigest(), "", shape
+    except Exception:
+        return "", "decode_failed", shape
+
+
 def _pcm_sha256(p: Path) -> str:
     """**解碼後**聲音內容的 sha256 —— 保留原始取樣率與聲道結構。
 
@@ -535,37 +643,10 @@ def _pcm_sha256(p: Path) -> str:
        跨 ffmpeg/decoder 版本也**不保證** bit-exact —— 但那個方向是「算不出相同」
        (退回檔案雜湊那層),不會造成假的同源判定。
     ⚠️ 沒有 ffmpeg/ffprobe 或解碼失敗 → 回空字串,**呼叫端不要寫這個欄位**
-       (寫空字串會被身分 schema 判成畸形 —— Codex R19-2 實測)。"""
-    exe = shutil.which("ffmpeg")
-    probe = shutil.which("ffprobe")
-    if not exe or not probe:
-        return ""
-    shape = _audio_shape(probe, p)
-    if not shape:
-        return ""
-    fmt = _canonical_fmt(shape.get("sample_fmt", ""))
-    if not fmt:
-        # 不認得的樣本格式 → 寧可沒有解碼身分,也不要一個會撞號的身分
-        return ""
-    try:
-        r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),
-                            "-map", "0:a:0", "-f", fmt, "-"],
-                           capture_output=True, timeout=900)
-        if r.returncode != 0 or not r.stdout:
-            return ""
-        h = hashlib.sha256()
-        # 固定順序組字串:dict 的順序不該影響身分
-        # ⛔ **不把 channel_layout 的字面值入雜湊**(Codex R21-P2-1 實測):
-        #    同一段 PCM 裝進 WAV 被 ffprobe 寫成 unknown、裝進 MOV/CAF 寫成 mono,
-        #    身分就變了 —— 那正是「換容器也認得出」這個宣稱要擋的情況。
-        #    而且 ffmpeg 的 channel-layout 推斷歷史上改過好幾次,那個字串
-        #    是**探測器/容器**的描述,不是聲音本身。聲道**數量**已經在裡面了。
-        shape_txt = "|".join(f"{k}={shape.get(k, '')}" for k in _IDENTITY_SHAPE_KEYS)
-        h.update(f"{PCM_IDENTITY_CONTRACT}|{shape_txt}|canonical={fmt}|".encode("utf-8"))
-        h.update(r.stdout)
-        return h.hexdigest()
-    except Exception:
-        return ""
+       (寫空字串會被身分 schema 判成畸形 —— Codex R19-2 實測)。
+    ⚠️ 這支只是 _pcm_identity 的薄包裝(算不出來時回空字串)——
+       要知道**為什麼**算不出來請用 _pcm_identity。"""
+    return _pcm_identity(p)[0]
 
 
 def _identity_fields(song: Path) -> dict:
@@ -575,21 +656,32 @@ def _identity_fields(song: Path) -> dict:
     整份變成不合法,連「降級成 exact-file」那條路都走不到。缺席才是
     「這台算不出來」的正確表示法。"""
     out = {"evaluation_id": uuid.uuid4().hex}
-    for key, val in (("source_file_sha256", _file_sha256(song)),
-                     ("source_audio_pcm_sha256", _pcm_sha256(song))):
-        if val:
-            out[key] = val
-    if out.get("source_audio_pcm_sha256"):
+    fh = _file_sha256(song)
+    if fh:
+        out["source_file_sha256"] = fh
+    pcm, reason, shape = _pcm_identity(song)
+    # ⭐ 把結構也寫進報告(Codex R21-P2-1):兩份報告的解碼雜湊不同時,
+    #    看得出是「聲音不同」還是「取樣率/聲道/樣本格式/喇叭配置不同」。
+    shape_out = ({k: shape.get(k, "") for k in _SHAPE_KEYS}
+                 | {"canonical": _canonical_fmt(shape.get("sample_fmt", "")),
+                    "canonical_speakers": _canonical_speakers(
+                        shape.get("channel_layout", ""), shape.get("channels", ""))}
+                 ) if shape else None
+    if pcm:
         # 解碼身分要帶版本:標準面換了就是換一把尺,新舊不可互比(R19-1)
+        out["source_audio_pcm_sha256"] = pcm
         out["source_audio_pcm_contract"] = PCM_IDENTITY_CONTRACT
-        # ⭐ 把結構也寫進報告(Codex R21-P2-1):兩份報告的解碼雜湊不同時,
-        #    看得出是「聲音不同」還是「取樣率/聲道/樣本格式不同」。
-        probe = shutil.which("ffprobe")
-        shape = _audio_shape(probe, song) if probe else None
-        if shape:
-            out["source_audio_pcm_shape"] = {
-                k: shape.get(k, "") for k in _SHAPE_KEYS
-            } | {"canonical": _canonical_fmt(shape.get("sample_fmt", ""))}
+        if shape_out:
+            out["source_audio_pcm_shape"] = shape_out
+    else:
+        # ⭐ **顯式降級證據**(Codex R22-P2-1):欄位缺席有好幾種意思,
+        #    下游只能猜(實測比較器把「格式不支援」說成「沒裝 ffmpeg」)。
+        #    這裡把原因、產出端版本、探測到的結構一起留下來給人稽核。
+        st = {"status": "unavailable", "reason": reason,
+              "generator_contract": PCM_IDENTITY_CONTRACT}
+        if shape_out:
+            st["shape"] = shape_out
+        out["source_audio_pcm_status"] = st
     return out
 
 

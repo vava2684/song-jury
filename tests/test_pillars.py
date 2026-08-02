@@ -356,3 +356,102 @@ def test_layout字面值不可以進身分雜湊(tmp_path, monkeypatch):
         seen.append(J._pcm_sha256(wav))
     assert seen[0] and seen[0] == seen[1], \
         f"🔴 layout 字面值進了身分雜湊:{seen}"
+
+
+# ── 喇叭語意(Codex R22-P1-1)─────────────────────────────────────
+def _six_ch_wav(tmp_path, mask, name):
+    """做一支 6 聲道 WAV,再**只改** WAVEFORMATEXTENSIBLE 的 dwChannelMask。
+
+    ⭐ 這樣兩個檔的 data chunk 逐 byte 相同,差別只有「每個聲道送去哪個喇叭」——
+       正是 Codex 用來證明 pcm-v4 會撞號的那組樣本。"""
+    import struct
+    import subprocess as _sp
+    src = tmp_path / "src6.wav"
+    if not src.exists():
+        _sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                 "-i", "aevalsrc=0.2*sin(400*t)|0.2*sin(500*t)|0.2*sin(600*t)|"
+                       "0.2*sin(700*t)|0.2*sin(800*t)|0.2*sin(900*t):s=48000:d=0.2:c=5.1",
+                 "-c:a", "pcm_s32le", str(src)], check=True, timeout=300)
+    raw = bytearray(src.read_bytes())
+    at = raw.index(b"fmt ") + 8 + 20          # fmt data + 20 = dwChannelMask
+    raw[at:at + 4] = struct.pack("<I", mask)
+    out = tmp_path / name
+    out.write_bytes(bytes(raw))
+    return out
+
+
+def test_喇叭配置不同不可以撞成同一個身分(tmp_path):
+    """🔴 Codex R22-P1-1:pcm-v4 把 channel_layout 整個踢出雜湊,於是
+    5.1(BL/BR 後置)與 5.1(side)(SL/SR 側置)——同一串數字送去不同喇叭 ——
+    得到同一個解碼身分,比較器直接喊 duplicate_source 拒絕兩者同場。
+    ⛔ 那是**假陽性**:播放空間與語意不同,本來就是兩個作品。"""
+    import shutil as _sh
+    from conftest import load as _load
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = _load("評審團")
+    back = _six_ch_wav(tmp_path, 0x003F, "back.wav")      # FL FR FC LFE BL BR
+    side = _six_ch_wav(tmp_path, 0x060F, "side.wav")      # FL FR FC LFE SL SR
+    probe = _sh.which("ffprobe")
+    got = {f.name: J._audio_shape(probe, f).get("channel_layout") for f in (back, side)}
+    assert len(set(got.values())) == 2, f"fixture 沒做出兩種配置:{got}"
+    hb, hs = J._pcm_sha256(back), J._pcm_sha256(side)
+    assert hb and hs, "兩個都該發布得出身分"
+    assert hb != hs, f"🔴 5.1 與 5.1(side) 撞成同一個身分:{hb}"
+
+
+def test_多聲道講不出喇叭配置就不發布身分(tmp_path):
+    """⛔ fail closed:mask=0 的 6 聲道檔,ffprobe 只說得出 unknown ——
+    這時候硬補一個預設配置等於**製造**碰撞(不同配置的檔會撞在一起)。"""
+    import shutil as _sh
+    from conftest import load as _load
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = _load("評審團")
+    un = _six_ch_wav(tmp_path, 0x0000, "unknown6.wav")
+    pcm, reason, shape = J._pcm_identity(un)
+    assert pcm == "", f"🔴 對講不出配置的多聲道發布了身分:{pcm}"
+    assert reason == "unknown_multichannel_layout", reason
+    # 而且要**寫進報告**讓人稽核得到原因(不是靜靜地少一個欄位)
+    ident = J._identity_fields(un)
+    assert ident["source_audio_pcm_status"]["reason"] == "unknown_multichannel_layout"
+    assert ident["source_audio_pcm_status"]["shape"]["channels"] == "6"
+
+
+def test_單聲道與立體聲用產品規則補預設(tmp_path):
+    """⚠️ 1/2 聲道沒有「送去哪個喇叭」的歧義,所以探測器講不出來時補預設 ——
+    這正是換容器不漂移的來源。⛔ 3 聲道以上不適用(見上一條)。"""
+    from conftest import load as _load
+    J = _load("評審團")
+    assert J._canonical_speakers("unknown", 1) == "FC"
+    assert J._canonical_speakers("", 2) == "FL+FR"
+    assert J._canonical_speakers("mono", 1) == J._canonical_speakers("unknown", 1)
+    assert J._canonical_speakers("unknown", 6) == ""       # fail closed
+    assert J._canonical_speakers("5.1", 6) != J._canonical_speakers("5.1(side)", 6)
+
+
+def test_喇叭表要對得上這台ffmpeg的分解():
+    """⭐ 這張表是**我們自己的**契約(所以身分不隨 ffmpeg 版本漂移),
+    但它描述的是 ffmpeg 的配置 —— 對不上就是表寫錯或 ffmpeg 改了定義,
+    兩種都要當場知道,而不是等到身分算錯。"""
+    import shutil as _sh
+    import subprocess as _sp
+    from conftest import load as _load
+    if not _sh.which("ffmpeg"):
+        pytest.skip("這台沒有 ffmpeg")
+    J = _load("評審團")
+    r = _sp.run(["ffmpeg", "-hide_banner", "-layouts"], capture_output=True,
+                text=True, timeout=300)
+    real, seen = {}, False
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("Standard channel layouts"):
+            seen = True
+            continue
+        if seen:
+            parts = line.split()
+            if len(parts) == 2 and "+" in parts[1] or (len(parts) == 2 and parts[1].isupper()):
+                real[parts[0]] = parts[1]
+    assert real, "沒解析到 ffmpeg 的配置表"
+    wrong = {k: (v, real[k]) for k, v in J._SPEAKERS_BY_LAYOUT.items()
+             if k in real and real[k] != v}
+    assert not wrong, f"🔴 喇叭表與這台 ffmpeg 的分解對不上:{wrong}"

@@ -122,8 +122,10 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
             else:
                 # ⛔ 不信 exit 0:獨立裁判拆 JSON,而且**必須**自報 scoring_contract ——
                 #    這是「本輪新產物」的安裝證據,不可套用舊格式相容(Codex R16-5)。
+                # ⛔ 安裝證據一律 decoded:demo 是 s16,這台裝好就一定算得出來。
+                #    (正式批次才接受「產出端明講的降級」—— 見 批次評測.py)
                 why = validate(report, newer_than=started, require_contract=True,
-                                       require_identity=True)
+                                       require_identity="decoded")
                 if why:
                     print(f"VERIFY_BAD {why}")
                     rc = 1

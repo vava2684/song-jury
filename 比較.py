@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from 驗證報告 import (CONTRACTS, PCM_CONTRACTS, REQUIRED_PILLARS,   # noqa: E402
+                      declared_downgrade,
                      identity_problem, validate_data)
 
 COMPARE_CONTRACT = "compare-v1"
@@ -104,6 +105,10 @@ def load_report(path: Path) -> dict:
                          if d.get("source_audio_pcm_contract") in PCM_CONTRACTS else ""),
         # 報告裡「有寫」解碼雜湊(不管版本認不認得)—— 用來分辨兩種降級原因
         "pcm_raw_present": bool(d.get("source_audio_pcm_sha256")),
+        # ⭐ 產出端**明講**的降級原因(Codex R22-P2-1):沒有這個就只能猜,
+        #    實測會把「格式不支援」說成「沒裝 ffmpeg,裝好重評即可升級」——
+        #    叫使用者去做一件完全沒有用的事。
+        "pcm_downgrade": declared_downgrade(d),
         "report_bytes_sha256": hashlib.sha256(raw).hexdigest(),
         # ⛔ report_id 必須不可碰撞:不同資料夾的同名報告會在 per_pillar 互相覆蓋,
         #    高分那份被低分那份用同一個 key 蓋掉(Codex R16-1 實測 n=2 但表只剩一筆)。
@@ -208,6 +213,16 @@ def _rank(items):
     return out
 
 
+# 降級原因 → 給人看的說法(⛔ 不可以一律說成「沒裝 ffmpeg」)
+_REASON_TEXT = {
+    "no_ffmpeg": "產出端沒有 ffmpeg/ffprobe;裝好重評即可升級",
+    "probe_failed": "探測不到音訊結構",
+    "unsupported_sample_fmt": "樣本格式不在白名單(例:s64),產品刻意不發布會撞號的身分",
+    "unknown_multichannel_layout": "多聲道但講不出喇叭配置,產品刻意不發布",
+    "decode_failed": "解碼失敗",
+}
+
+
 def _identity_note(items):
     """輸出裡明說這一批的身分證據**強到哪裡為止** ——
     ⛔ 不可以讓人以為「有欄位」就等於「同一首歌一定認得出來」(Codex R18-4)。"""
@@ -236,9 +251,17 @@ def _identity_note(items):
                "這一層退回檔案雜湊(請用新版重評以取得可比較的解碼身分)。")
     elif with_eval == n and with_file == n:
         level = "exact-file"
-        why = ("每份都帶 evaluation_id 與**檔案** sha256,但缺解碼後雜湊 ——"
-               "同一段聲音只要換個容器或改 metadata 就會被當成兩個來源。"
-               "(產出端沒有 ffmpeg 時會這樣;裝好 ffmpeg 重評即可升級。)")
+        # ⛔ 原因要講**真的**那個(Codex R22-P2-1):以前一律說「沒有 ffmpeg」,
+        #    但 s64/未知配置是產品**刻意**不發布身分,重裝 ffmpeg 一點用都沒有。
+        reasons = sorted({i["pcm_downgrade"] for i in items if i.get("pcm_downgrade")})
+        if reasons:
+            why = ("每份都帶 evaluation_id 與**檔案** sha256,但產出端明講算不出解碼身分"
+                   f"({'、'.join(_REASON_TEXT.get(r, r) for r in reasons)})——"
+                   "同一段聲音換個容器或改 metadata 就會被當成兩個來源。")
+        else:
+            why = ("每份都帶 evaluation_id 與**檔案** sha256,但缺解碼後雜湊 ——"
+                   "同一段聲音只要換個容器或改 metadata 就會被當成兩個來源。"
+                   "(產出端沒有 ffmpeg 時會這樣;裝好 ffmpeg 重評即可升級。)")
     elif with_eval or with_file or with_pcm:
         level = "mixed"
         why = (f"只有部分報告帶身分(id {with_eval}/{n}、檔案 {with_file}/{n}、"

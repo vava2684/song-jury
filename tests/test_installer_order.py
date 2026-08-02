@@ -30,7 +30,7 @@ p.with_name(p.stem + "_評審團.json").write_text(
                 "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64,
                 "source_audio_pcm_sha256": "c" * 64,
                 "source_audio_pcm_contract":
-                    "pcm-v4/native-rate/channels/native-sample-fmt"},
+                    "pcm-v5/native-rate/canonical-speakers/native-sample-fmt"},
                ensure_ascii=False),
     encoding="utf-8")
 (p.parent / (p.stem + "_評分.json")).write_text("mid", encoding="utf-8")
@@ -555,7 +555,12 @@ def test_狀態檔要原子寫入且用完就清(tmp_path):
     ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
     sh = (REPO / "install.sh").read_text(encoding="utf-8")
     assert "GetRandomFileName" in ps1, "🔴 PS 用可預測的固定檔名(殘留會被誤用)"
-    assert "Remove-Item $statusFile" in ps1 and "finally" in ps1, "🔴 PS 沒有保證清掉"
+    # ⛔ 這裡**故意不**用 grep 驗 PowerShell(Codex R22-P2-3):
+    #    「Remove-Item 與 finally 都出現在同一個檔案裡」證明不了它們在同一塊 ——
+    #    產品當時正是反例(清理在 try 之外 20 行)。結構由下面兩條真的檢查:
+    #    test_ps1的狀態檔清理必須在finally區塊裡(AST)、
+    #    test_ps1中途被中斷時狀態檔不可以留在磁碟上(真的 Stop 一個執行中的 pipeline)。
+    assert "Remove-Item -LiteralPath $statusFile" in ps1, "🔴 PS 沒有清狀態檔"
     assert "trap 'rm -f \"$_line_status\"'" in sh, "🔴 sh 沒有 trap 清理"
 
 
@@ -906,3 +911,163 @@ def test_bootstrap是main之外的最後一道保護傘(tmp_path):
     assert r.returncode == 4, f"最外圈要收斂成 4(拿到 {r.returncode}):{r.stderr[-300:]}"
     assert st.exists(), "🔴 最外圈也要盡量寫得出狀態檔"
     assert _json.loads(st.read_text(encoding="utf-8"))["kind"] == "internal_error"
+
+
+# ── 狀態檔的生命週期(Codex R22-P2-3 / P2-4)────────────────────────
+_AST_PROBE = """param([string]$Ps1)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Ps1, [ref]$null, [ref]$null)
+$tries = $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
+$out = @()
+foreach ($t in $tries) {
+    if (-not ($t.Body.Extent.Text -like '*分軌線檢查.py*')) { continue }
+    $f = $t.Finally
+    $out += [pscustomobject]@{
+        CleanupInFinally = ($null -ne $f -and
+            $f.Extent.Text -like '*Remove-Item -LiteralPath $statusFile*')
+        ValidatorInTry   = ($t.Body.Extent.Text -like '*狀態驗證.py*')
+    }
+}
+if ($out.Count -eq 0) { 'NO_TRY_FOUND' } else { $out | ConvertTo-Json -Compress -Depth 3 }
+"""
+
+
+def _write_ps(path: Path, text: str):
+    """⛔ 給 PS 5.1 的 .ps1 一定要 UTF-8 **有 BOM**:沒有 BOM 它會用 cp950 解,
+    腳本裡的中文字面值變亂碼 → 比對永遠不成立,測試會靜靜地驗不到東西
+    (自己踩到:同一支探針 pwsh 有輸出、powershell 什麼都沒印)。"""
+    path.write_text(text, encoding="utf-8-sig", newline="\r\n")
+
+
+@pytest.mark.parametrize("exe", _ps_engines(), ids=lambda e: Path(e).stem if e else "none")
+def test_ps1的狀態檔清理必須在finally區塊裡(tmp_path, exe):
+    """🔴 Codex R22-P2-3:舊版的 finally 只還原 PYTHONUTF8(結束於第 266 行),
+    狀態檔卻到第 286 行才刪 —— 中間任何中斷/終止性錯誤都會把隨機檔名的
+    狀態檔留在 TEMP 裡累積。⛔ 而當時的測試只驗「兩個字都在檔案裡」,
+    產品是反例卻照樣綠燈(兩道防線互相遮蔽的教科書案例)。"""
+    if sys.platform != "win32":
+        pytest.skip("install.ps1 是 Windows 安裝器")
+    if not exe:
+        pytest.skip("這台沒有 PowerShell")
+    probe = tmp_path / "ast.ps1"
+    _write_ps(probe, _AST_PROBE)
+    r = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        str(probe), "-Ps1", str(REPO / "install.ps1")],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=300)
+    out = (r.stdout or "").strip()
+    assert out and "NO_TRY_FOUND" not in out, f"🔴 找不到跑 helper 的 try 區塊:{out!r}"
+    import json as _json
+    got = _json.loads(out)
+    got = got if isinstance(got, list) else [got]
+    assert any(g["CleanupInFinally"] for g in got), \
+        f"🔴 狀態檔的清理不在 finally 裡(AST 說的,不是 grep):{got}"
+    assert any(g["ValidatorInTry"] for g in got), \
+        f"🔴 狀態驗證排在 try 之外 —— 那段中斷一樣會留檔:{got}"
+
+
+_STOP_PROBE = """param([string]$Repo, [string]$TempDir)
+$env:TMP = $TempDir
+$env:TEMP = $TempDir
+$ps = [PowerShell]::Create()
+[void]$ps.AddScript("Set-Location -LiteralPath '$Repo'; " +
+                    "& '$Repo\\install.ps1' -CheckOnly -NoAutoTools")
+[void]$ps.BeginInvoke()
+$marker = Join-Path $TempDir 'validator-started.txt'
+$t = 0
+while (-not (Test-Path $marker) -and $t -lt 120) { Start-Sleep -Milliseconds 100; $t++ }
+$seen = Test-Path $marker
+Start-Sleep -Milliseconds 300
+$ps.Stop()                      # ← 這正是 Ctrl+C 走的那條路(finally 要跑)
+Start-Sleep -Milliseconds 800
+$left = @(Get-ChildItem -LiteralPath $TempDir -Filter 'song-jury-demucs-*.json' `
+          -EA SilentlyContinue)
+[pscustomobject]@{MarkerSeen = $seen; Left = $left.Count} | ConvertTo-Json -Compress
+"""
+
+
+@pytest.mark.parametrize("exe", _ps_engines(), ids=lambda e: Path(e).stem if e else "none")
+def test_ps1中途被中斷時狀態檔不可以留在磁碟上(tmp_path, exe):
+    """🔴 Codex R22-P2-3 的動態版:在 helper 跑完、狀態還在驗的那一刻停掉整條
+    pipeline(PowerShell 的 Stop 就是 Ctrl+C 的內部路徑,會跑 finally),
+    然後看那個隨機檔名的狀態檔還在不在。⛔ 清理若排在 try 之外,這裡必留檔。"""
+    if sys.platform != "win32":
+        pytest.skip("install.ps1 是 Windows 安裝器")
+    if not exe:
+        pytest.skip("這台沒有 PowerShell")
+    d = _stub_repo(tmp_path, 0)
+    # helper:寫一份合法狀態檔就走人
+    (d / "分軌線檢查.py").write_text(_kind_stub("ok", 0).replace("'ok': False", "'ok': True"),
+                                    encoding="utf-8")
+    # 狀態驗證:先立旗標,再賴著不走 —— 給測試一個穩定的「中斷時機」
+    tempdir = tmp_path / "tmp"
+    tempdir.mkdir()
+    (d / "狀態驗證.py").write_text(
+        "import pathlib, sys, time\n"
+        f"pathlib.Path(r'{tempdir / 'validator-started.txt'}').write_text('1')\n"
+        "time.sleep(30)\n"
+        "print('ok\\t')\n", encoding="utf-8")
+    probe = tmp_path / "stop.ps1"
+    _write_ps(probe, _STOP_PROBE)
+    r = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(probe),
+                        "-Repo", str(d), "-TempDir", str(tempdir)],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=600)
+    import json as _json
+    out = (r.stdout or "").strip().splitlines()
+    assert out, f"🔴 探針沒有輸出:{r.stderr[-500:]}"
+    got = _json.loads(out[-1])
+    assert got["MarkerSeen"], "🔴 沒等到驗證階段就停了 —— 這次沒驗到要測的時機"
+    assert got["Left"] == 0, \
+        f"🔴 中斷之後還留著 {got['Left']} 份狀態檔 —— 清理沒有在 finally 裡"
+
+
+def test_sh在分軌體檢被中斷時要清檔並以130結束(tmp_path):
+    """🔴 Codex R22-P2-4:`trap 'rm -f ...' EXIT INT TERM` 的 INT handler 只刪檔、
+    沒有 exit —— 實測 shell 會**繼續往下裝**,最外層還回 0。於是在分軌探針按
+    Ctrl+C 等於什麼都沒發生,和 --verify-models 的 130 契約、和 PowerShell 都不一致。
+    ⛔ 只 grep `trap`/`130` 驗不到這件事:字串在,行為不在。"""
+    bash = _git_bash()
+    if not bash:
+        pytest.skip("這台沒有 Git Bash")
+    d = _stub_repo(tmp_path, 0)
+    flag = tmp_path / "probe-running.txt"
+    # helper:立旗標 → 賴一下(讓中斷落在探針執行中)→ 正常結束
+    (d / "分軌線檢查.py").write_text(
+        "import json, pathlib, sys, time\n"
+        "a = sys.argv[1:]\n"
+        "p = a[a.index('--status-json') + 1] if '--status-json' in a else None\n"
+        "if p:\n"
+        "    json.dump({'ok': True, 'kind': 'ok', 'rc': 0, 'why': ''},\n"
+        "              open(p, 'w', encoding='utf-8'))\n"
+        f"pathlib.Path(r'{flag}').write_text('1')\n"
+        "time.sleep(2)\n"
+        "sys.exit(0)\n", encoding="utf-8")
+    runner = tmp_path / "run.sh"
+    runner.write_text(
+        "#!/usr/bin/env bash\n"
+        # ⛔ 一定要 `set -m`(job control):非互動 shell 用 `&` 起的背景工作
+        #    會**繼承 SIGINT 為忽略**,而 bash 規定「進入時被忽略的訊號不能被
+        #    trap」—— 於是 kill -INT 什麼都不會發生,這條會變成驗不到東西的
+        #    裝飾品(自己踩到:第一版沒有 set -m,安裝器一路跑完回 1)。
+        "set -m\n"
+        f"cd '{str(d).replace(chr(92), '/')}'\n"
+        "bash install.sh --check-only --no-auto-tools > out.txt 2>&1 &\n"
+        "pid=$!\n"
+        f"for i in $(seq 1 200); do [ -f '{str(flag).replace(chr(92), '/')}' ] && break; sleep 0.1; done\n"
+        "kill -INT \"$pid\"\n"
+        "wait \"$pid\"; echo \"RC=$?\"\n",
+        encoding="utf-8", newline="\n")
+    r = subprocess.run([bash, str(runner)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600, cwd=str(tmp_path))
+    rc_line = [x for x in (r.stdout or "").splitlines() if x.startswith("RC=")]
+    assert rc_line, f"🔴 探針沒回報退出碼:{r.stdout[-400:]}{r.stderr[-400:]}"
+    rc = int(rc_line[-1].split("=")[1])
+    out = (d / "out.txt").read_text(encoding="utf-8", errors="replace")
+    # ⚠️ 先確認這次真的打到要測的時機,否則下面不管過不過都沒有意義
+    assert flag.exists(), f"🔴 探針還沒開始跑就結束了,這次沒驗到中斷:\n{out[-600:]}"
+    assert rc == 130, f"🔴 中斷後應該回 130,拿到 {rc};安裝器輸出尾巴:\n{out[-600:]}"
+    # ⛔ 而且要**真的停下來**:中斷之後不可以繼續跑後面的安裝步驟/健康表
+    for marker in ("冒煙測試", "接下來怎麼用"):
+        assert marker not in out, \
+            f"🔴 中斷之後還繼續往下跑(看到「{marker}」):\n{out[-600:]}"

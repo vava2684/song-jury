@@ -59,7 +59,8 @@ _八柱 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實
     # ⚠️ R20 起「本輪新產物」一律 strict:批次剛跑完的報告要帶完整身分
     "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64,
     "source_audio_pcm_sha256": "c" * 64,
-    "source_audio_pcm_contract": "pcm-v4/native-rate/channels/native-sample-fmt",
+    # ⚠️ 不要寫死版本字串:契約升版時這裡會靜靜地變成「不認得的版本」
+    "source_audio_pcm_contract": load("驗證報告").PCM_CONTRACTS[0],
     "pillar_totals": {
         "完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
         "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in _八柱},

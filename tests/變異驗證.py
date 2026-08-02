@@ -219,7 +219,7 @@ MUTATIONS = [
 
     ("批次 full 不過獨立裁判(半殘 JSON 冒充九柱完整)",
      "批次評測.py",
-     "validate(out_json, require_contract=True, require_identity=True)",
+     "validate(out_json, require_contract=True, require_identity=\"declared\")",
      'None if False else ""',
      "tests/test_batch_and_windows.py::test_full模式要過獨立裁判"),
 
@@ -921,8 +921,8 @@ MUTATIONS = [
 
     ("產出端不寫來源身分(比較器的防線失去依據)",
      "評審團.py",
-     '    for key, val in (("source_file_sha256", _file_sha256(song)),',
-     '    for key, val in (("x", ""),',
+     '    fh = _file_sha256(song)',
+     '    fh = ""   # 變異:不寫檔案身分',
      "tests/test_compare.py::test_產出端真的會寫來源身分"),
 
     ("拒絕理由退回沒有機器碼(測試只能綁中文文案)",
@@ -996,7 +996,7 @@ MUTATIONS = [
     ("安裝證據不要求來源身分(產出端迴歸也照樣 VERIFY_OK)",
      "完整驗證.py",
      "                why = validate(report, newer_than=started, require_contract=True,\n"
-     "                                       require_identity=True)",
+     "                                       require_identity=\"decoded\")",
      "                why = validate(report, newer_than=started, require_contract=True)",
      "tests/test_installer_order.py::test_本輪新產物沒有來源身分要被擋下"),
 
@@ -1017,8 +1017,8 @@ MUTATIONS = [
 
     ("產出端不算解碼後的聲音雜湊(換個容器就變成另一首歌)",
      "評審團.py",
-     '                     ("source_audio_pcm_sha256", _pcm_sha256(song))):',
-     '                     ("source_audio_pcm_sha256", "")):',
+     '    pcm, reason, shape = _pcm_identity(song)',
+     '    pcm, reason, shape = "", "no_ffmpeg", None',
      "tests/test_compare.py::test_產出端要寫出解碼後的聲音身分"),
 
     ("比較器不看解碼後身分(重新封裝的同一段聲音會被當兩個來源)",
@@ -1054,8 +1054,8 @@ MUTATIONS = [
 
     ("算不到身分時照樣寫空字串(整份報告被 schema 判畸形)",
      "評審團.py",
-     "        if val:\n            out[key] = val",
-     "        out[key] = val   # 變異:無條件寫入",
+     "    if fh:\n        out[\"source_file_sha256\"] = fh",
+     "    out[\"source_file_sha256\"] = fh   # 變異:無條件寫入",
      "tests/test_compare.py::test_算不出PCM時不可以寫空字串"),
 
     ("空字串身分被當成畸形(沒有 ffmpeg 的舊報告整份不合法)",
@@ -1064,13 +1064,14 @@ MUTATIONS = [
      "        pass   # 變異:空字串當成畸形",
      "tests/test_compare.py::test_算不出PCM時不可以寫空字串"),
 
-    ("安裝證據不要求解碼後身分(產出端迴歸也照樣 VERIFY_OK)",
+    # ⚠️ 「缺解碼雜湊要被擋」現在有三道防線(成對規則、缺版本分支、政策分支)——
+    #    拿掉其中一道時另外兩道會接住,所以那個方向驗不到東西。這條改指
+    #    這段程式**獨佔**的行為:合法的宣告降級在正式批次要能過。
+    ("身分政策整段被拿掉(合法的宣告降級在正式批次被誤擋)",
      "驗證報告.py",
-     '        need = [k for k in ("evaluation_id", "source_file_sha256",\n'
-     '                            "source_audio_pcm_sha256", "source_audio_pcm_contract")\n'
-     "                if not d.get(k)]",
-     '        need = [k for k in ("evaluation_id",) if not d.get(k)]',
-     "tests/test_compare.py::test_安裝證據要求三個身分欄位都在"),
+     '        if not d.get("source_audio_pcm_sha256"):',
+     "        if False:   # 變異:政策分支整段失效",
+     "tests/test_來源身分.py::test_正式批次接受產出端明講的降級"),
 
     # ⚠ 「版本前綴」與「版本白名單」是同一件事的兩半:白名單那道(見上一條)
     #   已經把未知版本的雜湊整個丟掉,所以單獨拔前綴測不出差別 —— 那不是缺陷,
@@ -1108,18 +1109,14 @@ MUTATIONS = [
 
     ("批次對本輪新產物退回相容驗證(半殘身分靜靜收件)",
      "批次評測.py",
-     "validate(out_json, require_contract=True, require_identity=True)",
+     "validate(out_json, require_contract=True, require_identity=\"declared\")",
      "validate(out_json, require_contract=True)",
      "tests/test_batch_and_windows.py::test_full模式對本輪新產物要用strict身分"),
 
-    ("strict 不要求解碼身分的版本(有雜湊沒版本照樣過)",
+    ("strict 不要求解碼身分的**版本**(換過標準面的舊雜湊照樣當強證據)",
      "驗證報告.py",
-     '        need = [k for k in ("evaluation_id", "source_file_sha256",\n'
-     '                            "source_audio_pcm_sha256", "source_audio_pcm_contract")\n'
-     "                if not d.get(k)]",
-     '        need = [k for k in ("evaluation_id", "source_file_sha256",\n'
-     '                            "source_audio_pcm_sha256")\n'
-     "                if not d.get(k)]",
+     "        if pc not in PCM_CONTRACTS:",
+     "        if False:   # 變異:什麼版本都收",
      "tests/test_compare.py::test_安裝證據要求三個身分欄位都在"),
 
     ("比較器又自己補一個版本(對不存在的證據蓋章)",
@@ -1231,6 +1228,50 @@ MUTATIONS = [
      '    if newer is not None and strict_contract and strict_identity:',
      "    if True:",
      "tests/test_installer_order.py::test_單檔驗證不可以把舊報告說成本輪新產物"),
+
+    # ── Codex R22 ────────────────────────────────────────────────
+    ('解碼身分不看喇叭語意(5.1 與 5.1(side) 撞成同一個身分)',
+     '評審團.py',
+     'h.update(f"{PCM_IDENTITY_CONTRACT}|{shape_txt}|speakers={speakers}"\n                 f"|canonical={fmt}|".encode("utf-8"))',
+     'h.update(f"{PCM_IDENTITY_CONTRACT}|{shape_txt}"\n                 f"|canonical={fmt}|".encode("utf-8"))',
+     'tests/test_pillars.py::test_喇叭配置不同不可以撞成同一個身分'),
+
+    ('多聲道講不出配置時硬補立體聲預設(製造碰撞)',
+     '評審團.py',
+     '    return _DEFAULT_SPEAKERS.get(n, "")',
+     '    return _DEFAULT_SPEAKERS.get(n, "FL+FR")',
+     'tests/test_pillars.py::test_多聲道講不出喇叭配置就不發布身分'),
+
+    ('安裝證據也接受宣告降級(沒裝好的機器照樣 VERIFY_OK)',
+     '驗證報告.py',
+     '            if policy == IDENTITY_DECLARED and why_declared:',
+     '            if why_declared:',
+     'tests/test_來源身分.py::test_安裝證據不接受宣告降級'),
+
+    ('降級宣告不驗產出端版本(舊版漏寫可以偽裝成刻意降級)',
+     '驗證報告.py',
+     '    return st.get("reason", "") if st.get("generator_contract") in PCM_CONTRACTS else ""',
+     '    return st.get("reason", "")',
+     'tests/test_來源身分.py::test_舊版產出端不可以假裝成刻意降級'),
+
+    ('--newer-than 不驗有限值(nan 讓舊報告蓋上『本輪新產物』)',
+     '驗證報告.py',
+     '            newer = finite_number("newer-than", argv[i] if i < len(argv) else None)',
+     '            newer = float(argv[i])',
+     'tests/test_來源身分.py::test_newer_than不是有限數字一律不可以蓋章'),
+
+    ('PS 的狀態檔清理搬出 finally(中斷就留檔)',
+     'install.ps1',
+     '        # ⛔ 狀態檔的清理**一定要在同一個 finally**(Codex R22-P2-3 實測):\n        #    舊版寫在 try 之後 20 行,helper 跑完到那一行之間若 Ctrl+C 或\n        #    發生終止性錯誤,隨機檔名的狀態檔就會一直留在 TEMP 裡累積。\n        Remove-Item -LiteralPath $statusFile -Force -EA SilentlyContinue\n    }',
+     '    }\n    Remove-Item -LiteralPath $statusFile -Force -EA SilentlyContinue',
+     'tests/test_installer_order.py::test_ps1的狀態檔清理必須在finally區塊裡',
+     'win32'),
+
+    ('POSIX 的 INT trap 只清檔不結束(Ctrl+C 之後照樣往下裝)',
+     'install.sh',
+     '  trap \'rm -f "$_line_status"; trap - INT; kill -INT $$\' INT',
+     '  trap \'rm -f "$_line_status"\' INT',
+     'tests/test_installer_order.py::test_sh在分軌體檢被中斷時要清檔並以130結束'),
 
 ]
 

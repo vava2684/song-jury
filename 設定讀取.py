@@ -20,6 +20,27 @@ class ConfigError(ValueError):
     """設定值不合法 —— 訊息要能讓人直接照著改,不需要看原始碼。"""
 
 
+def finite_number(name: str, raw) -> float:
+    """CLI 參數版:必須是**有限**數字,沒得預設 —— 缺值/亂填都要當場講清楚。
+
+    🔴 Codex R22-P2-2 實測:`驗證報告.py --newer-than nan` 會讓
+       `mtime <= nan` 永遠為 false,於是一份一天前的舊報告照樣印
+       「VERIFY_OK …本輪新產物」。`-inf` 同理。⛔ 那是**證據標籤**被繞過,
+       不是顯示問題:自動化就是靠這行字判斷「這份是這次跑出來的」。
+    ⚠️ 這裡不限正負(mtime 門檻可以是任何 epoch),只擋 NaN/Infinity 與非數字。"""
+    if raw is None:
+        raise ConfigError(f"{name} 少了值 —— 請填 epoch 秒數(例如 `--{name} 1785600000`)")
+    txt = str(raw).strip()
+    try:
+        val = float(txt)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name}={txt!r} 不是數字 —— 請填 epoch 秒數")
+    if not math.isfinite(val):
+        raise ConfigError(f"{name}={txt!r} 不是有限的數字"
+                          f"(NaN/Infinity 會讓所有比較都不成立,等於沒檢查)")
+    return val
+
+
 def positive_finite(name: str, default: float, lo: float = 0.0,
                     hi: float = 86400.0, env=None) -> float:
     """讀一個「秒數」設定:必須是有限、> lo、<= hi 的數字。

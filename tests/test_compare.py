@@ -330,16 +330,26 @@ def test_舊格式報告要誠實標示身分防線比較弱(tmp_path):
     assert C.compare_pk([c, d_], "zh")["source_identity"]["level"] == "decoded-audio"
 
 
-def test_產出端真的會寫來源身分():
-    """比較器的防線建立在產出端寫了身分 —— 那一段不可以只存在於比較器的想像裡。"""
-    from conftest import REPO
-    src = (REPO / "評審團.py").read_text(encoding="utf-8")
-    # ⚠️ 值算不出來時**不寫欄位**(R19-2),所以是迴圈寫入 —— 驗的是
-    #    「兩個雜湊都被算、而且只有非空才寫」這件事,不是某一行長什麼樣。
-    assert '("source_file_sha256", _file_sha256(song))' in src
-    assert '("source_audio_pcm_sha256", _pcm_sha256(song))' in src
-    assert "        if val:" in src, "🔴 又變成無條件寫入了(空字串會被 schema 判畸形)"
-    assert '"evaluation_id": uuid.uuid4().hex' in src
+def test_產出端真的會寫來源身分(tmp_path, monkeypatch):
+    """比較器的防線建立在產出端寫了身分 —— 那一段不可以只存在於比較器的想像裡。
+
+    ⚠️ 這條**驗行為不驗長相**:舊版比對的是 `("source_file_sha256", _file_sha256(song))`
+       這一行的字面樣子,R22 把組裝方式改寫之後整條紅了,但產品其實是對的
+       (自己踩到)。字面比對會把「重構」誤報成「迴歸」。"""
+    import hashlib
+    J = load("評審團")
+    song = tmp_path / "x.wav"
+    song.write_bytes(b"RIFF1234abcd")
+    monkeypatch.setattr(J, "_pcm_identity",
+                        lambda p: ("c" * 64, "", {"sample_rate": "48000",
+                                                  "channels": "2",
+                                                  "channel_layout": "stereo",
+                                                  "sample_fmt": "s16"}))
+    fields = J._identity_fields(song)
+    assert fields["source_file_sha256"] == hashlib.sha256(song.read_bytes()).hexdigest()
+    assert fields["source_audio_pcm_sha256"] == "c" * 64
+    assert len(fields["evaluation_id"]) == 32
+    assert fields["source_audio_pcm_contract"] == J.PCM_IDENTITY_CONTRACT
 
 
 # ── 錯誤碼是對外契約(Codex R17-7)──────────────────────────────────
@@ -433,14 +443,26 @@ def test_證據等級要說清楚強到哪裡(tmp_path):
     assert "換個容器" in out["source_identity"]["note"] or "metadata" in out["source_identity"]["note"]
 
 
-def test_產出端要寫出解碼後的聲音身分():
-    """比較器最強的那一層建立在產出端真的算了 PCM 雜湊。"""
-    from conftest import REPO as R
-    src = (R / "評審團.py").read_text(encoding="utf-8")
-    assert '("source_audio_pcm_sha256", _pcm_sha256(song))' in src
-    assert '("source_file_sha256", _file_sha256(song))' in src
+def test_產出端要寫出解碼後的聲音身分(tmp_path):
+    """比較器最強的那一層建立在產出端**真的**算了 PCM 雜湊 ——
+    這條不 stub,用真的 ffmpeg 跑一次(沒有 ffmpeg 的機器誠實跳過)。"""
+    import shutil as _sh
+    import subprocess as _sp
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = load("評審團")
+    song = tmp_path / "s.wav"
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "aevalsrc=0.2*sin(440*t):s=44100:d=0.2", "-c:a", "pcm_s16le",
+             "-ac", "2", str(song)], check=True, timeout=300)
+    fields = J._identity_fields(song)
+    assert len(fields.get("source_audio_pcm_sha256", "")) == 64, fields
+    assert len(fields.get("source_file_sha256", "")) == 64, fields
     # 版本欄位也要跟著寫,否則日後換標準面時新舊雜湊會被硬比(R19-1)
-    assert 'out["source_audio_pcm_contract"] = PCM_IDENTITY_CONTRACT' in src
+    assert fields["source_audio_pcm_contract"] == J.PCM_IDENTITY_CONTRACT
+    # 結構也要留給人稽核(含 canonical 喇叭集合 —— R22-P1-1)
+    shape = fields["source_audio_pcm_shape"]
+    assert shape["channels"] == "2" and shape["canonical_speakers"] == "FL+FR"
 
 
 # ── R19:身分欄位缺席/版本/strict ────────────────────────────────────
@@ -455,6 +477,10 @@ def test_算不出PCM時不可以寫空字串(tmp_path, monkeypatch):
     fields = J._identity_fields(tmp_path / "沒這檔.wav")
     assert "source_audio_pcm_sha256" not in fields, f"🔴 算不出來卻還是寫了欄位:{fields}"
     assert "source_file_sha256" not in fields, f"🔴 讀不到檔也寫了欄位:{fields}"
+    # ⛔ 任何欄位都不可以是空字串(那正是 R19-2 讓整份報告變不合法的寫法)
+    assert all(v != "" for v in fields.values()), f"🔴 有欄位寫成空字串:{fields}"
+    # ⭐ 而且要**明講**算不出來的原因(R22-P2-1),不是靜靜地少一個欄位
+    assert fields["source_audio_pcm_status"]["reason"] == "no_ffmpeg", fields
     assert fields.get("evaluation_id"), "evaluation_id 一定要有"
     # 而「有欄位但空字串」的舊產物要被當成缺席(相容),不是畸形
     assert V.identity_problem({"source_audio_pcm_sha256": ""}) == ""
@@ -475,6 +501,24 @@ def test_安裝證據要求三個身分欄位都在(tmp_path):
         raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
         why = V.validate_data(raw, "t.json", require_contract=True, require_identity=True)
         assert why and drop in why, f"🔴 strict 沒要求 {drop}:{why!r}"
+    # ⛔ 版本不是「有就好」:**不認得的**版本也要擋 —— 否則換過標準面的舊雜湊
+    #    會被當成最高等級的證據硬比(Codex R20-P1-2 的另一半)。
+    d = {**base, **full, "source_audio_pcm_contract": "pcm-v0/我自己編的"}
+    raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
+    why = V.validate_data(raw, "t.json", require_contract=True, require_identity=True)
+    assert why and "不認得" in why, f"🔴 strict 收下了不認得的解碼身分版本:{why!r}"
+    # ⛔ 版本不是「有就好」:**不認得的**版本也要擋 —— 否則換過標準面的舊雜湊
+    #    會被當成最高等級的證據硬比(Codex R20-P1-2 的另一半)。
+    d = {**base, **full, "source_audio_pcm_contract": "pcm-v0/我自己編的"}
+    raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
+    why = V.validate_data(raw, "t.json", require_contract=True, require_identity=True)
+    assert why and "不認得" in why, f"🔴 strict 收下了不認得的解碼身分版本:{why!r}"
+    # ⛔ 版本不是「有就好」:**不認得的**版本也要擋 —— 否則換過標準面的舊雜湊
+    #    會被當成最高等級的證據硬比(Codex R20-P1-2 的另一半)。
+    d = {**base, **full, "source_audio_pcm_contract": "pcm-v0/我自己編的"}
+    raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
+    why = V.validate_data(raw, "t.json", require_contract=True, require_identity=True)
+    assert why and "不認得" in why, f"🔴 strict 收下了不認得的解碼身分版本:{why!r}"
     # 三個都在就要過
     raw = json.dumps({**base, **full}, ensure_ascii=False).encode("utf-8")
     assert V.validate_data(raw, "t.json", require_contract=True, require_identity=True) == ""
