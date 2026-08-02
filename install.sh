@@ -286,28 +286,17 @@ if [ "$HAS_ENV" = 1 ]; then
   LINE_KIND=""
   LINE_RECOVERED=""
   if [ -s "$_line_status" ]; then
-    # ⭐ 狀態檔只是診斷補充:**必須與實際 rc 一致**才採信,成功與否永遠只看實際 rc。
-    #    (殘留或被改過的檔案會把 rc=4 說成設定問題 —— 那會給出完全錯的修復指示)
-    _line_json=$(PYTHONUTF8=1 .venv/bin/python - "$_line_status" "$LINE_RC" <<'PYCHK'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
-    rc = int(sys.argv[2])
-    ok_matches = bool(d.get("ok")) == (rc == 0)
-    if str(d.get("rc")) != str(rc) or not ok_matches or not str(d.get("kind") or "").strip():
-        print("MISMATCH")
-    else:
-        print((d.get("kind") or "") + "\t" + ("1" if d.get("recovered") else ""))
-except Exception:
-    print("MISMATCH")
-PYCHK
-)
-    if [ "$_line_json" = "MISMATCH" ]; then
-      warn "分軌線體檢的狀態檔與實際結果不一致 —— 已忽略狀態檔,只依退出碼判斷"
-    else
-      LINE_KIND=${_line_json%%	*}
-      LINE_RECOVERED=${_line_json##*	}
-    fi
+    # ⭐ 驗證邏輯只有一份(狀態驗證.py),兩支安裝器共用;而且不是被驗的那支自己:
+    #    rc/ok 相符、kind 屬於該 rc 的合法集合、recovered 是布林且成套。
+    #    ⛔ 只驗 rc/ok 是不夠的(Codex R21-P2-2)。
+    _line_chk=$(PYTHONUTF8=1 .venv/bin/python 狀態驗證.py "$_line_status" "$LINE_RC" 2>/dev/null | head -n 1)
+    case "$_line_chk" in
+      MISMATCH*)
+        warn "分軌線體檢的狀態檔不可採信(${_line_chk#MISMATCH	})—— 已忽略,只依退出碼判斷" ;;
+      *)
+        LINE_KIND=${_line_chk%%	*}
+        LINE_RECOVERED=${_line_chk##*	} ;;
+    esac
   fi
   rm -f "$_line_status"
   trap - EXIT INT TERM

@@ -232,15 +232,27 @@ def test_浮點來源不可以在正規化時撞成同一個身分(tmp_path, a_e
     assert ha != hb, f"🔴 {why} —— 兩個不同的音訊撞成同一個解碼身分"
 
 
-def test_浮點來源要用浮點面_整數來源才用s32(tmp_path):
-    """canonical 格式由**原始樣本格式**決定,不是一律 s32le。"""
+def test_canonical格式是白名單而且分得出寬度(tmp_path):
+    """canonical 由**原始樣本格式**決定,而且是白名單。
+
+    🔴 Codex R21-P1-1:上一版寫成「浮點→f64,其餘→s32」——
+    s64/s64p 被壓進 s32,實測兩個只差 1 個 s64 LSB 的音訊撞成同一個身分。
+    ⛔ 而且不認得的格式不可以有 fallback:ffmpeg 之後多一種格式,
+       fallback 會靜靜製造新的碰撞。回空字串 = 不發布解碼身分(fail closed)。"""
     from conftest import load as _load
     J = _load("評審團")
     assert J._canonical_fmt("flt") == "f64le"
     assert J._canonical_fmt("fltp") == "f64le"
+    assert J._canonical_fmt("dbl") == "f64le"
     assert J._canonical_fmt("dblp") == "f64le"
     assert J._canonical_fmt("s16") == "s32le"
-    assert J._canonical_fmt("") == "s32le"
+    assert J._canonical_fmt("s32p") == "s32le"
+    # ⚠️ s64/s64p 沒有無損容器可用(ffmpeg 沒有 s64le raw muxer,f64 尾數又不夠)
+    #    → 故意不給 canonical:寧可不發布身分,也不要一個會撞號的身分
+    assert J._canonical_fmt("s64") == "", "🔴 s64 壓進 s32 會撞號"
+    assert J._canonical_fmt("s64p") == ""
+    assert J._canonical_fmt("") == "", "不認得就不要給 canonical(fail closed)"
+    assert J._canonical_fmt("未來的新格式") == ""
 
 
 def test_ffprobe要讀keyvalue不可以靠欄位順序(tmp_path):
@@ -256,3 +268,53 @@ def test_ffprobe要讀keyvalue不可以靠欄位順序(tmp_path):
     assert isinstance(shape, dict), "要回 dict(key=value),不是靠位置的 list"
     assert shape.get("sample_rate") and shape.get("channels")
     assert "sample_fmt" in shape
+
+
+def test_s64來源寧可不發布身分也不要撞號(tmp_path):
+    """🔴 Codex R21-P1-1:s64 被壓進 s32le 時,只差 1 個 s64 LSB 的兩段聲音
+    會拿到同一個身分。
+
+    ⚠️ 實測發現 ffmpeg **沒有** s64le raw muxer(只有 f64le/f64be),而 f64 的
+    53 位尾數也裝不下 64 位整數 —— 沒有無損容器可用。
+    ⛔ 那就**不要發布解碼身分**(回空字串),讓它退到檔案雜湊那層,
+       絕不可以給一個會撞號的身分。"""
+    import shutil as _sh
+    import subprocess as _sp
+    from conftest import load as _load
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = _load("評審團")
+    assert J._canonical_fmt("s64") == "", "s64 不可以有 canonical(會撞號)"
+    src = tmp_path / "s64.nut"
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "aevalsrc=0.25*sin(1000*t):s=48000:d=0.2",
+             "-c:a", "pcm_s64le", "-ac", "1", str(src)], check=True, timeout=300)
+    shape = J._audio_shape(_sh.which("ffprobe"), src)
+    assert shape.get("sample_fmt") == "s64", f"fixture 要真的是 s64:{shape}"
+    assert J._pcm_sha256(src) == "", "🔴 對 s64 發布了身分 —— 那個身分會撞號"
+
+
+def test_同一段聲音換容器身分不可以變(tmp_path):
+    """🔴 Codex R21-P2-1:ffprobe 的 channel_layout 字面值是**容器/探測器**的描述 ——
+    同一段 PCM 裝 WAV 被寫成 unknown、裝 MOV/CAF 寫成 mono,身分就變了。
+    那正是「換容器也認得出」這個宣稱要擋的情況。"""
+    import shutil as _sh
+    import subprocess as _sp
+    from conftest import load as _load
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = _load("評審團")
+    wav = tmp_path / "a.wav"
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "aevalsrc=0.25*sin(1000*t):s=48000:d=0.2",
+             "-c:a", "pcm_f64le", "-ac", "1", str(wav)], check=True, timeout=300)
+    outs = []
+    for ext in ("mov", "caf"):
+        o = tmp_path / f"a.{ext}"
+        _sp.run(["ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "copy", str(o)],
+                check=True, timeout=300)
+        outs.append(o)
+    base = J._pcm_sha256(wav)
+    assert base
+    for o in outs:
+        assert J._pcm_sha256(o) == base, f"🔴 換成 {o.suffix} 之後身分就變了"

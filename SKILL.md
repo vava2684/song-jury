@@ -50,7 +50,8 @@ $juryRc = $LASTEXITCODE   # ⛔ 立刻保存 —— 退出碼是完整性契約,
 #      與聲道結構,另附 source_audio_pcm_contract 版本),比較器以
 #      code=duplicate_source 拒絕;source_identity.level 標證據強度
 #      (decoded-audio > exact-file > mixed > weak)。
-#      ⚠️ 擋不到 lossy 重壓,也不把「重新取樣/改聲道」的版本當同源。
+#      ⚠️ 擋不到 lossy 重壓,也不把「重新取樣/改聲道/改樣本格式」的版本當同源;
+#      ⚠️ s64 來源與不認得的樣本格式**不發布**解碼身分(寧可沒有,也不要撞號)。
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" pk    --lang zh 甲_評審團.json 乙_評審團.json
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" takes --group A t1_評審團.json t2_評審團.json
 

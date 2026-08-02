@@ -33,6 +33,8 @@
           「設定值有問題」,把工具自己的 bug 導向「請改環境變數」)。
 
 ⭐ --status-json <路徑>:把結論寫成 UTF-8 JSON({ok,kind,rc,why,recovered,...})。
+   ⛔ 那份 JSON 值不值得採信,由 **狀態驗證.py** 判(嚴格 schema + kind↔rc 對應
+      + recovered 成套)—— 驗證器不可以是被驗證的那支程式自己。
    ⛔ 安裝器一律讀這個檔判斷,**不要 grep 人類訊息**(Codex R19-3:PS 5.1 在
       cp950 下會把子程序的 UTF-8 解壞,韓文/emoji 直接變 ?;stderr 還會被
       包成 ErrorRecord)。人看的文字照樣即時印在終端,兩者互不干擾。
@@ -51,16 +53,32 @@ sys.path.insert(0, str(BASE))
 
 # ⛔ 模組清單與「用哪支 python」都跟評審團.py 拿,不可以在這裡另抄一份 ——
 #    抄了就會有「安裝器說可以、實際跑分說不行」的兩套真理(Codex R13 的老 bug)。
-from 設定讀取 import ConfigError, positive_finite   # noqa: E402
-
-# ⛔ 評審團.py 很重(它自己也會做環境解析)—— import 階段爆掉的話,舊版是
-#    裸 traceback rc=1,連 bootstrap 都來不及接(Codex R20-P2-2 實測)。
-#    先接住,等 main() 在保護傘裡才丟出來 → 收斂成 rc=4 並寫得出狀態檔。
+# ⛔ **所有專案內的 import 都要接住**(Codex R20-P2-2 / R21-P2-3):
+#    import 階段爆掉時舊版是裸 traceback rc=1,連 bootstrap 都來不及接,
+#    而 1 在安裝器眼裡是「缺套件」。先接住,等 main() 在保護傘裡才丟出來
+#    → 收斂成 rc=4 並寫得出狀態檔。
+#    ⚠️ R21 抓到:上一版只包了 評審團,設定讀取 仍在傘外 —— 它爆掉照樣 rc=1。
 try:
-    from 評審團 import DEMUCS_LINE_MODS, DEMUCS_PY   # noqa: E402
+    from 設定讀取 import ConfigError, positive_finite   # noqa: E402
+    from 狀態驗證 import (CONFIG, IMPORT, INTERNAL, LAUNCH,   # noqa: E402
+                         MISSING, OK, TIMEOUT)
+    from 評審團 import DEMUCS_LINE_MODS, DEMUCS_PY      # noqa: E402
     _IMPORT_ERROR = None
 except Exception as _imp_err:      # noqa: BLE001
+    # ⚠️ 佔位到**模組還載得起來**為止:少補一個名字,下面的模組層程式就會
+    #    NameError → 又變成 rc=1 的裸 traceback(新測試逐一驗每個相依時抓到)。
     DEMUCS_LINE_MODS, DEMUCS_PY, _IMPORT_ERROR = (), "", _imp_err
+    OK, MISSING, TIMEOUT = "ok", "missing_module", "timeout"
+    LAUNCH, IMPORT = "launch_error", "import_error"
+    CONFIG, INTERNAL = "config_error", "internal_error"
+
+    class ConfigError(ValueError):   # noqa: F811 —— 佔位,讓模組本身還載得起來
+        pass
+
+    def positive_finite(*a, **k):    # noqa: F811 —— 同上,不會被用到(main 會先丟)
+        # ⚠️ 不可以丟 _imp_err:except 綁的名字在區塊結束後會被刪掉 → NameError,
+        #    使用者看到的原因會變成一個跟真相無關的符號錯誤(自己踩到)
+        raise _IMPORT_ERROR
 
 RETRY_PAUSE = 5.0
 BUDGET_ENV = "SONG_JURY_DEMUCS_PROBE_TIMEOUT"
@@ -71,14 +89,8 @@ BUDGET_ENV = "SONG_JURY_DEMUCS_PROBE_TIMEOUT"
 #    被安裝器讀成「缺套件」(Codex R18-3)。改成用時才讀、壞掉有自己的碼。
 DEFAULT_BUDGET = 900.0
 
-# 錯誤種類 —— ⛔ 分類要由錯誤本身決定,不可以用「換個 import 再試」反推
-OK = "ok"
-CONFIG = "config_error"     # 設定值壞掉(不是機器壞掉)
-INTERNAL = "internal_error"  # 這支自己出事(也不可以被說成缺套件)
-MISSING = "missing_module"      # 指名了哪個模組沒裝 → 補裝
-TIMEOUT = "timeout"             # 卡住(下載中?死鎖?)
-LAUNCH = "launch_error"         # 連 python 都起不來(權限/檔案被鎖)
-IMPORT = "import_error"         # import 得動但炸了(DLL/ABI/損壞快取)
+# 錯誤種類的定義住在 狀態驗證.py(安裝器驗狀態檔時要用同一份)——
+# ⛔ 這裡只 import,不可以再抄一份:兩份枚舉遲早會漂移。
 
 # 只有這兩種值得**再確認一次**:剛裝完幾 GB 剛寫下去、防毒正在掃的時候會出現。
 # ⛔ MISSING 是確定性的(重試一百次還是缺);TIMEOUT 已經把預算吃掉了。

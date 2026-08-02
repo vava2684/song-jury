@@ -455,21 +455,38 @@ def _file_sha256(p: Path, chunk=1 << 20) -> str:
 # 解碼身分的**演算法版本**:標準面換了就是換了一把尺,新舊不可互比。
 # ⛔ 沒有版本欄位的話,日後改標準面時,新舊報告會被當成同一種 identity 硬比
 #    (Codex R19-1)。
-PCM_IDENTITY_CONTRACT = "pcm-v3/native-rate/native-layout/native-sample-fmt"
+PCM_IDENTITY_CONTRACT = "pcm-v4/native-rate/channels/native-sample-fmt"
 
-# 原始樣本格式 → 解碼時要用哪個**可逆**的容器格式
-# ⛔ 不可以一律 s32le(Codex R20-P1-1 實測兩種真實碰撞):
-#    · 低於 s32 LSB 的浮點訊號(1e-12)會被量化成 0 → 與靜音撞號;
-#    · 超出滿刻度的浮點(1.1 vs 1.2)會被 clip 成同一個值 → 撞號。
-#    浮點來源要留在浮點面上(f32 → f64 是精確擴展),整數來源才用 s32le 無損上轉。
-_FLOAT_FMTS = ("flt", "fltp", "dbl", "dblp")
+# 原始樣本格式 → 解碼時要用哪個**可逆**的容器格式(⛔ 白名單,不可以有 fallback)
+# 🔴 Codex R20-P1-1:一律 s32le 會把 1e-12 的浮點量化成 0(與靜音撞號)、
+#    把超出滿刻度的 1.1 與 1.2 clip 成同一個值。
+# 🔴 Codex R21-P1-1:改成「浮點→f64、其餘→s32」之後,**s64/s64p 仍被壓進 s32** ——
+#    實測兩個只差 1 個 s64 LSB 的音訊得到同一個身分。整數也要分寬度。
+# ⛔ 不認得的格式一律回空字串 → **不發布解碼身分**(fail closed)。
+#    有 fallback 的話,ffmpeg 之後多一種格式就會靜靜製造新的碰撞。
+_CANONICAL_BY_FMT = {
+    "u8": "s32le", "u8p": "s32le",
+    "s16": "s32le", "s16p": "s32le",
+    "s32": "s32le", "s32p": "s32le",      # 24-bit 也由 ffmpeg 以 s32 表示
+    # ⛔ s64/s64p:**沒有**無損的可用容器 —— ffmpeg 沒有 s64le raw muxer
+    #    (只有 f64le/f64be),而 f64 的 53 位尾數裝不下 64 位整數。
+    #    壓進 s32le 會撞號(Codex R21-P1-1 實測 1 個 LSB 的差異被抹平),
+    #    所以這裡**故意不給 canonical** → 不發布解碼身分(fail closed)。
+    #    → 這種來源只會退到「檔案雜湊」那一層,比較器也會誠實標成 exact-file。
+    "s64": "", "s64p": "",
+    "flt": "f64le", "fltp": "f64le",
+    "dbl": "f64le", "dblp": "f64le",      # f32→f64 與 f64→f64 都是精確的
+}
 
 
 def _canonical_fmt(sample_fmt: str) -> str:
-    return "f64le" if (sample_fmt or "").lower() in _FLOAT_FMTS else "s32le"
+    """⛔ 白名單:認得才給 canonical 格式,不認得回 "" (代表不發布身分)。"""
+    return _CANONICAL_BY_FMT.get((sample_fmt or "").lower(), "")
 
 
 _SHAPE_KEYS = ("sample_rate", "channels", "channel_layout", "sample_fmt")
+# ⛔ 只有這幾個進身分雜湊;channel_layout 只留在報告裡供稽核(見 _pcm_sha256)
+_IDENTITY_SHAPE_KEYS = ("sample_rate", "channels", "sample_fmt")
 
 
 def _audio_shape(exe_probe, p: Path):
@@ -527,6 +544,9 @@ def _pcm_sha256(p: Path) -> str:
     if not shape:
         return ""
     fmt = _canonical_fmt(shape.get("sample_fmt", ""))
+    if not fmt:
+        # 不認得的樣本格式 → 寧可沒有解碼身分,也不要一個會撞號的身分
+        return ""
     try:
         r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),
                             "-map", "0:a:0", "-f", fmt, "-"],
@@ -535,7 +555,12 @@ def _pcm_sha256(p: Path) -> str:
             return ""
         h = hashlib.sha256()
         # 固定順序組字串:dict 的順序不該影響身分
-        shape_txt = "|".join(f"{k}={shape.get(k, '')}" for k in _SHAPE_KEYS)
+        # ⛔ **不把 channel_layout 的字面值入雜湊**(Codex R21-P2-1 實測):
+        #    同一段 PCM 裝進 WAV 被 ffprobe 寫成 unknown、裝進 MOV/CAF 寫成 mono,
+        #    身分就變了 —— 那正是「換容器也認得出」這個宣稱要擋的情況。
+        #    而且 ffmpeg 的 channel-layout 推斷歷史上改過好幾次,那個字串
+        #    是**探測器/容器**的描述,不是聲音本身。聲道**數量**已經在裡面了。
+        shape_txt = "|".join(f"{k}={shape.get(k, '')}" for k in _IDENTITY_SHAPE_KEYS)
         h.update(f"{PCM_IDENTITY_CONTRACT}|{shape_txt}|canonical={fmt}|".encode("utf-8"))
         h.update(r.stdout)
         return h.hexdigest()
@@ -557,6 +582,14 @@ def _identity_fields(song: Path) -> dict:
     if out.get("source_audio_pcm_sha256"):
         # 解碼身分要帶版本:標準面換了就是換一把尺,新舊不可互比(R19-1)
         out["source_audio_pcm_contract"] = PCM_IDENTITY_CONTRACT
+        # ⭐ 把結構也寫進報告(Codex R21-P2-1):兩份報告的解碼雜湊不同時,
+        #    看得出是「聲音不同」還是「取樣率/聲道/樣本格式不同」。
+        probe = shutil.which("ffprobe")
+        shape = _audio_shape(probe, song) if probe else None
+        if shape:
+            out["source_audio_pcm_shape"] = {
+                k: shape.get(k, "") for k in _SHAPE_KEYS
+            } | {"canonical": _canonical_fmt(shape.get("sample_fmt", ""))}
     return out
 
 

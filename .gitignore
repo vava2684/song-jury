@@ -50,6 +50,8 @@
 !分軌線檢查.py
 # 設定值解析(環境變數當秒數用時的唯一入口;分軌線檢查/完整驗證共用)
 !設定讀取.py
+# 狀態檔驗證(安裝器判斷 --status-json 值不值得採信;只有 shell 會叫)
+!狀態驗證.py
 # -VerifyModels 的整條流程(install.ps1 / install.sh 都直接呼叫它)
 # ⚠️ 這支是被 **shell 腳本**叫的,不是被 .py import —— 漏放行的話,
 #    「掃 .py 的 import」那層檢查完全看不到,別人 clone 下來 -VerifyModels 直接找不到檔

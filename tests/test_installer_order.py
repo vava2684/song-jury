@@ -30,7 +30,7 @@ p.with_name(p.stem + "_評審團.json").write_text(
                 "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64,
                 "source_audio_pcm_sha256": "c" * 64,
                 "source_audio_pcm_contract":
-                    "pcm-v3/native-rate/native-layout/native-sample-fmt"},
+                    "pcm-v4/native-rate/channels/native-sample-fmt"},
                ensure_ascii=False),
     encoding="utf-8")
 (p.parent / (p.stem + "_評分.json")).write_text("mid", encoding="utf-8")
@@ -180,7 +180,7 @@ def _git_bash():
 
 def _stub_repo(tmp_path, code):
     """一個只有安裝器 + stub helper 的最小工作目錄,外加一個**真的** venv。"""
-    for name in ("install.ps1", "install.sh"):
+    for name in ("install.ps1", "install.sh", "狀態驗證.py"):
         shutil.copy(REPO / name, tmp_path / name)
     (tmp_path / "完整驗證.py").write_text(
         f"import sys\nprint('STUB VERIFY')\nsys.exit({code})\n", encoding="utf-8")
@@ -530,7 +530,7 @@ def test_ps1不可以採信與實際結果矛盾的狀態檔(tmp_path, exe):
     r = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=600, cwd=str(d))
-    assert "不一致" in r.stdout, f"🔴 沒有察覺狀態檔與實際結果矛盾:\n{r.stdout[-900:]}"
+    assert "不可採信" in r.stdout, f"🔴 沒有察覺狀態檔與實際結果矛盾:\n{r.stdout[-900:]}"
     assert "設定值有問題" not in r.stdout, "🔴 採信了矛盾狀態檔的 kind"
     assert "自己出錯了" in r.stdout, "應該照實際 rc=4 給 internal 的建議"
 
@@ -544,7 +544,7 @@ def test_sh不可以採信與實際結果矛盾的狀態檔(tmp_path):
     r = subprocess.run([bash, str(d / "install.sh"), "--check-only", "--no-auto-tools"],
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=600, cwd=str(d))
-    assert "不一致" in r.stdout, f"🔴 沒有察覺矛盾:\n{r.stdout[-900:]}"
+    assert "不可採信" in r.stdout, f"🔴 沒有察覺矛盾:\n{r.stdout[-900:]}"
     assert "自己出錯了" in r.stdout
 
 
@@ -580,7 +580,7 @@ def test_helper的未預期例外一律收斂成4(tmp_path):
 
 def test_import階段就爆掉也要收斂成4並寫得出狀態檔(tmp_path):
     """⛔ 連 main 都進不去的情況:舊版是裸 traceback rc=1(=「缺套件」)。"""
-    for mod in ("分軌線檢查.py", "設定讀取.py"):
+    for mod in ("分軌線檢查.py", "設定讀取.py", "狀態驗證.py"):
         shutil.copy(REPO / mod, tmp_path / mod)
     (tmp_path / "評審團.py").write_text("raise RuntimeError('import 就炸')\n",
                                         encoding="utf-8")
@@ -830,3 +830,79 @@ def test_成功時的成功標記只出現一次(tmp_path, monkeypatch):
     out = buf.getvalue()
     assert rc == 0 and out.count("VERIFY_OK") == 1, f"rc={rc}\n{out}"
     assert "零殘留" in out, "成功標記要包含『零殘留』這個保證"
+
+
+def test_單檔驗證不可以把舊報告說成本輪新產物(tmp_path):
+    """🔴 Codex R21-P2-4:pcm-v2 的舊報告、甚至完全沒有身分的舊格式,
+    單檔 CLI 一律印「VERIFY_OK 九柱完整、格式合格、本輪新產物」——
+    相容可讀 ≠ 本輪新產物的證據。只有三個嚴格條件都要求過才可以那樣講。"""
+    import json as _json
+    P8 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")
+    pt = {"完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
+          "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in P8},
+          "曲側含柱": list(P8)}
+    old = tmp_path / "舊_評審團.json"
+    old.write_text(_json.dumps({"scoring_contract": "2026-07-25-v1", "pillar_totals": pt,
+                                "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64},
+                               ensure_ascii=False), encoding="utf-8")
+    r = subprocess.run([sys.executable, str(REPO / "驗證報告.py"), str(old)],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=300,
+                       env={**os.environ, "PYTHONUTF8": "1"})
+    assert r.returncode == 0, r.stdout
+    # ⚠️ 只看**標籤**,不要 grep 「本輪新產物」四個字 —— 提示句裡也有它(自己踩到)
+    assert not r.stdout.startswith("VERIFY_OK 九柱"),         f"🔴 舊報告被說成本輪新產物:{r.stdout!r}"
+    assert "VERIFY_OK_LEGACY" in r.stdout and "身分證據" in r.stdout
+
+
+def test_每一個本地模組的import爆掉都要收斂成4(tmp_path):
+    """🔴 Codex R21-P2-3:上一版只把 評審團 的 import 包進保護傘,
+    設定讀取 仍在傘外 —— 它爆掉照樣裸 traceback rc=1(=安裝器眼中的「缺套件」)。
+    ⛔ 這條逐一驗每個本地相依,不是只驗其中一個。"""
+    import json as _json
+    for victim in ("評審團.py", "設定讀取.py", "狀態驗證.py"):
+        d = tmp_path / victim.replace(".py", "")
+        d.mkdir()
+        for mod in ("分軌線檢查.py", "評審團.py", "設定讀取.py", "狀態驗證.py"):
+            shutil.copy(REPO / mod, d / mod)
+        (d / victim).write_text(f"raise RuntimeError('{victim} import 就炸')\n",
+                                encoding="utf-8")
+        st = d / "st.json"
+        # ⚠️ **不帶 python 參數**跑 —— 那才是安裝器真正的呼叫形式。
+        #    帶參數時,壞掉的 import 會晚一點才在別處炸出來(照樣 4),
+        #    於是「main 開頭那道 raise」拿掉也測不出來(變異驗證抓到)。
+        r = subprocess.run([sys.executable, "分軌線檢查.py", "--status-json", str(st)],
+                           cwd=str(d), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=300,
+                           env={**os.environ, "PYTHONUTF8": "1"})
+        assert r.returncode == 4, f"🔴 {victim} 爆掉時回 {r.returncode}(要 4):{r.stderr[-300:]}"
+        assert st.exists(), f"🔴 {victim} 爆掉時連狀態檔都沒寫"
+        st_data = _json.loads(st.read_text(encoding="utf-8"))
+        assert st_data["kind"] == "internal_error"
+        # ⛔ 回報的原因要是**真正的 import 錯誤**,不是下游的符號錯誤 ——
+        #    使用者拿到 NameError 只會更難查(變異驗證抓到:少了 raise 也「剛好」回 4)
+        assert "import 就炸" in st_data.get("why", ""),             f"🔴 {victim} 的真正原因沒被回報:{st_data.get('why')!r}"
+
+
+def test_bootstrap是main之外的最後一道保護傘(tmp_path):
+    """⛔ main 自己也有 except,所以「import 爆掉」那條其實被內圈接走了。
+    這條直接讓 **main 本身**爆,驗最外圈那道:任何漏網例外仍要 rc=4 + 狀態檔。
+    (兩層分開測才不會互相掩護 —— 變異驗證抓到過。)"""
+    import json as _json
+    st = tmp_path / "st.json"
+    probe = tmp_path / "boom.py"
+    probe.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, r'{REPO}')\n"
+        "import 分軌線檢查 as D\n"
+        "def boom(*a, **k):\n"
+        "    raise RuntimeError('main 自己爆了')\n"
+        "D.main = boom\n"
+        f"sys.exit(D.bootstrap(['--status-json', r'{st}', sys.executable]))\n",
+        encoding="utf-8")
+    r = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=300,
+                       env={**os.environ, "PYTHONUTF8": "1"})
+    assert r.returncode == 4, f"最外圈要收斂成 4(拿到 {r.returncode}):{r.stderr[-300:]}"
+    assert st.exists(), "🔴 最外圈也要盡量寫得出狀態檔"
+    assert _json.loads(st.read_text(encoding="utf-8"))["kind"] == "internal_error"

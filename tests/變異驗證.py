@@ -1046,11 +1046,11 @@ MUTATIONS = [
     #   (結構前綴 or 原生解碼各自都足以分辨)—— 變異驗證抓到我這個裝飾品。
     # ⚠ 要**整段退回**才是 R18 當時的行為:只拿掉結構前綴、或只改 ffmpeg 參數,
     #   另一半都還能讓兩個版本的雜湊分開 —— 變異驗證抓到我這個裝飾品。
-    ("PCM 身分退回「一律 s32le」(浮點來源的低振幅/超刻度會撞號)",
+    ("PCM canonical 退回「浮點以外一律 s32le」(s64 與低振幅浮點都會撞號)",
      "評審團.py",
-     '    return "f64le" if (sample_fmt or "").lower() in _FLOAT_FMTS else "s32le"',
-     '    return "s32le"',
-     "tests/test_pillars.py::test_浮點來源不可以在正規化時撞成同一個身分"),
+     '    return _CANONICAL_BY_FMT.get((sample_fmt or "").lower(), "")',
+     '    return _CANONICAL_BY_FMT.get((sample_fmt or "").lower(), "s32le")',
+     "tests/test_pillars.py::test_canonical格式是白名單而且分得出寬度"),
 
     ("算不到身分時照樣寫空字串(整份報告被 schema 判畸形)",
      "評審團.py",
@@ -1094,8 +1094,8 @@ MUTATIONS = [
 
     ("安裝器不看狀態檔的種類(退回只憑退出碼猜,建議就會給錯)",
      "install.ps1",
-     '    $lineKind = if ($lineStatus) { "$($lineStatus.kind)" } else { "" }',
-     '    $lineKind = ""   # 變異:不看狀態檔,退回猜',
+     "            $lineKind = $parts[0]",
+     '            $lineKind = ""   # 變異:不看狀態檔,退回猜',
      "tests/test_installer_order.py::test_ps1要照狀態檔的種類給建議",
      "win32"),
 
@@ -1131,18 +1131,15 @@ MUTATIONS = [
 
     ("安裝器採信與實際 rc 矛盾的狀態檔(殘留或被改過的檔會給錯建議)",
      "install.ps1",
-     '    if ($lineStatus -and (\n'
-     '            ("$($lineStatus.rc)" -ne "$lineRc") -or\n'
-     "            ([bool]$lineStatus.ok -ne ($lineRc -eq 0)) -or\n"
-     '            [string]::IsNullOrWhiteSpace("$($lineStatus.kind)"))) {',
-     "    if ($false) {",
+     '        if ($parts[0] -eq "MISMATCH") {',
+     "        if ($false) {",
      "tests/test_installer_order.py::test_ps1不可以採信與實際結果矛盾的狀態檔",
      "win32"),
 
     ("install.sh 採信矛盾狀態檔(同上,POSIX 版)",
      "install.sh",
-     '    if [ "$_line_json" = "MISMATCH" ]; then',
-     '    if [ "$_line_json" = "永遠不會等於這個" ]; then',
+     "      MISMATCH*)",
+     "      永遠不會符合的樣式*)",
      "tests/test_installer_order.py::test_sh不可以採信與實際結果矛盾的狀態檔"),
 
     ("helper 的未預期例外又落回 rc=1(被安裝器讀成缺套件)",
@@ -1167,7 +1164,7 @@ MUTATIONS = [
      "        # 在保護傘裡丟出來 → bootstrap 收斂成 internal_error / rc 4\n"
      "        raise _IMPORT_ERROR",
      "    pass   # 變異:import 失敗不處理",
-     "tests/test_installer_order.py::test_import階段就爆掉也要收斂成4並寫得出狀態檔"),
+     "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
     ("完整驗證的 CLI --timeout 不驗(nan 一路傳到 subprocess)",
      "完整驗證.py",
@@ -1189,6 +1186,52 @@ MUTATIONS = [
      '        p.write_text(json.dumps(fields, ensure_ascii=False), encoding="utf-8")',
      "tests/test_installer_order.py::test_狀態檔要原子寫入且用完就清"),
 
+    # ── Codex 第二十一輪:s64 碰撞、layout 漂移、狀態 schema、import 傘、CLI 標籤 ──
+    ("s64 來源給了會撞號的 canonical(1 個 LSB 的差異被抹平)",
+     "評審團.py",
+     '    "s64": "", "s64p": "",',
+     '    "s64": "s32le", "s64p": "s32le",',
+     "tests/test_pillars.py::test_s64來源寧可不發布身分也不要撞號"),
+
+    ("解碼身分又把 channel_layout 字面值吃進去(換容器就換身分)",
+     "評審團.py",
+     '        shape_txt = "|".join(f"{k}={shape.get(k, \'\')}" for k in _IDENTITY_SHAPE_KEYS)',
+     '        shape_txt = "|".join(f"{k}={shape.get(k, \'\')}" for k in _SHAPE_KEYS)',
+     "tests/test_pillars.py::test_同一段聲音換容器身分不可以變"),
+
+    ("狀態檔只驗 rc/ok 不驗 kind↔rc(rc=4 卻說是設定問題)",
+     "狀態驗證.py",
+     '    if not isinstance(kind, str) or kind not in KIND_BY_RC.get(actual_rc, set()):\n'
+     '        return f"kind={kind!r:.40} 不屬於退出碼 {actual_rc} 的合法種類"',
+     "    pass   # 變異:不驗 kind 與 rc 的對應",
+     "tests/test_狀態驗證.py::test_矛盾或型別不對一律不採信"),
+
+    ("recovered 不驗型別與成套(字串 'false' 也會觸發假警告)",
+     "狀態驗證.py",
+     '    rec = data.get("recovered", False)\n'
+     '    if not isinstance(rec, bool):\n'
+     '        return f"recovered 不是布林:{rec!r:.40}"',
+     '    rec = data.get("recovered", False)',
+     "tests/test_狀態驗證.py::test_矛盾或型別不對一律不採信"),
+
+    ("驗證器又搬回被驗的那支程式自己",
+     "install.ps1",
+     "        $chk = (& .venv\\Scripts\\python.exe 狀態驗證.py $lineStatusRaw $lineRc 2>$null | Select-Object -First 1)",
+     "        $chk = (& .venv\\Scripts\\python.exe 分軌線檢查.py --check-status $lineStatusRaw $lineRc 2>$null | Select-Object -First 1)",
+     "tests/test_狀態驗證.py::test_驗證器不可以是被驗的那支程式自己"),
+
+    ("設定讀取 的 import 又被放到保護傘外(爆掉變裸 traceback rc=1)",
+     "分軌線檢查.py",
+     "try:\n    from 設定讀取 import ConfigError, positive_finite   # noqa: E402",
+     "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
+     "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
+
+    ("單檔驗證把相容模式的舊報告說成「本輪新產物」",
+     "驗證報告.py",
+     '    if newer is not None and strict_contract and strict_identity:',
+     "    if True:",
+     "tests/test_installer_order.py::test_單檔驗證不可以把舊報告說成本輪新產物"),
+
 ]
 
 # 打包類的變異不能靠改字串 —— 檔案一旦已被 git 追蹤,改 .gitignore 是不會讓它消失的
@@ -1203,6 +1246,9 @@ GIT_MUTATIONS = [
      "tests/test_packaging.py::test_每個被subprocess呼叫的腳本都在repo裡"),
     ("白名單漏放行 分軌線檢查.py(安裝器自檢第一步就找不到檔)",
      "分軌線檢查.py",
+     "tests/test_packaging.py::test_安裝腳本呼叫的py也要在repo裡"),
+    ("白名單漏放行 狀態驗證.py(安裝器驗狀態檔時找不到檔)",
+     "狀態驗證.py",
      "tests/test_packaging.py::test_安裝腳本呼叫的py也要在repo裡"),
     ("白名單漏放行 完整驗證.py(只有 shell 腳本會叫它 → 掃 import 的檢查看不到)",
      "完整驗證.py",
@@ -1382,7 +1428,9 @@ def main(argv=None):
         try:
             # ⛔ 在 worktree 裡 git 還失敗 = 硬錯誤(index.lock / 唯讀 / 損壞),
             #    不可以偽裝成 ZIP skip(Codex R17-4)
-            git_must(["rm", "--cached", "-q", "--", fname])
+            # ⚠️ -f:開發中工作區常有未 stage 的修改,不加會被 git 擋下來
+            #    (我們在 finally 立刻 git add 回去,index 不會留下副作用)
+            git_must(["rm", "--cached", "-q", "-f", "--", fname])
         except GitFailure as e:
             print(f"\n[{j}/{n0 + len(git_items)}] ❌ Git 故障,這條驗不了也不能當沒事:{desc}")
             print(f"        → {e}")

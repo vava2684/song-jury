@@ -85,7 +85,7 @@ IDENTITY_FIELDS = {
 # 認得的解碼身分版本(⛔ 換標準面 = 換一把尺,新舊不可互比 —— Codex R19-1)
 # ⛔ v2(一律 s32le)已被證明會把不同的浮點來源撞成同一個身分(Codex R20-P1-1),
 #    所以**不列在認得的版本裡** —— 舊 v2 報告會誠實退回 exact-file,不再當同源硬證據。
-PCM_CONTRACTS = ("pcm-v3/native-rate/native-layout/native-sample-fmt",)
+PCM_CONTRACTS = ("pcm-v4/native-rate/channels/native-sample-fmt",)
 
 
 def identity_problem(d: dict) -> str:
@@ -249,17 +249,42 @@ def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = F
 
 
 def main(argv) -> int:
+    """⛔ 成功訊息要說**實際上驗了什麼**(Codex R21-P2-4)。
+
+    舊版不管怎麼呼叫都印「本輪新產物」—— 連 pcm-v2 的舊報告、
+    完全沒有身分欄位的舊格式,都被說成本輪新產物。相容可讀 ≠ 新產物證據。"""
     if len(argv) < 2:
-        print("用法:python 驗證報告.py <報告.json> [--newer-than <epoch>]")
+        print("用法:python 驗證報告.py <報告.json> "
+              "[--newer-than <epoch>] [--require-contract] [--require-identity]")
         return 1
     newer = None
     if "--newer-than" in argv:
         newer = float(argv[argv.index("--newer-than") + 1])
-    why = validate(Path(argv[1]), newer, require_contract="--require-contract" in argv)
+    strict_contract = "--require-contract" in argv
+    strict_identity = "--require-identity" in argv
+    path = Path(argv[1])
+    why = validate(path, newer, require_contract=strict_contract,
+                   require_identity=strict_identity)
     if why:
         print(f"VERIFY_BAD {why}")
         return 1
-    print("VERIFY_OK 九柱完整、格式合格、本輪新產物")
+    # 「本輪新產物」只有在**三個條件都要求過**時才能講
+    if newer is not None and strict_contract and strict_identity:
+        print("VERIFY_OK 九柱完整、格式合格、本輪新產物")
+        return 0
+    # 相容模式:講清楚驗了什麼、身分證據到哪一級
+    try:
+        d = json.loads(path.read_bytes().decode("utf-8"))
+    except Exception:       # noqa: BLE001 —— 到這裡一定解析得開,保險而已
+        d = {}
+    lv = ("decoded-audio" if d.get("source_audio_pcm_contract") in PCM_CONTRACTS
+          and d.get("source_audio_pcm_sha256") and d.get("evaluation_id")
+          else "exact-file" if d.get("source_file_sha256") and d.get("evaluation_id")
+          else "weak")
+    checked = ["九柱完整", "格式合格"]
+    checked.append("有計分契約" if strict_contract else "計分契約:相容模式")
+    print(f"VERIFY_OK_LEGACY {'、'.join(checked)};來源身分證據={lv}"
+          f"(要當『本輪新產物』的證據請加 --newer-than/--require-contract/--require-identity)")
     return 0
 
 

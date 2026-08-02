@@ -250,7 +250,7 @@ if ($hasEnv) {
     $statusFile = Join-Path ([System.IO.Path]::GetTempPath()) `
                             ("song-jury-demucs-" + [System.IO.Path]::GetRandomFileName() + ".json")
     $lineRc = 1
-    $lineStatus = $null
+    $lineStatusRaw = $null
     try {
         $env:PYTHONUTF8 = "1"
         # ⛔ **不要**把子程序的輸出接進 PowerShell 管線(Codex R19-3):
@@ -259,29 +259,34 @@ if ($hasEnv) {
         #    讓它直接寫終端最乾淨:即時、原汁原味、沒有編碼中間人。
         & .venv\Scripts\python.exe 分軌線檢查.py --status-json $statusFile
         $lineRc = $LASTEXITCODE
-        if (Test-Path $statusFile) {
-            try { $lineStatus = (Get-Content $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json) }
-            catch { Warn "分軌線體檢的狀態檔讀不了($($_.Exception.Message))—— 只依退出碼判斷" }
-        }
+        if (Test-Path $statusFile) { $lineStatusRaw = $statusFile }
     } finally {
         if ($null -eq $oldUtf8Line) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
         else { $env:PYTHONUTF8 = $oldUtf8Line }
-        Remove-Item $statusFile -Force -EA SilentlyContinue    # ⛔ 中斷也要清
     }
-    # ⭐ 狀態檔只是**診斷用**的補充,而且必須與實際退出碼一致才採信
-    #    (Codex R20-P2-1:殘留或被改過的檔案會把 rc=4 說成設定問題)。
+    # ⭐ 狀態檔只是**診斷用**的補充,而且要通過**嚴格 schema**才採信:
+    #    rc/ok 相符、kind 屬於該 rc 的合法集合、recovered 是布林且成套
+    #    (Codex R21-P2-2:只驗 rc/ok 時,「rc=4 但 kind=config_error」照樣被採信,
+    #     使用者被導去改一個沒問題的環境變數;`recovered:"false"` 也會觸發警告)。
+    #    ⛔ 驗證邏輯只有一份 —— 在 狀態驗證.py 裡,兩支安裝器共用;
+    #       而且**不是**被驗的那支程式自己(helper 出事時它自己也不可信)。
     #    成功與否**永遠只看實際 rc**,狀態檔不能把失敗說成成功。
-    if ($lineStatus -and (
-            ("$($lineStatus.rc)" -ne "$lineRc") -or
-            ([bool]$lineStatus.ok -ne ($lineRc -eq 0)) -or
-            [string]::IsNullOrWhiteSpace("$($lineStatus.kind)"))) {
-        Warn "分軌線體檢的狀態檔與實際結果不一致(檔案 rc=$($lineStatus.rc)/ok=$($lineStatus.ok),實際 rc=$lineRc)—— 已忽略狀態檔"
-        $lineStatus = $null
+    $lineKind = ""
+    $lineRecovered = $false
+    if ($lineStatusRaw) {
+        $chk = (& .venv\Scripts\python.exe 狀態驗證.py $lineStatusRaw $lineRc 2>$null | Select-Object -First 1)
+        $parts = "$chk".Split("`t")
+        if ($parts[0] -eq "MISMATCH") {
+            Warn "分軌線體檢的狀態檔不可採信($($parts[1]))—— 已忽略,只依退出碼判斷"
+        } else {
+            $lineKind = $parts[0]
+            $lineRecovered = ($parts.Count -gt 1 -and $parts[1] -eq "1")
+        }
     }
-    $lineKind = if ($lineStatus) { "$($lineStatus.kind)" } else { "" }
+    Remove-Item $statusFile -Force -EA SilentlyContinue   # ⛔ 驗完就清(中斷也走 finally)
     $hasDemucs = ($lineRc -eq 0)
     if ($hasDemucs) {
-        if ($lineStatus -and $lineStatus.recovered) {
+        if ($lineRecovered) {
             # ⛔ 救回來≠沒事:這條線在這台機器上是不穩的,不可以靜靜給綠燈
             Warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(第一次的錯誤見上面)"
         }
