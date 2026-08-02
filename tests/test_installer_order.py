@@ -1206,8 +1206,17 @@ def test_sh在探針不理會TERM時要升級成KILL(tmp_path):
     #    ⛔ 整支換掉的話,安裝器每一次呼叫 python(import 檢查、狀態驗證、冒煙測試)
     #       都會掉進那個迴圈,整支卡死(自己踩到,第一版 600 秒逾時)。
     wrapper = d / ".venv" / "bin" / "python"
-    real = wrapper.read_text(encoding="utf-8").strip().splitlines()[-1]
-    real = real.replace("exec ", "").replace(' "$@"', "").strip()
+    # ⛔ 不可以把它當文字讀:POSIX 上那是**真的執行檔/symlink**,read_text 直接
+    #    UnicodeDecodeError(CI 三個平台實測)。改成先搬到 python.real 再 exec 它 ——
+    #    不管原本是 Windows 的 shell wrapper 還是 POSIX 的 binary 都成立。
+    real = wrapper.with_name("python.real")
+    if real.exists():
+        real.unlink()
+    wrapper.replace(real)
+    # ⚠️ POSIX 的 .venv/bin/python 常常是**symlink**(指到系統 python)——
+    #    對 symlink chmod 會跟著改到目標(系統的檔案),絕不可以。
+    if not real.is_symlink():
+        real.chmod(0o755)
     wrapper.write_text(
         "#!/usr/bin/env bash\n"
         "case \"$*\" in\n"
@@ -1224,7 +1233,7 @@ def test_sh在探針不理會TERM時要升級成KILL(tmp_path):
         f"'{posix(beat)}'; done\n"
         "    exit 0 ;;\n"
         "esac\n"
-        f"exec {real} \"$@\"\n",
+        f"exec '{posix(real)}' \"$@\"\n",
         encoding="utf-8", newline="\n")
     (d / ".venv" / "bin" / "python").chmod(0o755)
     tmpdir = tmp_path / "tmp"
