@@ -417,7 +417,7 @@ repo 附四首**作者自己的 SUNO 作品**(同意公開散布),中/英/日/�
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests -q          # 411 條(約 6 分;含真子程序樹、兩支安裝器 × 兩個 PowerShell 引擎的退出碼矩陣、
+python -m pytest tests -q          # 412 條(約 6 分;含真子程序樹、兩支安裝器 × 兩個 PowerShell 引擎的退出碼矩陣、
                                    #   「進度要即時看得到」的真時序測試、比較器行為)
 python tests/變異驗證.py            # 證明測試不是裝飾品
 ```

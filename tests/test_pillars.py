@@ -316,5 +316,43 @@ def test_同一段聲音換容器身分不可以變(tmp_path):
         outs.append(o)
     base = J._pcm_sha256(wav)
     assert base
+    # ⚠️ 這條的前提是「這台 ffprobe 對不同容器講出不同的 layout」——
+    #    那是**該版 ffmpeg 的行為**,不是我們的契約(CI 的 ubuntu 版本就一致,
+    #    於是這條在那裡驗不到東西)。前提不成立要明講跳過,不可以靜靜算通過。
+    layouts = {J._audio_shape(_sh.which("ffprobe"), f).get("channel_layout", "")
+               for f in [wav] + outs}
+    if len(layouts) < 2:
+        pytest.skip(f"這台 ffmpeg 對各容器的 layout 講法一致({layouts}),"
+                    "重現不了容器漂移;不靠版本行為的那條是 "
+                    "test_layout字面值不可以進身分雜湊")
     for o in outs:
         assert J._pcm_sha256(o) == base, f"🔴 換成 {o.suffix} 之後身分就變了"
+
+
+def test_layout字面值不可以進身分雜湊(tmp_path, monkeypatch):
+    """🔴 Codex R21-P2-1 的**契約版**:同一段聲音、只有 channel_layout 這個
+    字串不同 → 身分必須一模一樣。
+
+    ⛔ 為什麼不靠「裝 WAV vs 裝 MOV」:那是 ffmpeg 版本行為 —— 某些版本兩邊
+       都寫 mono,於是缺陷塞回去也測不出來(CI ubuntu 實測,變異存活)。
+       這裡直接餵兩個只差 layout 的 shape,任何有 ffmpeg 的機器都成立。"""
+    import shutil as _sh
+    import subprocess as _sp
+    from conftest import load as _load
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = _load("評審團")
+    wav = tmp_path / "a.wav"
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "aevalsrc=0.25*sin(1000*t):s=48000:d=0.2",
+             "-c:a", "pcm_f64le", "-ac", "1", str(wav)], check=True, timeout=300)
+    real = J._audio_shape(_sh.which("ffprobe"), wav)
+    assert real, "fixture 探測不到結構"
+
+    seen = []
+    for layout in ("mono", "unknown"):
+        monkeypatch.setattr(J, "_audio_shape",
+                            lambda _probe, _p, _l=layout: {**real, "channel_layout": _l})
+        seen.append(J._pcm_sha256(wav))
+    assert seen[0] and seen[0] == seen[1], \
+        f"🔴 layout 字面值進了身分雜湊:{seen}"

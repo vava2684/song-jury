@@ -1197,7 +1197,7 @@ MUTATIONS = [
      "評審團.py",
      '        shape_txt = "|".join(f"{k}={shape.get(k, \'\')}" for k in _IDENTITY_SHAPE_KEYS)',
      '        shape_txt = "|".join(f"{k}={shape.get(k, \'\')}" for k in _SHAPE_KEYS)',
-     "tests/test_pillars.py::test_同一段聲音換容器身分不可以變"),
+     "tests/test_pillars.py::test_layout字面值不可以進身分雜湊"),
 
     ("狀態檔只驗 rc/ok 不驗 kind↔rc(rc=4 卻說是設定問題)",
      "狀態驗證.py",
