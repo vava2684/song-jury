@@ -457,7 +457,8 @@ def test_VerifyModels要有外層timeout():
     deadlock 時只能靠人工中斷,而硬 kill 不保證跑得到 finally(清理與環境還原)。"""
     # ⭐ R16 起整段流程收進 完整驗證.py(PowerShell 對真 Ctrl+C 不可靠進 finally)
     helper = (REPO / "完整驗證.py").read_text(encoding="utf-8")
-    assert 'os.environ.get("SONG_JURY_VERIFY_TIMEOUT"' in helper,         "完整驗證.py 沒有真的讀 SONG_JURY_VERIFY_TIMEOUT"
+    assert '"SONG_JURY_VERIFY_TIMEOUT"' in helper and "positive_finite" in helper, \
+        "完整驗證.py 要透過共用解析器讀 SONG_JURY_VERIFY_TIMEOUT(R19-5)"
     assert "run_tree" in helper, "jury 沒有用可殺整棵樹的 runner 包住"
     # ⚠️ 退出碼是**行為**,不是字串:真的跑一次的驗在
     #    tests/test_installer_order.py(逾時→124、中斷→130、矩陣傳到安裝器最外層)。

@@ -254,11 +254,15 @@ def test_成功時要印出用的是哪支python_救回來的要標RECOVERED(mon
 
 
 def test_安裝器要把RECOVERED當警告而不是靜靜放行():
-    """⛔ 救回來≠沒事:這台機器的分軌線是不穩的,正式評分可能掉 26.2% 的權重。"""
+    """⛔ 救回來≠沒事:這台機器的分軌線是不穩的,正式評分可能掉 26.2% 的權重。
+
+    ⚠️ R19-3 起安裝器不再 grep 人類訊息,改讀狀態 JSON 的 recovered 欄位
+    (PS 5.1 在 cp950 下會把中文解壞,靠文字判斷本來就不該是契約)。"""
     from conftest import REPO
     for name in ("install.ps1", "install.sh"):
         src = (REPO / name).read_text(encoding="utf-8")
-        assert "DEMUCS_LINE_RECOVERED" in src, f"🔴 {name} 沒有處理『重試才成功』"
+        assert "recovered" in src.lower(), f"🔴 {name} 沒有處理『重試才成功』"
+        assert "不穩" in src, f"🔴 {name} 沒有把它當警告講出來"
 
 
 def test_分軌探針要排在base環境檢查之後():

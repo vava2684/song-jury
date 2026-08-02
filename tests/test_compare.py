@@ -331,8 +331,12 @@ def test_產出端真的會寫來源身分():
     """比較器的防線建立在產出端寫了身分 —— 那一段不可以只存在於比較器的想像裡。"""
     from conftest import REPO
     src = (REPO / "評審團.py").read_text(encoding="utf-8")
-    assert 'merged["source_file_sha256"] = _file_sha256(song)' in src
-    assert 'merged["evaluation_id"]' in src
+    # ⚠️ 值算不出來時**不寫欄位**(R19-2),所以是迴圈寫入 —— 驗的是
+    #    「兩個雜湊都被算、而且只有非空才寫」這件事,不是某一行長什麼樣。
+    assert '("source_file_sha256", _file_sha256(song))' in src
+    assert '("source_audio_pcm_sha256", _pcm_sha256(song))' in src
+    assert "        if val:" in src, "🔴 又變成無條件寫入了(空字串會被 schema 判畸形)"
+    assert '"evaluation_id": uuid.uuid4().hex' in src
 
 
 # ── 錯誤碼是對外契約(Codex R17-7)──────────────────────────────────
@@ -429,5 +433,57 @@ def test_產出端要寫出解碼後的聲音身分():
     """比較器最強的那一層建立在產出端真的算了 PCM 雜湊。"""
     from conftest import REPO as R
     src = (R / "評審團.py").read_text(encoding="utf-8")
-    assert 'merged["source_audio_pcm_sha256"] = _pcm_sha256(song)' in src
-    assert 'merged["source_file_sha256"] = _file_sha256(song)' in src
+    assert '("source_audio_pcm_sha256", _pcm_sha256(song))' in src
+    assert '("source_file_sha256", _file_sha256(song))' in src
+    # 版本欄位也要跟著寫,否則日後換標準面時新舊雜湊會被硬比(R19-1)
+    assert 'out["source_audio_pcm_contract"] = PCM_IDENTITY_CONTRACT' in src
+
+
+# ── R19:身分欄位缺席/版本/strict ────────────────────────────────────
+def test_算不出PCM時不可以寫空字串(tmp_path, monkeypatch):
+    """🔴 Codex R19-2 實測:沒有 ffmpeg 時產出端寫 "",而身分 schema 規定
+    「欄位存在就要是 64 hex」→ **整份報告變成不合法**,連 README 說的
+    「降級成 exact-file」都走不到。缺席要用「不寫這個欄位」表示。"""
+    J = load("評審團")
+    monkeypatch.setattr(J.shutil, "which", lambda *a, **k: None)   # 假裝沒有 ffmpeg
+    # ⚠️ 要呼叫**產品自己的組裝函式**,不可以在測試裡複製一份邏輯 ——
+    #    那樣改壞產品碼測試照樣綠(變異驗證抓到我這個錯)
+    fields = J._identity_fields(tmp_path / "沒這檔.wav")
+    assert "source_audio_pcm_sha256" not in fields, f"🔴 算不出來卻還是寫了欄位:{fields}"
+    assert "source_file_sha256" not in fields, f"🔴 讀不到檔也寫了欄位:{fields}"
+    assert fields.get("evaluation_id"), "evaluation_id 一定要有"
+    # 而「有欄位但空字串」的舊產物要被當成缺席(相容),不是畸形
+    assert V.identity_problem({"source_audio_pcm_sha256": ""}) == ""
+
+
+def test_安裝證據要求三個身分欄位都在(tmp_path):
+    """⛔ 安裝本來就強制 ffmpeg;產出端若迴歸成不算 PCM,九柱照樣 VERIFY_OK,
+    下游卻只剩最弱的證據 —— 所以 strict 模式三個都要(Codex R19-2)。"""
+    full = {"scoring_contract": "2026-07-25-v1",
+            "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64,
+            "source_audio_pcm_sha256": "c" * 64}
+    base = json.loads(_report(tmp_path, "甲", 70).read_text(encoding="utf-8"))
+    for drop in ("evaluation_id", "source_file_sha256", "source_audio_pcm_sha256"):
+        d = {**base, **full}
+        d.pop(drop)
+        raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
+        why = V.validate_data(raw, "t.json", require_contract=True, require_identity=True)
+        assert why and drop in why, f"🔴 strict 沒要求 {drop}:{why!r}"
+    # 三個都在就要過
+    raw = json.dumps({**base, **full}, ensure_ascii=False).encode("utf-8")
+    assert V.validate_data(raw, "t.json", require_contract=True, require_identity=True) == ""
+
+
+def test_不同PCM版本的雜湊不可以互比(tmp_path):
+    """🔴 Codex R19-1:標準面換了就是換一把尺 —— 沒有版本欄位的話,
+    日後改演算法時新舊報告會被當成同一種 identity 硬比。"""
+    a = _report(tmp_path, "甲", 70, pcm_sha="e" * 64)
+    b = _report(tmp_path, "乙", 80, pcm_sha="e" * 64)   # 同雜湊、不同版本
+    for f, ver in ((a, "pcm-v2/native-rate/native-layout/s32le"), (b, "pcm-v9/未來版")):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        d["source_audio_pcm_contract"] = ver
+        f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    out = C.compare_pk([a, b], "zh")      # ⛔ 不可以被當成同源硬擋
+    assert out["n"] == 2
+    assert out["source_identity"]["level"] == "exact-file", out["source_identity"]
+    assert "版本" in out["source_identity"]["note"]

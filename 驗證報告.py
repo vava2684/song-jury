@@ -82,16 +82,28 @@ IDENTITY_FIELDS = {
     "source_audio_pcm_sha256": (_HEX64, "64 位小寫 hex"),
     "source_audio_sha256": (_HEX64, "64 位小寫 hex(R17 舊名)"),
 }
+# 認得的解碼身分版本(⛔ 換標準面 = 換一把尺,新舊不可互比 —— Codex R19-1)
+PCM_CONTRACTS = ("pcm-v2/native-rate/native-layout/s32le",)
 
 
 def identity_problem(d: dict) -> str:
-    """回一句話說明身分欄位哪裡不合法;完全沒有身分欄位不算錯(舊報告)。"""
+    """回一句話說明身分欄位哪裡不合法;完全沒有身分欄位不算錯(舊報告)。
+
+    ⚠️ 空字串 == 缺席(Codex R19-2):產出端算不到 PCM 雜湊時,舊版寫 ""
+       而 schema 判它畸形 —— 沒有 ffmpeg 的機器產出的報告會整份不合法。
+       現在產出端改成不寫該欄位;過渡期留下的 "" 一律當成「這台算不出來」,
+       降級處理,而不是當成偽造。⛔ 但 strict 模式(安裝證據)照樣要求它存在。"""
     for name, (rx, how) in IDENTITY_FIELDS.items():
         if name not in d:
             continue
         v = d[name]
+        if isinstance(v, str) and v == "":
+            continue                      # 缺席,不是畸形
         if isinstance(v, bool) or not isinstance(v, str) or not rx.match(v):
             return f"{name} 不是合法的身分值(要 {how},拿到 {type(v).__name__} {v!r:.40})"
+    c = d.get("source_audio_pcm_contract")
+    if c is not None and (not isinstance(c, str) or not c.strip()):
+        return f"source_audio_pcm_contract 不是合法的版本字串(拿到 {c!r:.40})"
     return ""
 
 
@@ -125,11 +137,15 @@ def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = F
     if why_id:
         return why_id
     if require_identity:
-        # 本輪新產物(安裝證據)必須帶得出身分,不可以退回舊格式相容
-        need = [k for k in ("evaluation_id", "source_file_sha256") if k not in d]
+        # 本輪新產物(安裝證據)必須帶得出**完整**身分,不可以退回舊格式相容。
+        # ⛔ 一定要含解碼後雜湊(Codex R19-2):安裝本來就強制 ffmpeg,
+        #    產出端若迴歸成不算 PCM,九柱照樣 VERIFY_OK,下游卻只剩最弱的證據。
+        need = [k for k in ("evaluation_id", "source_file_sha256",
+                            "source_audio_pcm_sha256")
+                if not d.get(k)]
         if need:
-            return (f"報告缺少來源身分欄位 {need} —— 這個模式要求新版產出端的證據"
-                    f"(舊格式相容只給既有報告用)")
+            return (f"報告缺少來源身分欄位 {need} —— 這個模式要求新版產出端的完整證據"
+                    f"(舊格式相容只給既有報告用;PCM 雜湊要有 ffmpeg/ffprobe)")
 
     # ⭐ 計分契約:報告自報版本 → 裁判查表拿權重與柱集合。
     # ⛔ 不認得的版本一律拒收:那可能是新契約(裁判要跟上)或竄改,

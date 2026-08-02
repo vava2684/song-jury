@@ -16,6 +16,7 @@ from pathlib import Path
 import gradio as gr
 
 from 子程序 import run_tree
+from 設定讀取 import ConfigError, positive_finite
 import requests
 from urllib.parse import urlparse
 
@@ -50,7 +51,12 @@ def _venv_py(venv):
 # 網頁版子程序的整體上限。⛔ 沒有 timeout 的話:某階段卡住(解碼器、模型下載、
 #    GPU 排隊)會讓那個 worker 與 GPU 被無限占用,而使用者關掉頁面也叫不停它。
 #    預設 2 小時(整首歌走完九柱含首次模型下載的悲觀值),可用環境變數調。
-_JOB_TIMEOUT = int(os.environ.get("SONG_JURY_WEB_TIMEOUT", "7200"))
+# ⛔ 不可以直接 int(env)(Codex R19-5):打錯字會在載入階段變成裸 ValueError,
+#    網頁版連起不起得來都看不出原因。設定值一律走共用解析器。
+try:
+    _JOB_TIMEOUT = int(positive_finite("SONG_JURY_WEB_TIMEOUT", 7200.0, lo=0.0, hi=86400.0))
+except ConfigError as _e:
+    raise SystemExit(f"⛔ 設定值有問題:{_e}")
 
 
 def _run(cmd, timeout=None):

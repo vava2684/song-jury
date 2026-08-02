@@ -330,8 +330,9 @@ MUTATIONS = [
     #    也因此不再需要 win32 標記 —— 三個平台每次都驗得到。
     ("VerifyModels 拿掉外層 timeout(模型 deadlock 就永遠掛著)",
      "完整驗證.py",
-     '                    default=float(os.environ.get("SONG_JURY_VERIFY_TIMEOUT", "7200")))',
-     '                    default=7200.0)   # 變異:逾時寫死、外部關不掉',
+     '        default_timeout = positive_finite("SONG_JURY_VERIFY_TIMEOUT", 7200.0,\n'
+     "                                          lo=0.0, hi=86400.0)",
+     "        default_timeout = 7200.0   # 變異:逾時寫死、外部關不掉",
      "tests/test_installer_order.py::test_逾時要回124且殺乾淨"),
 
     # ── Codex 第十四輪:驗證順序、失敗路徑殺樹、裁判自洽、政策 fail-closed ──
@@ -873,8 +874,8 @@ MUTATIONS = [
 
     ("分軌線壞掉時不分「缺套件」與「其他壞法」(安裝器給不出對的建議)",
      "分軌線檢查.py",
-     "    return 1 if res.kind == MISSING else 2",
-     "    return 1",
+     "    rc = 1 if res.kind == MISSING else 2",
+     "    rc = 1",
      "tests/test_demucs_resolve.py::test_非缺套件的錯不可以被說成缺套件"),
 
     # ── Codex 第十七輪:重試假綠、退出碼分裂、複製灌票、git 假 skip、清理謊報 ──
@@ -920,8 +921,8 @@ MUTATIONS = [
 
     ("產出端不寫來源身分(比較器的防線失去依據)",
      "評審團.py",
-     '    merged["source_file_sha256"] = _file_sha256(song)',
-     '    pass',
+     '    for key, val in (("source_file_sha256", _file_sha256(song)),',
+     '    for key, val in (("x", ""),',
      "tests/test_compare.py::test_產出端真的會寫來源身分"),
 
     ("拒絕理由退回沒有機器碼(測試只能綁中文文案)",
@@ -960,20 +961,18 @@ MUTATIONS = [
     #    整檔雜湊不等於聲音、成功標記太早發布、pause 不受預算限制 ────────────
     ("安裝器把分軌體檢的輸出整段緩衝(執行中看不到進度,像當機)",
      "install.ps1",
-     "        & .venv\\Scripts\\python.exe 分軌線檢查.py 2>&1 | Tee-Object -Variable lines | Out-Host\n"
-     "        $lineRc = $LASTEXITCODE\n"
-     "        $lineOut = ($lines | Out-String).TrimEnd()",
-     "        $lineOut = (& .venv\\Scripts\\python.exe 分軌線檢查.py 2>&1 | Out-String).TrimEnd()\n"
+     "        & .venv\\Scripts\\python.exe 分軌線檢查.py --status-json $statusFile\n"
+     "        $lineRc = $LASTEXITCODE",
+     "        $lineOut = (& .venv\\Scripts\\python.exe 分軌線檢查.py --status-json $statusFile 2>&1 | Out-String)\n"
      "        $lineRc = $LASTEXITCODE",
      "tests/test_installer_order.py::test_ps1要即時顯示分軌體檢的進度",
      "win32"),
 
     ("install.sh 把分軌體檢的輸出整段緩衝(同上,POSIX 版)",
      "install.sh",
-     '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py 2>&1 | tee "$_line_log"\n'
-     "  LINE_RC=${PIPESTATUS[0]}\n"
-     '  LINE_OUT=$(cat "$_line_log" 2>/dev/null)',
-     "  LINE_OUT=$(PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py 2>&1)\n"
+     '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"\n'
+     "  LINE_RC=$?",
+     '  LINE_OUT=$(PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status" 2>&1)\n'
      "  LINE_RC=$?",
      "tests/test_installer_order.py::test_sh要即時顯示分軌體檢的進度"),
 
@@ -1018,13 +1017,14 @@ MUTATIONS = [
 
     ("產出端不算解碼後的聲音雜湊(換個容器就變成另一首歌)",
      "評審團.py",
-     '    merged["source_audio_pcm_sha256"] = _pcm_sha256(song)',
-     '    merged["source_audio_pcm_sha256"] = ""   # 變異:不算解碼後身分',
+     '                     ("source_audio_pcm_sha256", _pcm_sha256(song))):',
+     '                     ("source_audio_pcm_sha256", "")):',
      "tests/test_compare.py::test_產出端要寫出解碼後的聲音身分"),
 
     ("比較器不看解碼後身分(重新封裝的同一段聲音會被當兩個來源)",
      "比較.py",
-     '                       ("source_audio_pcm_sha256", "同一段聲音(解碼後完全相同)被放進來兩次"),\n',
+     '                       ("source_audio_pcm_sha256",\n'
+     '                        "同一段聲音(解碼後在同一個格式面上完全相同)被放進來兩次"),\n',
      "",
      "tests/test_compare.py::test_換個容器的同一段聲音不可以當兩首"),
 
@@ -1040,6 +1040,83 @@ MUTATIONS = [
      "        nap = max(0.0, min(pause, deadline - time.monotonic()))",
      "        nap = pause   # 變異:等待不吃預算",
      "tests/test_demucs_resolve.py::test_等待也要吃預算"),
+
+    # ── Codex 第十九輪:PCM 正規化撞號、空字串身分、rc 混用、設定沒統一 ──────
+    # ⚠ 要**兩個一起退**才是 R18 當時的行為:只改其中一半,另一半仍會讓雜湊分開
+    #   (結構前綴 or 原生解碼各自都足以分辨)—— 變異驗證抓到我這個裝飾品。
+    # ⚠ 要**整段退回**才是 R18 當時的行為:只拿掉結構前綴、或只改 ffmpeg 參數,
+    #   另一半都還能讓兩個版本的雜湊分開 —— 變異驗證抓到我這個裝飾品。
+    ("PCM 身分退回 R18 的強制正規化(mono 與 dual-mono 撞成同一個身分)",
+     "評審團.py",
+     '        r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),\n'
+     '                            "-map", "0:a:0", "-f", "s32le", "-"],\n'
+     "                           capture_output=True, timeout=900)\n"
+     "        if r.returncode != 0 or not r.stdout:\n"
+     '            return ""\n'
+     "        h = hashlib.sha256()\n"
+     '        h.update(f"{PCM_IDENTITY_CONTRACT}|{shape}|".encode("utf-8"))\n'
+     "        h.update(r.stdout)\n"
+     "        return h.hexdigest()",
+     '        r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),\n'
+     '                            "-map", "0:a:0", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"],\n'
+     "                           capture_output=True, timeout=900)\n"
+     "        if r.returncode != 0 or not r.stdout:\n"
+     '            return ""\n'
+     "        return hashlib.sha256(r.stdout).hexdigest()",
+     "tests/test_pillars.py::test_不同取樣率與聲道的版本不可以撞成同一個身分"),
+
+    ("算不到身分時照樣寫空字串(整份報告被 schema 判畸形)",
+     "評審團.py",
+     "        if val:\n            out[key] = val",
+     "        out[key] = val   # 變異:無條件寫入",
+     "tests/test_compare.py::test_算不出PCM時不可以寫空字串"),
+
+    ("空字串身分被當成畸形(沒有 ffmpeg 的舊報告整份不合法)",
+     "驗證報告.py",
+     '        if isinstance(v, str) and v == "":\n            continue                      # 缺席,不是畸形',
+     "        pass   # 變異:空字串當成畸形",
+     "tests/test_compare.py::test_算不出PCM時不可以寫空字串"),
+
+    ("安裝證據不要求解碼後身分(產出端迴歸也照樣 VERIFY_OK)",
+     "驗證報告.py",
+     '        need = [k for k in ("evaluation_id", "source_file_sha256",\n'
+     '                            "source_audio_pcm_sha256")\n'
+     "                if not d.get(k)]",
+     '        need = [k for k in ("evaluation_id",) if not d.get(k)]',
+     "tests/test_compare.py::test_安裝證據要求三個身分欄位都在"),
+
+    ("比較器不看 PCM 版本(不同標準面算出來的雜湊被硬比)",
+     "比較.py",
+     '        "source_audio_pcm_sha256": (\n'
+     '            f\'{d.get("source_audio_pcm_contract") or "pcm-v1"}#\'\n'
+     '            f\'{d["source_audio_pcm_sha256"]}\'\n'
+     '            if d.get("source_audio_pcm_sha256") else ""),',
+     '        "source_audio_pcm_sha256": d.get("source_audio_pcm_sha256") or "",',
+     "tests/test_compare.py::test_不同PCM版本的雜湊不可以互比"),
+
+    ("helper 自己出錯又跟設定錯誤共用碼(使用者被導去改沒問題的環境變數)",
+     "分軌線檢查.py",
+     "        _write_status(status, ok=False, kind=INTERNAL, rc=4,\n"
+     '                      why=f"{type(e).__name__}: {e}", recovered=False)\n'
+     "        return 4",
+     "        _write_status(status, ok=False, kind=CONFIG, rc=3,\n"
+     '                      why=f"{type(e).__name__}: {e}", recovered=False)\n'
+     "        return 3",
+     "tests/test_installer_order.py::test_helper自己出錯要用專屬退出碼"),
+
+    ("完整驗證的 timeout 又直接 float(env)(設定 typo 變裸 traceback)",
+     "完整驗證.py",
+     '        default_timeout = positive_finite("SONG_JURY_VERIFY_TIMEOUT", 7200.0,\n'
+     "                                          lo=0.0, hi=86400.0)",
+     '        default_timeout = float(os.environ.get("SONG_JURY_VERIFY_TIMEOUT", "7200"))',
+     "tests/test_installer_order.py::test_完整驗證的timeout也要走共用設定解析"),
+
+    ("安裝器不看狀態檔的種類(退回只憑退出碼猜,建議就會給錯)",
+     "install.ps1",
+     '    $lineKind = if ($lineStatus) { "$($lineStatus.kind)" } else { "" }',
+     '    $lineKind = ""   # 變異:不看狀態檔,退回猜',
+     "tests/test_installer_order.py::test_ps1要照狀態檔的種類給建議",
+     "win32"),
 
 ]
 

@@ -245,35 +245,49 @@ if ($hasEnv) {
     # ⚠️ PYTHONUTF8 要**存了再設、finally 還原**:這是呼叫者的環境,不是我們的
     #    (同檔金鑰探針那段已經是這個寫法;R17-5 抓到這裡漏了)。
     $oldUtf8Line = $env:PYTHONUTF8
-    $lineOut = ""
+    $statusFile = Join-Path ([System.IO.Path]::GetTempPath()) "song-jury-demucs-$PID.json"
+    Remove-Item $statusFile -EA SilentlyContinue
+    $lineRc = 1
     try {
         $env:PYTHONUTF8 = "1"
-        # ⛔ 不可以用 (… | Out-String):那會把整段輸出**收進變數**,helper 再怎麼
-        #    flush 使用者也是全程看不到,最壞 15 分鐘像當機(Codex R18-1 實測)。
-        #    Tee-Object 一邊即時顯示、一邊留下文字給下面判斷。
-        $lines = @()
-        & .venv\Scripts\python.exe 分軌線檢查.py 2>&1 | Tee-Object -Variable lines | Out-Host
+        # ⛔ **不要**把子程序的輸出接進 PowerShell 管線(Codex R19-3):
+        #    PS 5.1 在 cp950 下會用 big5 去解 UTF-8,捕捉到的字串本身就壞掉
+        #    (韓文/emoji 直接變 ?),2>&1 還會把 stderr 包成 ErrorRecord,
+        #    Out-String 再灌進一整段 PowerShell 診斷。讓它直接寫終端最乾淨:
+        #    即時、原汁原味、沒有編碼中間人。
+        & .venv\Scripts\python.exe 分軌線檢查.py --status-json $statusFile
         $lineRc = $LASTEXITCODE
-        $lineOut = ($lines | Out-String).TrimEnd()
     } finally {
         if ($null -eq $oldUtf8Line) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
         else { $env:PYTHONUTF8 = $oldUtf8Line }
     }
+    # ⭐ 判斷一律讀機器可讀的 UTF-8 JSON,不 grep 人類訊息
+    $lineStatus = $null
+    if (Test-Path $statusFile) {
+        try { $lineStatus = (Get-Content $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json) }
+        catch { Warn "分軌線體檢的狀態檔讀不了($($_.Exception.Message))—— 只能靠退出碼判斷" }
+        Remove-Item $statusFile -EA SilentlyContinue
+    }
+    $lineKind = if ($lineStatus) { "$($lineStatus.kind)" } else { "" }
     $hasDemucs = ($lineRc -eq 0)
     if ($hasDemucs) {
-        if ($lineOut -match "DEMUCS_LINE_RECOVERED") {
+        if ($lineStatus -and $lineStatus.recovered) {
             # ⛔ 救回來≠沒事:這條線在這台機器上是不穩的,不可以靜靜給綠燈
-            Warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(原因見上面)"
+            Warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(第一次的錯誤見上面)"
         }
-    } elseif ($lineRc -eq 3) {
+    } elseif ($lineRc -eq 3 -or $lineKind -eq "config_error") {
         # ⛔ 設定錯誤要跟「機器壞掉」分開(Codex R18-3):一個 typo 不該叫人重裝幾 GB
         Bad "分軌線體檢的設定值有問題" "看上面的『實際』那行改設定(例如 SONG_JURY_DEMUCS_PROBE_TIMEOUT 要填正數秒數);⛔ 這跟缺套件無關"
-    } elseif ($lineRc -eq 1 -and $lineOut -match "missing_module") {
+    } elseif ($lineRc -eq 4 -or $lineKind -eq "internal_error") {
+        # ⛔ 這支自己出事 ≠ 你的設定寫錯(Codex R19-4)
+        Bad "分軌線體檢自己出錯了(不是你的設定)" "這是本工具的問題:請把上面的『實際』那行連同版本一起回報;⛔ 改環境變數或重裝套件都沒用"
+    } elseif ($lineKind -eq "missing_module") {
         Bad "分軌環境缺套件" "上面那行有指名缺哪個模組 → 重跑安裝,或 uv pip install -r requirements-demucs.txt"
     } else {
         Bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "⛔ 不是缺套件 —— 逾時/啟動失敗/DLL 或快取損壞,照上面的『種類』與『實際』查;重裝 requirements 多半沒用"
     }
 }
+
 $hasMl  = Test-Import ".venv-ml"       @("torch", "muq", "audiobox_aesthetics")
 $hasAud = Test-Import ".venv-audition" @("torch", "s3prl", "muq")
 # SongEval 不能只看 eval.py 在不在:它要用 .venv-ml 跑,那個環境沒裝好就等於沒有

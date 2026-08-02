@@ -20,6 +20,9 @@
    0   = 九柱實跑 + 獨立裁判都過
    1   = 沒過(jury 失敗、JSON 驗不過…原因印在 stdout)
    2   = 評測跑完但缺柱(jury 的專用碼)
+   3   = 設定錯誤(SONG_JURY_VERIFY_TIMEOUT 填了非數字/NaN/0/負數)
+         ⚠️ 這是 **helper 的**碼,不是安裝器對外的碼 —— 安裝器會翻成自己的
+            訊息並以 1 收場(對外的 3 永遠只代表「金鑰未能驗證」)。
    124 = 逾時(已中止整棵程序樹)
    130 = 使用者中斷(Ctrl+C / SIGINT)—— 跟「失敗」明確分開
 """
@@ -35,6 +38,7 @@ from pathlib import Path
 BASE = Path(__file__).parent.resolve()
 sys.path.insert(0, str(BASE))
 from 子程序 import run_tree              # noqa: E402
+from 設定讀取 import ConfigError, positive_finite   # noqa: E402
 from 驗證報告 import validate            # noqa: E402
 
 # 這些環境變數會讓驗證跳關或信任舊快取 → 子程序一律拿掉
@@ -154,8 +158,15 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="song-jury 完整驗證(實跑九柱+獨立裁判)")
     ap.add_argument("--audio", type=Path, default=BASE / "demo_mix.wav")
-    ap.add_argument("--timeout", type=float,
-                    default=float(os.environ.get("SONG_JURY_VERIFY_TIMEOUT", "7200")))
+    # ⛔ 不可以直接 float(env)(Codex R19-5):abc/nan/inf 會變成裸 traceback,
+    #    而安裝器把那個 rc 讀成別的意思。設定錯誤要有明確的碼與訊息。
+    try:
+        default_timeout = positive_finite("SONG_JURY_VERIFY_TIMEOUT", 7200.0,
+                                          lo=0.0, hi=86400.0)
+    except ConfigError as e:
+        print(f"VERIFY_BAD 設定值有問題:{e}")
+        return 3
+    ap.add_argument("--timeout", type=float, default=default_timeout)
     ap.add_argument("--python", default=None, help="用哪支直譯器跑評審團(預設:本程序)")
     a = ap.parse_args(argv)
     if not a.audio.exists():

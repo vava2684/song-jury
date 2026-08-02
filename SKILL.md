@@ -46,9 +46,11 @@ $juryRc = $LASTEXITCODE   # ⛔ 立刻保存 —— 退出碼是完整性契約,
 #   抽卡 :同一份詞+prompt 的多個 take;比的是曲側**八柱全部**,
 #          best_take = 曲側合成最高者(不是含糊的「綜合分」)
 #   ⛔ 同一份報告複製改名/換容器都不能當兩票:報告帶 evaluation_id +
-#      source_file_sha256 + source_audio_pcm_sha256(解碼後),比較器以
+#      source_file_sha256 + source_audio_pcm_sha256(解碼後,保留原始取樣率
+#      與聲道結構,另附 source_audio_pcm_contract 版本),比較器以
 #      code=duplicate_source 拒絕;source_identity.level 標證據強度
 #      (decoded-audio > exact-file > mixed > weak)。
+#      ⚠️ 擋不到 lossy 重壓,也不把「重新取樣/改聲道」的版本當同源。
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" pk    --lang zh 甲_評審團.json 乙_評審團.json
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" takes --group A t1_評審團.json t2_評審團.json
 

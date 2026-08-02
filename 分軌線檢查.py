@@ -27,9 +27,17 @@
    3 = **設定錯誤**(SONG_JURY_DEMUCS_PROBE_TIMEOUT 填了非數字/NaN/0/負數)
        🔴 Codex R18-3:舊版這種 typo 會變成未捕捉例外(rc=1),而安裝器把 1
           讀成「缺套件」→ 叫人去重裝 requirements。設定錯誤要有自己的碼。
-   ⛔ 任何預期外的例外也一律收斂成 3(帶 kind=internal_error),絕不讓
-      裸 traceback 的 rc=1 被誤讀成缺套件。
+   4 = **這支自己出事**(internal_error)
+       ⛔ 任何預期外的例外收斂成 4,絕不讓裸 traceback 的 rc=1 被誤讀成缺套件 ——
+          也不可以跟設定錯誤共用 3(Codex R19-4:兩支安裝器看到 3 一律說
+          「設定值有問題」,把工具自己的 bug 導向「請改環境變數」)。
+
+⭐ --status-json <路徑>:把結論寫成 UTF-8 JSON({ok,kind,rc,why,recovered,...})。
+   ⛔ 安裝器一律讀這個檔判斷,**不要 grep 人類訊息**(Codex R19-3:PS 5.1 在
+      cp950 下會把子程序的 UTF-8 解壞,韓文/emoji 直接變 ?;stderr 還會被
+      包成 ErrorRecord)。人看的文字照樣即時印在終端,兩者互不干擾。
 """
+import json
 import math
 import re
 import subprocess
@@ -155,11 +163,34 @@ def probe(py, mods=DEMUCS_LINE_MODS, attempts=2, budget=None,
     return res
 
 
+def _write_status(path, **fields):
+    """機器可讀的結論(UTF-8 JSON)—— ⛔ 安裝器判斷一律看這個,不 grep 中文。
+
+    🔴 Codex R19-3:PowerShell 5.1 在 cp950 下會把子程序的 UTF-8 解成 big5,
+       捕捉到的字串本身就壞掉(韓文/emoji 直接變 ?);再加上 2>&1 會把 stderr
+       變成 ErrorRecord,Out-String 又會灌進一整段 PowerShell 診斷文字。
+       靠「解析人類訊息找 RECOVERED / missing_module」本來就不該是契約。"""
+    if not path:
+        return
+    try:
+        Path(path).write_text(json.dumps(fields, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        print(f"⚠ 狀態檔寫不出來({type(e).__name__});安裝器只能靠退出碼判斷", flush=True)
+
+
 def main(argv=None) -> int:
-    py = (argv or sys.argv[1:] or [DEMUCS_PY])[0]
+    args = list(argv) if argv is not None else sys.argv[1:]
+    status = None
+    if "--status-json" in args:
+        i = args.index("--status-json")
+        status = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    py = (args or [DEMUCS_PY])[0]
     if not py or not Path(py).exists():
         print(f"DEMUCS_LINE_BAD 找不到可用的 python:{py!r}\n"
               f"           種類:{LAUNCH}")
+        _write_status(status, ok=False, kind=LAUNCH, rc=2,
+                      why=f"找不到可用的 python:{py!r}", recovered=False)
         return 2
     try:
         res = probe(py)
@@ -168,18 +199,26 @@ def main(argv=None) -> int:
         print(f"DEMUCS_LINE_BAD 設定值有問題\n"
               f"           種類:{CONFIG}\n"
               f"           實際:{e}")
+        _write_status(status, ok=False, kind=CONFIG, rc=3, why=str(e), recovered=False)
         return 3
     except Exception as e:      # noqa: BLE001 —— 這支自己出事也不能被說成缺套件
         print(f"DEMUCS_LINE_BAD 分軌線體檢自己出錯了\n"
               f"           種類:{INTERNAL}\n"
               f"           實際:{type(e).__name__}: {e}")
-        return 3
+        # ⛔ 這支自己爆掉 ≠ 你的設定寫錯(Codex R19-4):共用 3 的話,安裝器會
+        #    把人導去改一個根本沒問題的環境變數。給它自己的碼。
+        _write_status(status, ok=False, kind=INTERNAL, rc=4,
+                      why=f"{type(e).__name__}: {e}", recovered=False)
+        return 4
     if res.ok:
         print(f"DEMUCS_LINE_OK {py}")
         if res.recovered:
             # ⛔ 救回來≠沒事:這台機器的這條線是不穩的,安裝器要把它當警告印出來
             print(f"DEMUCS_LINE_RECOVERED 第 {res.tries} 次才成功;"
                   f"第一次的錯誤:{res.first_error}")
+        _write_status(status, ok=True, kind=OK, rc=0, why="",
+                      recovered=bool(res.recovered), first_error=res.first_error,
+                      tries=res.tries, python=str(py))
         return 0
     print(f"DEMUCS_LINE_BAD {py}\n"
           f"           需要:{', '.join(DEMUCS_LINE_MODS)}\n"
@@ -187,7 +226,10 @@ def main(argv=None) -> int:
           f"           實際:{res.why}")
     # ⛔ 只有「錯誤訊息指名了缺哪個模組」才叫缺套件 —— 其餘一律 2,
     #    不可以把 DLL/權限/損壞快取說成「請重裝 requirements」(Codex R17-1)
-    return 1 if res.kind == MISSING else 2
+    rc = 1 if res.kind == MISSING else 2
+    _write_status(status, ok=False, kind=res.kind, rc=rc, why=res.why,
+                  module=res.module, recovered=False, python=str(py))
+    return rc
 
 
 if __name__ == "__main__":

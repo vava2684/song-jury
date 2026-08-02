@@ -178,3 +178,26 @@ def test_沒有ffmpeg時解碼雜湊回空字串而不是炸掉(tmp_path, monkey
     J = _load("評審團")
     monkeypatch.setattr(J.shutil, "which", lambda *a, **k: None)
     assert J._pcm_sha256(R / "demo_mix.wav") == ""
+
+
+def test_不同取樣率與聲道的版本不可以撞成同一個身分(tmp_path):
+    """🔴 Codex R19-1 實測:舊版強制 -ac 2 -ar 44100 是**多對一**正規化 ——
+    「48k 單聲道」與「由它轉出的 44.1k 雙單聲道」canonical PCM 雜湊完全相同,
+    兩個結構不同的來源被硬判成同源(比較器會直接拒絕)。
+    現在保留原始取樣率/聲道並把結構餵進雜湊,兩者必須不同。"""
+    import shutil as _sh
+    import subprocess as _sp
+    from conftest import REPO as R, load as _load
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = _load("評審團")
+    mono, dual = tmp_path / "m.wav", tmp_path / "d.wav"
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-i", str(R / "demo_mix.wav"),
+             "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", str(mono)],
+            check=True, timeout=300)
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-i", str(mono),
+             "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(dual)],
+            check=True, timeout=300)
+    hm, hd = J._pcm_sha256(mono), J._pcm_sha256(dual)
+    assert hm and hd, "兩個都要算得出來"
+    assert hm != hd, "🔴 不同取樣率/聲道的版本撞成同一個身分 —— 會被硬判同源"

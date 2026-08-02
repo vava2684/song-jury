@@ -276,31 +276,32 @@ fi
 #       --verify-models 卻用同一條線跑完九柱、拿到 VERIFY_OK。沒有原因的假警報最難修。
 HAS_DEMUCS=0
 if [ "$HAS_ENV" = 1 ]; then
-  # ⛔ 不可以用 LINE_OUT=$(...):command substitution 會把整段輸出收住,
-  #    helper 再怎麼 flush 使用者也是全程看不到(Codex R18-1 實測)。
-  #    tee 一邊即時顯示、一邊留檔;退出碼要取 PIPESTATUS[0],不是 tee 的。
-  _line_log="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX")"
-  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py 2>&1 | tee "$_line_log"
-  LINE_RC=${PIPESTATUS[0]}
-  LINE_OUT=$(cat "$_line_log" 2>/dev/null)
-  rm -f "$_line_log"
+  # ⛔ 輸出直接給終端(即時、不經手);判斷讀機器可讀的 UTF-8 JSON,不 grep 人類訊息
+  #    (Codex R19-3:靠解析中文訊息本來就不該是契約,換個 code page 就會壞)
+  _line_status="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX")"
+  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"
+  LINE_RC=$?
+  LINE_KIND=""
+  LINE_RECOVERED=""
+  if [ -s "$_line_status" ]; then
+    LINE_KIND=$(PYTHONUTF8=1 .venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8')).get('kind',''))" "$_line_status" 2>/dev/null)
+    LINE_RECOVERED=$(PYTHONUTF8=1 .venv/bin/python -c "import json,sys;print('1' if json.load(open(sys.argv[1],encoding='utf-8')).get('recovered') else '')" "$_line_status" 2>/dev/null)
+  fi
+  rm -f "$_line_status"
   if [ "$LINE_RC" = 0 ]; then
     HAS_DEMUCS=1
-    case "$LINE_OUT" in
-      *DEMUCS_LINE_RECOVERED*)
-        # ⛔ 救回來≠沒事:這條線在這台機器上是不穩的,不可以靜靜給綠燈
-        warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(原因見上面)" ;;
-    esac
-  elif [ "$LINE_RC" = 3 ]; then
-    # ⛔ 設定錯誤要跟「機器壞掉」分開(Codex R18-3):一個 typo 不該叫人重裝幾 GB
+    if [ -n "$LINE_RECOVERED" ]; then
+      # ⛔ 救回來≠沒事:這條線在這台機器上是不穩的,不可以靜靜給綠燈
+      warn "分軌線是重試後才成功的 —— 這台機器的這條線不穩,正式評分可能掉柱(第一次的錯誤見上面)"
+    fi
+  elif [ "$LINE_RC" = 3 ] || [ "$LINE_KIND" = "config_error" ]; then
     bad "分軌線體檢的設定值有問題" "看上面的『實際』那行改設定(例如 SONG_JURY_DEMUCS_PROBE_TIMEOUT 要填正數秒數);⛔ 這跟缺套件無關"
+  elif [ "$LINE_RC" = 4 ] || [ "$LINE_KIND" = "internal_error" ]; then
+    bad "分軌線體檢自己出錯了(不是你的設定)" "這是本工具的問題:請把上面的『實際』那行連同版本一起回報;⛔ 改環境變數或重裝套件都沒用"
+  elif [ "$LINE_KIND" = "missing_module" ]; then
+    bad "分軌環境缺套件" "上面那行有指名缺哪個模組 → 重跑安裝,或 uv pip install -r requirements-demucs.txt"
   else
-    case "$LINE_RC:$LINE_OUT" in
-      1:*missing_module*)
-        bad "分軌環境缺套件" "上面那行有指名缺哪個模組 → 重跑安裝,或 uv pip install -r requirements-demucs.txt" ;;
-      *)
-        bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "⛔ 不是缺套件 —— 逾時/啟動失敗/DLL 或快取損壞,照上面的『種類』與『實際』查;重裝 requirements 多半沒用" ;;
-    esac
+    bad "分軌線不可用(結構編曲柱 + 和聲柱,合計 26.2%)" "⛔ 不是缺套件 —— 逾時/啟動失敗/DLL 或快取損壞,照上面的『種類』與『實際』查;重裝 requirements 多半沒用"
   fi
 fi
 

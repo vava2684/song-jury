@@ -92,7 +92,13 @@ def load_report(path: Path) -> dict:
         "evaluation_id": d.get("evaluation_id") or "",
         "source_file_sha256": (d.get("source_file_sha256")
                                or d.get("source_audio_sha256") or ""),
-        "source_audio_pcm_sha256": d.get("source_audio_pcm_sha256") or "",
+        # ⚠️ 解碼身分要連**版本**一起帶(Codex R19-1):標準面換了就是換一把尺,
+        #    不同版本的雜湊不可以互比 —— 所以 key 把版本前綴進去,版本不同自然不撞。
+        "source_audio_pcm_sha256": (
+            f'{d.get("source_audio_pcm_contract") or "pcm-v1"}#'
+            f'{d["source_audio_pcm_sha256"]}'
+            if d.get("source_audio_pcm_sha256") else ""),
+        "pcm_contract": d.get("source_audio_pcm_contract") or "",
         "report_bytes_sha256": hashlib.sha256(raw).hexdigest(),
         # ⛔ report_id 必須不可碰撞:不同資料夾的同名報告會在 per_pillar 互相覆蓋,
         #    高分那份被低分那份用同一個 key 蓋掉(Codex R16-1 實測 n=2 但表只剩一筆)。
@@ -134,7 +140,8 @@ def _reject_same_source(items):
     ⚠️ 誠實邊界:舊版報告(沒有 ①②)只剩第 ③ 層,兩次重跑同一首歌的 JSON 會因
        時間戳而不同 → 擋不住。輸出的 note 會講明這件事,不假裝擋得住。"""
     for field, why in (("evaluation_id", "同一次評測的結果被放進來兩次"),
-                       ("source_audio_pcm_sha256", "同一段聲音(解碼後完全相同)被放進來兩次"),
+                       ("source_audio_pcm_sha256",
+                        "同一段聲音(解碼後在同一個格式面上完全相同)被放進來兩次"),
                        ("source_file_sha256", "同一個音檔的報告被放進來兩次"),
                        ("report_bytes_sha256", "內容完全相同的報告被放進來兩次")):
         seen = {}
@@ -203,11 +210,18 @@ def _identity_note(items):
     with_eval = sum(1 for i in items if i.get("evaluation_id"))
     with_file = sum(1 for i in items if i.get("source_file_sha256"))
     with_pcm = sum(1 for i in items if i.get("source_audio_pcm_sha256"))
-    if with_eval == n and with_pcm == n:
+    contracts = {i.get("pcm_contract") for i in items if i.get("pcm_contract")}
+    if with_eval == n and with_pcm == n and len(contracts) <= 1:
         level = "decoded-audio"
-        why = ("每份都帶 evaluation_id 與**解碼後**音訊雜湊:複製改名、換容器、"
-               "改 metadata 之後再上場都擋得住。⚠️ 擋不到 lossy 重壓(那需要 "
-               "acoustic fingerprint,本系統不做)。")
+        why = ("每份都帶 evaluation_id 與**解碼後**音訊雜湊(保留原始取樣率與聲道結構):"
+               "複製改名、換容器、改 metadata 之後再上場都擋得住。"
+               "⚠️ 擋不到 lossy 重壓、也擋不到重新取樣/改聲道數之後的版本 —— "
+               "那需要 acoustic fingerprint,本系統不做。")
+    elif with_eval == n and with_pcm == n and len(contracts) > 1:
+        # ⛔ 兩份報告用不同版本的解碼身分算出來的雜湊**不可互比**(Codex R19-1)
+        level = "exact-file"
+        why = (f"這批的解碼身分版本不一致({sorted(contracts)})—— 不同標準面算出來的"
+               f"雜湊不可互比,這一層自動退回檔案雜湊。請用同一版重評再比。")
     elif with_eval == n and with_file == n:
         level = "exact-file"
         why = ("每份都帶 evaluation_id 與**檔案** sha256,但缺解碼後雜湊 ——"

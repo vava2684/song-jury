@@ -39,7 +39,9 @@ def _stub_env(tmp_path, jury_src):
     """把 helper 需要的東西擺進 tmp:stub 評審團 + demo 音檔 + 共用模組。"""
     (tmp_path / "評審團.py").write_text(jury_src, encoding="utf-8")
     (tmp_path / "demo_mix.wav").write_bytes(b"RIFF0000")
-    for mod in ("子程序.py", "驗證報告.py", "完整驗證.py"):
+    # ⚠️ helper 的相依會長(R19-5 加了 設定讀取)—— 少複製一個就會變成
+    #    ModuleNotFoundError,而那看起來像「helper 壞了」
+    for mod in ("子程序.py", "驗證報告.py", "完整驗證.py", "設定讀取.py"):
         shutil.copy(REPO / mod, tmp_path / mod)
     return tmp_path
 
@@ -247,11 +249,11 @@ def _healthy_env(fake):
     return {**_os.environ, "PATH": str(fake) + _os.pathsep + _os.environ.get("PATH", "")}
 
 
+@pytest.mark.parametrize("exe", _ps_engines(), ids=lambda e: Path(e).stem if e else "none")
 @pytest.mark.parametrize("code,expect", _HEALTHY)
-def test_ps1在全部健康時要把0傳成0(tmp_path, code, expect):
+def test_ps1在全部健康時要把0傳成0(tmp_path, code, expect, exe):
     if sys.platform != "win32":
         pytest.skip("install.ps1 是 Windows 安裝器")
-    exe = shutil.which("pwsh") or shutil.which("powershell")
     if not exe:
         pytest.skip("這台沒有 PowerShell")
     d, fake = _healthy_repo(tmp_path, code)
@@ -381,6 +383,157 @@ def test_sh要即時顯示分軌體檢的進度(tmp_path):
     _stream_case(tmp_path,
                  lambda d: [bash, str(d / "install.sh"), "--check-only", "--no-auto-tools"],
                  bash)
+
+
+# ── 非 ASCII 訊息不可以在路上壞掉(Codex R19-3)──────────────────────
+# 🔴 PYTHONUTF8=1 只管 python 端;PowerShell 仍照 console code page 解碼
+#    (繁中 Windows 常見 cp950)→ 中文/日文/韓文/emoji 會被解成亂碼,
+#    而且是**捕捉到的字串本身**就壞了(不是畫面字型問題)。
+#    ⛔ 舊測試的 marker 是純 ASCII,所以中文全爛也照樣綠。
+_NONASCII_STUB = """import sys, time
+print("LIVE_中文_日本語_한국어_🙂", flush=True)
+time.sleep(4)
+print("DEMUCS_LINE_OK stub")
+sys.exit(0)
+"""
+
+
+@pytest.mark.parametrize("exe", _ps_engines(), ids=lambda e: Path(e).stem if e else "none")
+def test_ps1的非ASCII進度不可以變亂碼(tmp_path, exe):
+    if sys.platform != "win32":
+        pytest.skip("install.ps1 是 Windows 安裝器")
+    if not exe:
+        pytest.skip("這台沒有 PowerShell")
+    d = _stub_repo(tmp_path, 0)
+    (d / "分軌線檢查.py").write_text(_NONASCII_STUB, encoding="utf-8")
+    log = tmp_path / "installer.log"
+    # ⚠️ 先把 console code page 切成 950(繁中 Windows 的預設),重現真實環境;
+    #    切不過去就跳過 —— 那台機器沒有這個 code page,不是產品的問題。
+    script = ("chcp 950 > $null; "
+              f"& '{exe}' -NoProfile -ExecutionPolicy Bypass -File '{d / 'install.ps1'}' "
+              "-CheckOnly -NoAutoTools")
+    with log.open("wb") as fh:
+        proc = subprocess.Popen([exe, "-NoProfile", "-Command", script],
+                                cwd=str(d), stdout=fh, stderr=subprocess.STDOUT)
+        try:
+            live = _wait_for_marker(log, proc, "LIVE_中文_日本語_한국어_🙂", limit=25.0)
+            proc.wait(timeout=600)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    after = log.read_text(encoding="utf-8", errors="replace")
+    assert "LIVE_中文_日本語_한국어_🙂" in after, \
+        f"🔴 非 ASCII 訊息在路上壞掉了(console 編碼沒切/沒還原):\n{after[-600:]}"
+    assert live, "🔴 非 ASCII 也要即時看得到,不是最後才吐"
+
+
+def test_安裝器不可以再去解析人類訊息():
+    """🔴 Codex R19-3 的根治:PS 5.1 在 cp950 下把子程序的 UTF-8 解成 big5,
+    捕捉到的字串本身就壞掉(韓文/emoji 變 ?);2>&1 還會把 stderr 包成 ErrorRecord,
+    Out-String 再灌進整段 PowerShell 診斷。
+
+    ⛔ 所以契約改成:**子程序的輸出直接寫終端**(即時、不經手、不會壞),
+    判斷改讀 helper 寫的 UTF-8 JSON。安裝器裡不該再有管線捕捉與中文 grep。"""
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    for name, src in (("install.ps1", ps1), ("install.sh", sh)):
+        assert "--status-json" in src, f"🔴 {name} 沒有用機器可讀的狀態檔"
+        assert "DEMUCS_LINE_RECOVERED" not in src, \
+            f"🔴 {name} 還在 grep 人類訊息找 RECOVERED —— 換個 code page 就會壞"
+    # ⚠️ 只看**分軌線那一段**:冒煙測試那邊的 Out-String 是拿失敗尾段給人看,
+    #    不是判斷契約(範圍寫太寬會擋住無關的正常寫法 —— 自己踩到)。
+    # ⚠️ 還要把註解拿掉再看:那段註解本身就在解釋「為什麼不用 Out-String」,
+    #    直接 grep 會命中自己的說明(這個坑踩過不只一次)。
+    head = ps1.index("# ── 分軌線(結構編曲柱")
+    seg = "\n".join(ln for ln in ps1[head:ps1.index("$hasMl", head)].splitlines()
+                    if not ln.lstrip().startswith("#"))
+    assert "Tee-Object" not in seg and "Out-String" not in seg, \
+        "🔴 install.ps1 又把分軌體檢的輸出接進管線了(那正是編碼壞掉的來源)"
+    assert "LINE_OUT=$(" not in sh, \
+        "🔴 install.sh 又用 command substitution 把輸出收住了"
+
+
+def _kind_stub(kind, rc):
+    """一支只寫狀態檔的假 helper:退出碼與 kind 可以各自控制。"""
+    return ("import json, sys\n"
+            "a = sys.argv[1:]\n"
+            "p = a[a.index('--status-json') + 1] if '--status-json' in a else None\n"
+            "if p:\n"
+            f"    json.dump({{'ok': False, 'kind': {kind!r}, 'rc': {rc}, 'why': 'stub'}},\n"
+            "              open(p, 'w', encoding='utf-8'))\n"
+            f"print('stub kind={kind}')\n"
+            f"sys.exit({rc})\n")
+
+
+@pytest.mark.parametrize("exe", _ps_engines(), ids=lambda e: Path(e).stem if e else "none")
+# ⚠️ 期望字串要用**標題**,不能用會出現在別條說明裡的詞:
+#    「分軌線不可用」那條的說明就寫著「⛔ 不是缺套件 ——」,拿「缺套件」當關鍵字
+#    會在退化成通用訊息時照樣命中(變異驗證抓到我這個裝飾品)。
+@pytest.mark.parametrize("kind,rc,expect", [
+    ("missing_module", 1, "分軌環境缺套件"),
+    ("import_error", 1, "分軌線不可用"),
+    ("config_error", 3, "設定值有問題"),
+    ("internal_error", 4, "自己出錯了"),
+])
+def test_ps1要照狀態檔的種類給建議(tmp_path, exe, kind, rc, expect):
+    """🔴 Codex R19-3/R19-4:判斷若靠 grep 人類訊息,換個 code page 就判錯;
+    而 config 與 internal 共用一個碼時,使用者會被導去改沒問題的環境變數。
+    ⛔ 所以「rc + 狀態檔的 kind」兩者都要用上,而且訊息要各自不同。"""
+    if sys.platform != "win32":
+        pytest.skip("install.ps1 是 Windows 安裝器")
+    if not exe:
+        pytest.skip("這台沒有 PowerShell")
+    d = _stub_repo(tmp_path, 0)
+    (d / "分軌線檢查.py").write_text(_kind_stub(kind, rc), encoding="utf-8")
+    # ⚠️ 這條要讀**安裝器自己印的中文**,所以得叫 PowerShell 用 UTF-8 寫 stdout ——
+    #    否則在繁中 Windows 上它會寫 cp950,我們這端解成 UTF-8 就變亂碼,
+    #    測試會因為「解碼」而紅,跟產品行為無關(自己踩到)。
+    script = ("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); "
+              f"& '{d / 'install.ps1'}' -CheckOnly -NoAutoTools")
+    r = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=600, cwd=str(d))
+    assert expect in r.stdout, f"🔴 kind={kind} 應該給「{expect}」的建議:\n{r.stdout[-900:]}"
+
+
+def test_安裝器要分開設定錯誤與工具自己出錯():
+    """🔴 Codex R19-4:config_error 與 internal_error 以前共用 rc=3,
+    兩支安裝器一律說「設定值有問題」→ 把使用者導去改一個根本沒問題的環境變數。"""
+    for name in ("install.ps1", "install.sh"):
+        src = (REPO / name).read_text(encoding="utf-8")
+        assert "internal_error" in src or "-eq 4" in src or '= 4 ' in src, \
+            f"🔴 {name} 沒有分出 internal_error"
+        assert "自己出錯了" in src, f"🔴 {name} 沒有給 internal 專屬訊息"
+
+
+def test_helper自己出錯要用專屬退出碼(tmp_path):
+    """rc=3 只留給設定錯誤;工具自己爆掉是 rc=4 —— 兩者的建議完全不同。"""
+    probe = tmp_path / "boom.py"
+    probe.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, r'{REPO}')\n"
+        "import 分軌線檢查 as D\n"
+        "D.probe = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))\n"
+        "sys.exit(D.main([sys.executable]))\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=300,
+                       env={**os.environ, "PYTHONUTF8": "1"})
+    assert r.returncode == 4, f"internal 要回 4(拿到 {r.returncode}):{r.stdout}"
+    assert "internal_error" in r.stdout and "config_error" not in r.stdout
+
+
+def test_完整驗證的timeout也要走共用設定解析(tmp_path):
+    """🔴 Codex R19-5:設定讀取自稱「唯一入口」,但 完整驗證 仍直接 float(env) ——
+    abc 會變成裸 traceback rc=1,而 1 在安裝器眼裡是別的意思。"""
+    r = subprocess.run([sys.executable, str(REPO / "完整驗證.py"),
+                        "--audio", str(REPO / "demo_mix.wav")],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=300, cwd=str(REPO),
+                       env={**os.environ, "PYTHONUTF8": "1",
+                            "SONG_JURY_VERIFY_TIMEOUT": "abc"})
+    assert r.returncode == 3, f"設定錯誤要回 3(拿到 {r.returncode}):{r.stdout}{r.stderr}"
+    assert "設定值有問題" in r.stdout
+    assert "Traceback" not in r.stderr, "不可以只丟裸 traceback"
 
 
 def test_設定打錯不可以被說成缺套件(tmp_path):

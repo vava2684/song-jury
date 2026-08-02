@@ -452,26 +452,80 @@ def _file_sha256(p: Path, chunk=1 << 20) -> str:
         return ""
 
 
-def _pcm_sha256(p: Path) -> str:
-    """**解碼後**聲音內容的 sha256(固定 44.1k / 立體聲 / s16le 這個標準面)。
+# 解碼身分的**演算法版本**:標準面換了就是換了一把尺,新舊不可互比。
+# ⛔ 沒有版本欄位的話,日後改標準面時,新舊報告會被當成同一種 identity 硬比
+#    (Codex R19-1)。
+PCM_IDENTITY_CONTRACT = "pcm-v2/native-rate/native-layout/s32le"
 
-    ⭐ 這才是「同一段聲音」的身分:換容器、改 metadata、重新封裝都不會改變它,
-       比較器據此擋掉「同一首歌換個殼再上場」(Codex R18-4)。
-    ⚠️ 邊界要說清楚:它擋的是**解碼後位元相同**;lossy 重壓(320k → 192k)
-       會得到不同的 PCM,那需要 acoustic fingerprint,本系統不假裝做得到。
-    ⚠️ 沒有 ffmpeg 或解碼失敗 → 回空字串,報告仍可發布(比較器會標較弱等級)。"""
+
+def _audio_shape(exe_probe, p: Path):
+    """問 ffprobe 拿原始結構(取樣率 / 聲道數 / 佈局)。拿不到回 None。"""
+    try:
+        r = subprocess.run([exe_probe, "-v", "error", "-select_streams", "a:0",
+                            "-show_entries", "stream=sample_rate,channels,channel_layout",
+                            "-of", "default=nw=1:nk=1", str(p)],
+                           capture_output=True, text=True, timeout=120)
+        vals = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+        if r.returncode != 0 or len(vals) < 2:
+            return None
+        return "|".join(vals[:3])
+    except Exception:
+        return None
+
+
+def _pcm_sha256(p: Path) -> str:
+    """**解碼後**聲音內容的 sha256 —— 保留原始取樣率與聲道結構。
+
+    ⭐ 用途:換容器、改 metadata、重新封裝都不會改變它,比較器據此擋掉
+       「同一首歌換個殼再上場」(Codex R18-4)。
+
+    🔴 Codex R19-1 抓到的 false positive:舊版強制 `-ac 2 -ar 44100`,那是
+       **多對一**的正規化 —— 實測「48k 單聲道」與「由它轉成的 44.1k 雙單聲道」
+       雜湊完全相同,兩個結構不同的來源被硬判成同源。而且不同 ffmpeg/resampler
+       版本還可能反過來讓同一段聲音算出不同雜湊。
+       → 現在不做取樣率/聲道轉換,只把樣本格式統一成 s32le(無損上轉),
+         並把**原始結構**(rate|channels|layout)與版本字串一起餵進雜湊。
+
+    ⚠️ 邊界不變:它擋的是「解碼後在同一個格式面上位元相同」;lossy 重壓
+       (320k → 192k)會得到不同結果,那需要 acoustic fingerprint,本系統不做。
+    ⚠️ 沒有 ffmpeg/ffprobe 或解碼失敗 → 回空字串,**呼叫端不要寫這個欄位**
+       (寫空字串會被身分 schema 判成畸形 —— Codex R19-2 實測)。"""
     exe = shutil.which("ffmpeg")
-    if not exe:
+    probe = shutil.which("ffprobe")
+    if not exe or not probe:
+        return ""
+    shape = _audio_shape(probe, p)
+    if not shape:
         return ""
     try:
         r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),
-                            "-map", "0:a:0", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"],
+                            "-map", "0:a:0", "-f", "s32le", "-"],
                            capture_output=True, timeout=900)
         if r.returncode != 0 or not r.stdout:
             return ""
-        return hashlib.sha256(r.stdout).hexdigest()
+        h = hashlib.sha256()
+        h.update(f"{PCM_IDENTITY_CONTRACT}|{shape}|".encode("utf-8"))
+        h.update(r.stdout)
+        return h.hexdigest()
     except Exception:
         return ""
+
+
+def _identity_fields(song: Path) -> dict:
+    """這次評測的來源身分 —— ⛔ **算不出來的欄位一律不寫**(Codex R19-2)。
+
+    寫空字串的話會被身分 schema 判成畸形 → 沒有 ffmpeg 的機器產出的報告
+    整份變成不合法,連「降級成 exact-file」那條路都走不到。缺席才是
+    「這台算不出來」的正確表示法。"""
+    out = {"evaluation_id": uuid.uuid4().hex}
+    for key, val in (("source_file_sha256", _file_sha256(song)),
+                     ("source_audio_pcm_sha256", _pcm_sha256(song))):
+        if val:
+            out[key] = val
+    if out.get("source_audio_pcm_sha256"):
+        # 解碼身分要帶版本:標準面換了就是換一把尺,新舊不可互比(R19-1)
+        out["source_audio_pcm_contract"] = PCM_IDENTITY_CONTRACT
+    return out
 
 
 def _write_report(merged: dict, out_path: Path):
@@ -1289,9 +1343,7 @@ def _evaluate(song: Path):
     #    · source_audio_pcm_sha256:**解碼後**的聲音 → 換容器/改 metadata 也認得出
     #      (Codex R18-4:只靠檔案雜湊,尾端加幾個 byte 就變成「另一首歌」)
     #    · evaluation_id:這次評測的唯一識別 → 複製出來的兩份會完全一樣
-    merged["source_file_sha256"] = _file_sha256(song)
-    merged["source_audio_pcm_sha256"] = _pcm_sha256(song)
-    merged["evaluation_id"] = uuid.uuid4().hex
+    merged.update(_identity_fields(song))
     out_path = song.with_name(song.stem + "_評審團.json")
     _write_report(merged, out_path)   # 清洗非有限值 + allow_nan=False + 原子發布
     # ⛔ 以下全部是「顯示」:報告已原子發布並通過清洗,摘要再怎麼炸都不可以
