@@ -28,6 +28,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - name: 裝 ffmpeg(只有 ubuntu;解碼身分那幾條測試要它)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
       - name: 裝測試相依(輕量;⛔ 不裝那四個重量級 venv)
         run: |
           python -m pip install --quiet --upgrade pip
@@ -48,6 +52,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # ⛔ 沒有 ffmpeg 的話,「解碼身分」那條變異的目標測試會 skip ——
+      #    那條就變成**兩個平台都沒驗到**(Codex R19 之後實測發現的覆蓋洞)。
+      - name: 裝 ffmpeg(解碼身分的變異要它)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - run: |
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet -r requirements-dev.txt
