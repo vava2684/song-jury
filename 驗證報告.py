@@ -104,6 +104,21 @@ PCM_UNAVAILABLE_REASONS = (
 IDENTITY_DECODED = "decoded"
 IDENTITY_DECLARED = "declared"
 
+# 裁判**自己**的一份「產出端認得的樣本格式」(⛔ 不 import 產出端:裁判要能單獨
+# 驗一份外來 JSON;兩邊各自維護,對不上就是有人改壞了 —— 那正是要被抓到的事)。
+SUPPORTED_SAMPLE_FMTS = ("u8", "u8p", "s16", "s16p", "s32", "s32p",
+                         "flt", "fltp", "dbl", "dblp")
+# 每個降級原因**必然**長什麼樣(Codex R23-P1-2):
+#   · no_ffmpeg / probe_failed  → 根本探測不到,所以不可能附得出 shape
+#   · unsupported_sample_fmt    → 探測得到,但格式不在支援表 → canonical 必須是空的
+#   · unknown_multichannel_layout → 格式支援(canonical 非空)、3 聲道以上、講不出喇叭
+#   · decode_failed             → 前面都過了(canonical 與喇叭都算得出來),只是解碼失敗
+# ⛔ 沒有這層關聯,「unsupported_sample_fmt + s16 + canonical=s32le」這種
+#    自相矛盾的宣告會被正式批次收下 —— 等於「受支援格式漏寫 PCM」換個殼就過關。
+_SHAPE_REQUIRED = {"unsupported_sample_fmt", "unknown_multichannel_layout",
+                   "decode_failed"}
+_SHAPE_FORBIDDEN = {"no_ffmpeg", "probe_failed"}
+
 
 def _identity_policy(require_identity):
     """把呼叫端給的值正規化成 None / "decoded" / "declared"。
@@ -169,6 +184,66 @@ def status_problem(d: dict) -> str:
     shape = st.get("shape")
     if shape is not None and not isinstance(shape, dict):
         return f"source_audio_pcm_status.shape 不是物件({type(shape).__name__})"
+    return _shape_matches_reason(reason, shape)
+
+
+def _int_field(shape, key):
+    """shape 的數值欄位是字串(ffprobe 就是給字串);回 int 或 None。"""
+    v = shape.get(key)
+    if isinstance(v, bool) or not isinstance(v, (str, int)):
+        return None
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _shape_matches_reason(reason: str, shape) -> str:
+    """reason 與 shape 必須**互相成立**(Codex R23-P1-2 實測四組矛盾都被收下)。
+
+    ⛔ 裁判是獨立的:不能假設 JSON 一定來自現在這版產出端。只驗型別的話,
+       「格式其實有支援」的降級宣告會變成繞過 strict 的後門。"""
+    if reason in _SHAPE_FORBIDDEN:
+        if shape:
+            return (f"{reason} 卻附了 shape —— 探測不到音訊結構時不可能有 shape"
+                    f"(這兩件事不可能同時成立)")
+        return ""
+    if reason not in _SHAPE_REQUIRED:
+        return ""
+    if not isinstance(shape, dict) or not shape:
+        return f"{reason} 一定要附 shape(說得出是哪個格式/配置算不出來)"
+    for k, v in shape.items():
+        if not isinstance(k, str) or isinstance(v, bool) or not isinstance(v, (str, int)):
+            return f"shape.{k!r:.20} 不是字串/數字({type(v).__name__})"
+    fmt = str(shape.get("sample_fmt", "")).strip().lower()
+    canonical = str(shape.get("canonical", "")).strip()
+    speakers = str(shape.get("canonical_speakers", "")).strip()
+    ch = _int_field(shape, "channels")
+    if not fmt:
+        return f"{reason} 的 shape 缺 sample_fmt"
+    if reason == "unsupported_sample_fmt":
+        if fmt in SUPPORTED_SAMPLE_FMTS:
+            return (f"宣告 unsupported_sample_fmt,但 sample_fmt={fmt!r} 是支援的 ——"
+                    f" 這是「受支援格式卻沒算 PCM」,不是刻意降級")
+        if canonical:
+            return f"宣告 unsupported_sample_fmt,卻同時給了 canonical={canonical!r:.20}"
+        return ""
+    # 以下兩種都以「格式支援」為前提
+    if fmt not in SUPPORTED_SAMPLE_FMTS:
+        return f"{reason} 的 sample_fmt={fmt!r} 不在支援表 —— 那應該回報 unsupported_sample_fmt"
+    if not canonical:
+        return f"{reason} 的 shape 缺 canonical(格式支援就一定算得出來)"
+    if reason == "unknown_multichannel_layout":
+        if ch is None or ch < 3:
+            return (f"宣告 unknown_multichannel_layout,但 channels={shape.get('channels')!r:.20}"
+                    f" —— 1/2 聲道有產品規則補預設,不會講不出配置")
+        if speakers:
+            return (f"宣告 unknown_multichannel_layout,卻同時給了"
+                    f" canonical_speakers={speakers!r:.30}")
+        return ""
+    # decode_failed:前面每一關都過了,只是解碼沒成功
+    if not speakers:
+        return "宣告 decode_failed,但連 canonical_speakers 都算不出來(那是配置問題,不是解碼問題)"
     return ""
 
 
@@ -355,6 +430,12 @@ def main(argv) -> int:
             print(f"VERIFY_BAD --newer-than 的值不合法:{e}")
             return 1
     strict_contract = "--require-contract" in argv
+    # ⛔ 兩個旗標互斥(Codex R23-P2-1):同時給的時候舊版靜靜挑比較鬆的那個,
+    #    使用者以為自己要求了最嚴格的證據,實際上收下了降級報告。
+    if "--require-identity" in argv and "--allow-declared-downgrade" in argv:
+        print("VERIFY_BAD --require-identity 與 --allow-declared-downgrade 是互斥的 ——"
+              "前者要求解碼身分,後者接受宣告降級,請只選一個")
+        return 1
     strict_identity = ("--require-identity" in argv
                        or "--allow-declared-downgrade" in argv)
     policy = (IDENTITY_DECLARED if "--allow-declared-downgrade" in argv

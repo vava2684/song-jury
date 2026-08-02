@@ -970,10 +970,8 @@ MUTATIONS = [
 
     ("install.sh 把分軌體檢的輸出整段緩衝(同上,POSIX 版)",
      "install.sh",
-     '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"\n'
-     "  LINE_RC=$?",
-     '  LINE_OUT=$(PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status" 2>&1)\n'
-     "  LINE_RC=$?",
+     '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status" &',
+     '  LINE_OUT=$(PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status" 2>&1) &',
      "tests/test_installer_order.py::test_sh要即時顯示分軌體檢的進度"),
 
     ("裁判不驗來源身分的格式(list / 'x' 都被當成有效證據)",
@@ -1223,6 +1221,61 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R23 ────────────────────────────────────────────────
+    ('身分改回算使用者給的路徑(評測中途換檔 → 分數 A、身分 B)',
+     '評審團.py',
+     '    merged.update(_identity_fields(audio))',
+     '    merged.update(_identity_fields(song))',
+     'tests/test_來源身分.py::test_評分階段與來源身分只讀同一份不可變快照'),
+
+    ('某個評分階段改回讀原路徑(各階段可能讀到不同版本)',
+     '評審團.py',
+     '    cmd = [_venv_py(".venv"), str(BASE / "song_scorer.py"), str(audio), "--json", str(phys_json)]',
+     '    cmd = [_venv_py(".venv"), str(BASE / "song_scorer.py"), str(song), "--json", str(phys_json)]',
+     'tests/test_來源身分.py::test_評分階段與來源身分只讀同一份不可變快照'),
+
+    ('快照改用隨機檔名(分軌快取每次都 miss,白燒 GPU)',
+     '評審團.py',
+     '        snap = d / song.name',
+     '        snap = d / ("snap" + song.suffix)',
+     'tests/test_來源身分.py::test_評分階段與來源身分只讀同一份不可變快照'),
+
+    ('降級宣告不驗 reason 與 shape 是否互相成立(漏寫 PCM 換個殼就過關)',
+     '驗證報告.py',
+     '    return _shape_matches_reason(reason, shape)',
+     '    return ""   # 變異:只驗型別',
+     'tests/test_來源身分.py::test_降級原因要跟shape互相成立'),
+
+    ('兩個互斥的身分旗標同時給時不擋(比較鬆的那個無聲勝出)',
+     '驗證報告.py',
+     '    if "--require-identity" in argv and "--allow-declared-downgrade" in argv:',
+     '    if False:   # 變異:不擋互斥旗標',
+     'tests/test_來源身分.py::test_兩個互斥的身分旗標不可以同時給'),
+
+    ('喇叭表刪掉最稀有的一列(22.2 的來源從此靜靜降級)',
+     '評審團.py',
+     '    "22.2": ("FL+FR+FC+LFE+BL+BR+FLC+FRC+BC+SL+SR+TC+TFL+TFC+TFR+TBL+TBC+TBR"\n             "+LFE2+TSL+TSR+BFC+BFL+BFR"),\n',
+     '',
+     'tests/test_pillars.py::test_喇叭表是鎖住的契約_整份都要對'),
+
+    ('探測音訊結構時用系統 code page 解輸出(繁中 Windows 靜靜失去解碼身分)',
+     '評審團.py',
+     '                           capture_output=True, text=True, encoding="utf-8",\n                           errors="replace", timeout=120)',
+     '                           capture_output=True, text=True, timeout=120)',
+     'tests/test_pillars.py::test_探測音訊結構不可以用系統code_page解輸出'),
+
+    ('分軌探針改回前景執行(只送主 PID 的中斷要等它跑完)',
+     'install.sh',
+     '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status" &\n  _line_pid=$!\n  wait "$_line_pid"',
+     '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"',
+     'tests/test_installer_order.py::test_sh在分軌體檢被中斷時要立刻停下來'),
+
+    ('中斷時不把訊號轉給探針(留下孤兒程序繼續吃資源)',
+     'install.sh',
+     '      kill -TERM -"$_line_pid" 2>/dev/null || kill -TERM "$_line_pid" 2>/dev/null\n      wait "$_line_pid" 2>/dev/null',
+     '      :   # 變異:不轉送訊號',
+     'tests/test_installer_order.py::test_sh在分軌體檢被中斷時要立刻停下來'),
+
     ("單檔驗證把相容模式的舊報告說成「本輪新產物」",
      "驗證報告.py",
      '    if newer is not None and strict_contract and strict_identity:',
@@ -1267,11 +1320,11 @@ MUTATIONS = [
      'tests/test_installer_order.py::test_ps1的狀態檔清理必須在finally區塊裡',
      'win32'),
 
-    ('POSIX 的 INT trap 只清檔不結束(Ctrl+C 之後照樣往下裝)',
-     'install.sh',
-     '  trap \'rm -f "$_line_status"; trap - INT; kill -INT $$\' INT',
-     '  trap \'rm -f "$_line_status"\' INT',
-     'tests/test_installer_order.py::test_sh在分軌體檢被中斷時要清檔並以130結束'),
+    ("POSIX 的 INT trap 只清檔不結束(Ctrl+C 之後照樣往下裝)",
+     "install.sh",
+     '    trap - "$1"\n    kill -"$1" $$',
+     "    :   # 變異:清完就繼續",
+     "tests/test_installer_order.py::test_sh在分軌體檢被中斷時要立刻停下來"),
 
 ]
 

@@ -430,6 +430,60 @@ def test_單聲道與立體聲用產品規則補預設(tmp_path):
     assert J._canonical_speakers("5.1", 6) != J._canonical_speakers("5.1(side)", 6)
 
 
+# pcm-v5 的喇叭表 golden contract —— ⛔ 這是**身分契約的一部分**,
+# 少一列 = 那種配置從此不發布身分(靜靜降級),多一列/改一列 = 身分定義變了。
+# 兩者都必須是「明確改版」而不是「順手編輯」,所以整份鎖在這裡。
+_GOLDEN_SPEAKERS = {
+    "mono": "FC", "stereo": "FL+FR", "downmix": "DL+DR",
+    "2.1": "FL+FR+LFE", "3.0": "FL+FR+FC", "3.0(back)": "FL+FR+BC",
+    "4.0": "FL+FR+FC+BC", "quad": "FL+FR+BL+BR", "quad(side)": "FL+FR+SL+SR",
+    "3.1": "FL+FR+FC+LFE", "5.0": "FL+FR+FC+BL+BR", "5.0(side)": "FL+FR+FC+SL+SR",
+    "4.1": "FL+FR+FC+LFE+BC",
+    "5.1": "FL+FR+FC+LFE+BL+BR", "5.1(side)": "FL+FR+FC+LFE+SL+SR",
+    "6.0": "FL+FR+FC+BC+SL+SR", "6.0(front)": "FL+FR+FLC+FRC+SL+SR",
+    "3.1.2": "FL+FR+FC+LFE+TFL+TFR", "hexagonal": "FL+FR+FC+BL+BR+BC",
+    "6.1": "FL+FR+FC+LFE+BC+SL+SR", "6.1(back)": "FL+FR+FC+LFE+BL+BR+BC",
+    "6.1(front)": "FL+FR+LFE+FLC+FRC+SL+SR",
+    "7.0": "FL+FR+FC+BL+BR+SL+SR", "7.0(front)": "FL+FR+FC+FLC+FRC+SL+SR",
+    "7.1": "FL+FR+FC+LFE+BL+BR+SL+SR", "7.1(wide)": "FL+FR+FC+LFE+BL+BR+FLC+FRC",
+    "7.1(wide-side)": "FL+FR+FC+LFE+FLC+FRC+SL+SR",
+    "5.1.2": "FL+FR+FC+LFE+BL+BR+TFL+TFR",
+    "octagonal": "FL+FR+FC+BL+BR+BC+SL+SR",
+    "cube": "FL+FR+BL+BR+TFL+TFR+TBL+TBR",
+    "5.1.4": "FL+FR+FC+LFE+BL+BR+TFL+TFR+TBL+TBR",
+    "7.1.2": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR",
+    "7.1.4": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBL+TBR",
+    "7.2.3": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBC+LFE2",
+    "9.1.4": "FL+FR+FC+LFE+BL+BR+FLC+FRC+SL+SR+TFL+TFR+TBL+TBR",
+    "hexadecagonal": "FL+FR+FC+BL+BR+BC+SL+SR+TFL+TFC+TFR+TBL+TBC+TBR+WL+WR",
+    "22.2": ("FL+FR+FC+LFE+BL+BR+FLC+FRC+BC+SL+SR+TC+TFL+TFC+TFR+TBL+TBC+TBR"
+             "+LFE2+TSL+TSR+BFC+BFL+BFR"),
+}
+
+
+def test_喇叭表是鎖住的契約_整份都要對():
+    """🔴 Codex R23-P2-3:舊測試只比「產品表 ∩ 這台 ffmpeg」的交集 ——
+    把整列 `22.2` 刪掉,四條相關測試照樣全綠(實測)。那正是最稀有、最沒人會
+    手動發現的一列:刪掉之後 22.2 的來源會靜靜降級成 exact-file。
+    ⛔ 契約要整份鎖:少一列、多一列、改一列都得是明確的改版。"""
+    from conftest import load as _load
+    J = _load("評審團")
+    got = J._SPEAKERS_BY_LAYOUT
+    missing = {k: v for k, v in _GOLDEN_SPEAKERS.items() if k not in got}
+    extra = {k: v for k, v in got.items() if k not in _GOLDEN_SPEAKERS}
+    changed = {k: (got[k], v) for k, v in _GOLDEN_SPEAKERS.items()
+               if k in got and got[k] != v}
+    assert not missing, f"🔴 喇叭表少了幾列(那些配置會靜靜降級):{missing}"
+    assert not extra, f"🔴 喇叭表多了幾列(身分定義變了,要升 contract):{extra}"
+    assert not changed, f"🔴 有列被改過(同一個名字換了喇叭集合):{changed}"
+    # 分解不可以重複:兩個名字對到同一組喇叭 = 同一個身分的兩條路,遲早撞號
+    rev = {}
+    for k, v in got.items():
+        rev.setdefault(v, []).append(k)
+    dup = {v: ks for v, ks in rev.items() if len(ks) > 1}
+    assert not dup, f"🔴 有兩個配置名對到同一組喇叭:{dup}"
+
+
 def test_喇叭表要對得上這台ffmpeg的分解():
     """⭐ 這張表是**我們自己的**契約(所以身分不隨 ffmpeg 版本漂移),
     但它描述的是 ffmpeg 的配置 —— 對不上就是表寫錯或 ffmpeg 改了定義,
@@ -452,6 +506,41 @@ def test_喇叭表要對得上這台ffmpeg的分解():
             if len(parts) == 2 and "+" in parts[1] or (len(parts) == 2 and parts[1].isupper()):
                 real[parts[0]] = parts[1]
     assert real, "沒解析到 ffmpeg 的配置表"
-    wrong = {k: (v, real[k]) for k, v in J._SPEAKERS_BY_LAYOUT.items()
-             if k in real and real[k] != v}
-    assert not wrong, f"🔴 喇叭表與這台 ffmpeg 的分解對不上:{wrong}"
+    got = J._SPEAKERS_BY_LAYOUT
+    changed = {k: (v, real[k]) for k, v in got.items() if k in real and real[k] != v}
+    missing = sorted(k for k in real if k not in got and k != "NAME")
+    assert not changed, f"🔴 喇叭表與這台 ffmpeg 的分解對不上:{changed}"
+    # ⚠️ missing 不算失敗(新版 ffmpeg 多出來的配置會 fail closed,那是安全方向)——
+    #    但要印出來讓人知道有東西沒被涵蓋,不可以靜靜地當作全對。
+    if missing:
+        print(f"⚠ 這台 ffmpeg 有而表裡沒有的配置(會誠實降級,不發布身分):{missing}")
+
+
+def test_探測音訊結構不可以用系統code_page解輸出(monkeypatch, tmp_path):
+    """⚠️ 這條是 R23 順手抓到的(跑別條測試時看到 UnicodeDecodeError 警告):
+
+    `subprocess.run(..., text=True)` 不給 encoding 就會用**父程序的 locale** ——
+    繁中 Windows 是 cp950,工具只要吐一個非 ASCII 位元組就 UnicodeDecodeError。
+    🔴 後果不是崩潰而是**靜靜降級**:_audio_shape 的 except 會把它變成
+       「探測不到」→ 那台機器從此發不出解碼身分,使用者完全看不出原因。
+    ⛔ 這裡用一個「只有指定 encoding 才解得開」的假 subprocess 模擬那個環境。"""
+    from conftest import load as _load
+    J = _load("評審團")
+    real_run = J.subprocess.run
+
+    def fake_run(cmd, **kw):
+        if kw.get("encoding") is None:
+            raise UnicodeDecodeError("cp950", b"\xe7", 0, 1, "illegal multibyte sequence")
+        return _Result()
+
+    class _Result:
+        returncode = 0
+        stdout = ("sample_fmt=s16\nsample_rate=44100\nchannels=2\n"
+                  "channel_layout=stereo\n")
+        stderr = ""
+
+    monkeypatch.setattr(J.subprocess, "run", fake_run)
+    shape = J._audio_shape("ffprobe", tmp_path / "x.wav")
+    assert shape and shape["sample_fmt"] == "s16", \
+        f"🔴 沒有指定 encoding —— 這台機器會靜靜地失去解碼身分:{shape}"
+    J.subprocess.run = real_run

@@ -284,11 +284,30 @@ if [ "$HAS_ENV" = 1 ]; then
   #    的話,shell 清掉狀態檔之後**照樣往下裝**,Ctrl+C 變成「什麼都沒發生」,
   #    最外層還回 0 —— 與 --verify-models 的 130 契約、與 PowerShell 都不一致。
   #    正確寫法是清完把訊號**原樣重送**給自己(預設處置 → 130 / 143)。
+  #
+  # ⛔ 而且探針要跑在**背景**再 wait(Codex R23-P2-2 實測):bash 在等前景命令時
+  #    會把 trap 押到那個命令結束才跑 —— 只把訊號送給安裝器 PID 的自動化/服務管理
+  #    路徑(systemd、CI、supervisor)會傻等探針跑完(實測整整等滿 5 秒才回 130)。
+  #    背景 + wait 才是可中斷的;handler 再把訊號轉給探針、收屍,才不會留孤兒。
+  # ⚠️ 探針是背景工作 → 它繼承到的 SIGINT 是「忽略」,所以要用 TERM 才殺得動。
+  _line_pid=""
+  _line_stop() {          # $1 = INT | TERM
+    if [ -n "$_line_pid" ]; then
+      kill -TERM -"$_line_pid" 2>/dev/null || kill -TERM "$_line_pid" 2>/dev/null
+      wait "$_line_pid" 2>/dev/null
+    fi
+    rm -f "$_line_status"
+    trap - "$1"
+    kill -"$1" $$
+  }
   trap 'rm -f "$_line_status"' EXIT
-  trap 'rm -f "$_line_status"; trap - INT; kill -INT $$' INT
-  trap 'rm -f "$_line_status"; trap - TERM; kill -TERM $$' TERM
-  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"
+  trap '_line_stop INT' INT
+  trap '_line_stop TERM' TERM
+  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status" &
+  _line_pid=$!
+  wait "$_line_pid"
   LINE_RC=$?
+  _line_pid=""           # 已經收屍了:之後再收到訊號不要去 kill 一個被回收的 PID
   LINE_KIND=""
   LINE_RECOVERED=""
   if [ -s "$_line_status" ]; then

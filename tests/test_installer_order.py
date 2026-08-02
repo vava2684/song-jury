@@ -1022,52 +1022,80 @@ def test_ps1中途被中斷時狀態檔不可以留在磁碟上(tmp_path, exe):
         f"🔴 中斷之後還留著 {got['Left']} 份狀態檔 —— 清理沒有在 finally 裡"
 
 
-def test_sh在分軌體檢被中斷時要清檔並以130結束(tmp_path):
-    """🔴 Codex R22-P2-4:`trap 'rm -f ...' EXIT INT TERM` 的 INT handler 只刪檔、
-    沒有 exit —— 實測 shell 會**繼續往下裝**,最外層還回 0。於是在分軌探針按
-    Ctrl+C 等於什麼都沒發生,和 --verify-models 的 130 契約、和 PowerShell 都不一致。
-    ⛔ 只 grep `trap`/`130` 驗不到這件事:字串在,行為不在。"""
+@pytest.mark.parametrize("sig,rc_want", [("INT", 130), ("TERM", 143)])
+def test_sh在分軌體檢被中斷時要立刻停下來(tmp_path, sig, rc_want):
+    """🔴 Codex R22-P2-4:`trap 'rm -f ...' EXIT INT TERM` 的 handler 只刪檔、沒有
+    exit —— 實測 shell 會**繼續往下裝**,最外層還回 0。
+    🔴 Codex R23-P2-2:handler 修好之後還有第二半 —— 探針跑在**前景**時,bash 會把
+    trap 押到它結束才執行。只把訊號送給安裝器 PID 的自動化(systemd/CI/supervisor)
+    要傻等探針跑完(實測等滿 5 秒才回 130)。⛔ 所以這條驗四件事:
+    退出碼、**多久回來**、探針子程序有沒有被收掉、後面的步驟有沒有偷跑。"""
     bash = _git_bash()
     if not bash:
         pytest.skip("這台沒有 Git Bash")
     d = _stub_repo(tmp_path, 0)
-    flag = tmp_path / "probe-running.txt"
-    # helper:立旗標 → 賴一下(讓中斷落在探針執行中)→ 正常結束
+    pidfile = tmp_path / "probe.pid"
+    beat = tmp_path / "probe.beat"                # 還活著的探針會一直更新它
+    natural = tmp_path / "probe-finished.txt"     # 探針「自然跑完」才會有
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    # helper:寫狀態檔 + 自己的 PID → 賴很久 → 只有沒被殺掉才會寫自然完成旗標
     (d / "分軌線檢查.py").write_text(
-        "import json, pathlib, sys, time\n"
+        "import json, os, pathlib, sys, time\n"
         "a = sys.argv[1:]\n"
         "p = a[a.index('--status-json') + 1] if '--status-json' in a else None\n"
         "if p:\n"
         "    json.dump({'ok': True, 'kind': 'ok', 'rc': 0, 'why': ''},\n"
         "              open(p, 'w', encoding='utf-8'))\n"
-        f"pathlib.Path(r'{flag}').write_text('1')\n"
-        "time.sleep(2)\n"
+        f"pathlib.Path(r'{pidfile}').write_text(str(os.getpid()))\n"
+        # ⛔ 心跳而不是 `kill -0`:Git Bash 的 kill 認 MSYS PID,python 給的是
+        #    Windows PID —— 用 kill -0 檢查「還活著嗎」在這台永遠回答「死了」,
+        #    那條斷言就是裝飾品(變異驗證抓到我這個錯)。
+        "for _i in range(600):\n"
+        "    time.sleep(0.1)\n"
+        f"    pathlib.Path(r'{beat}').write_text(str(_i))\n"
+        f"pathlib.Path(r'{natural}').write_text('1')\n"
         "sys.exit(0)\n", encoding="utf-8")
     runner = tmp_path / "run.sh"
+    posix = lambda q: str(q).replace(chr(92), "/")
     runner.write_text(
         "#!/usr/bin/env bash\n"
-        # ⛔ 一定要 `set -m`(job control):非互動 shell 用 `&` 起的背景工作
-        #    會**繼承 SIGINT 為忽略**,而 bash 規定「進入時被忽略的訊號不能被
-        #    trap」—— 於是 kill -INT 什麼都不會發生,這條會變成驗不到東西的
-        #    裝飾品(自己踩到:第一版沒有 set -m,安裝器一路跑完回 1)。
+        # ⛔ set -m:非互動 shell 用 `&` 起的背景工作會**繼承 SIGINT 為忽略**,
+        #    而 bash 規定「進入時被忽略的訊號不能被 trap」→ kill -INT 什麼都不會
+        #    發生,這條會變成驗不到東西的裝飾品(自己踩到)。
         "set -m\n"
-        f"cd '{str(d).replace(chr(92), '/')}'\n"
+        f"export TMPDIR='{posix(tmpdir)}'\n"
+        f"cd '{posix(d)}'\n"
         "bash install.sh --check-only --no-auto-tools > out.txt 2>&1 &\n"
         "pid=$!\n"
-        f"for i in $(seq 1 200); do [ -f '{str(flag).replace(chr(92), '/')}' ] && break; sleep 0.1; done\n"
-        "kill -INT \"$pid\"\n"
-        "wait \"$pid\"; echo \"RC=$?\"\n",
+        # ⚠️ 要等**心跳**不是等 PID 檔:PID 一寫完就送訊號的話,可能還沒跳第一下,
+        #    下面「心跳有沒有停」就成了 '' == '' 的假通過(自己踩到,TERM 那組先紅)。
+        f"for i in $(seq 1 300); do [ -s '{posix(beat)}' ] && break; sleep 0.1; done\n"
+        "start=$SECONDS\n"
+        f"kill -{sig} \"$pid\"\n"
+        "wait \"$pid\"; rc=$?\n"
+        "echo \"RC=$rc\"\n"
+        "echo \"ELAPSED=$((SECONDS - start))\"\n"
+        "\n",
         encoding="utf-8", newline="\n")
     r = subprocess.run([bash, str(runner)], capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=600, cwd=str(tmp_path))
-    rc_line = [x for x in (r.stdout or "").splitlines() if x.startswith("RC=")]
-    assert rc_line, f"🔴 探針沒回報退出碼:{r.stdout[-400:]}{r.stderr[-400:]}"
-    rc = int(rc_line[-1].split("=")[1])
+    got = dict(x.split("=", 1) for x in (r.stdout or "").splitlines() if "=" in x)
     out = (d / "out.txt").read_text(encoding="utf-8", errors="replace")
-    # ⚠️ 先確認這次真的打到要測的時機,否則下面不管過不過都沒有意義
-    assert flag.exists(), f"🔴 探針還沒開始跑就結束了,這次沒驗到中斷:\n{out[-600:]}"
-    assert rc == 130, f"🔴 中斷後應該回 130,拿到 {rc};安裝器輸出尾巴:\n{out[-600:]}"
-    # ⛔ 而且要**真的停下來**:中斷之後不可以繼續跑後面的安裝步驟/健康表
+    assert beat.exists(), f"🔴 探針還沒開始就結束了,這次沒驗到中斷:\n{out[-600:]}"
+    assert got.get("RC") == str(rc_want), \
+        f"🔴 {sig} 之後應該回 {rc_want},拿到 {got.get('RC')};輸出尾巴:\n{out[-600:]}"
+    # ⛔ 立刻:探針還要睡 60 秒,若我們等它自然結束就不叫「中斷」
+    assert int(got.get("ELAPSED", "999")) <= 15, \
+        f"🔴 等了 {got.get('ELAPSED')} 秒才回來 —— trap 被押到前景命令結束才跑"
+    # ⛔ 探針要**真的被收掉**:心跳在中斷之後不可以再往前走
+    beat1 = beat.read_text(encoding="utf-8") if beat.exists() else ""
+    time.sleep(2.0)
+    beat2 = beat.read_text(encoding="utf-8") if beat.exists() else ""
+    assert beat1 and beat1 == beat2, \
+        f"🔴 探針還活著(心跳從 {beat1!r} 走到 {beat2!r})—— handler 沒把訊號轉下去"
+    assert not natural.exists(), "🔴 探針其實跑完了(沒有被中斷)"
+    assert list(tmpdir.glob("song-jury-demucs.*")) == [], "🔴 狀態檔沒清掉"
     for marker in ("冒煙測試", "接下來怎麼用"):
         assert marker not in out, \
             f"🔴 中斷之後還繼續往下跑(看到「{marker}」):\n{out[-600:]}"

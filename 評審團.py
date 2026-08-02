@@ -555,7 +555,8 @@ def _audio_shape(exe_probe, p: Path):
         r = subprocess.run([exe_probe, "-v", "error", "-select_streams", "a:0",
                             "-show_entries", "stream=" + ",".join(_SHAPE_KEYS),
                             "-of", "default=nw=0", str(p)],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120)
         if r.returncode != 0:
             return None
         got = {}
@@ -720,8 +721,12 @@ def _load_stage_json(path, label):
 def _free_vram_mib():
     """目前可用 VRAM(MiB);查不到回 -1(視為不可用 → 走 CPU)。"""
     try:
+        # ⛔ 一定要自己指定 encoding(同檔上面那條註解):text=True 會用**父程序的
+        #    locale** —— 繁中 Windows 是 cp950,工具吐一個非 ASCII 位元組就
+        #    UnicodeDecodeError。這裡被 except 吞掉 → 明明有 GPU 卻一路走 CPU。
         r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             return int(r.stdout.strip().splitlines()[0].strip())
     except Exception:
@@ -1234,11 +1239,35 @@ def main():
         sys.exit("用法: python 評審團.py <歌曲檔路徑 或 SUNO/YouTube 連結>\n"
                  "  含空白的路徑請用引號括起。")
     song = resolve_input(sys.argv[1])
-    with _job_lock(song):
-        _evaluate(song)
+    # ⛔ 鎖 → 快照 → 評測:順序不能反過來(先鎖住才輪得到我們複製那一份)
+    with _job_lock(song), _immutable_input(song) as audio:
+        _evaluate(song, audio)
 
 
-def _evaluate(song: Path):
+@contextlib.contextmanager
+def _immutable_input(song: Path):
+    """把來源複製成一份**私有快照**,評分階段與來源身分都只讀它。
+
+    🔴 Codex R23-P1-1 實測:各階段各自開「使用者給的那個路徑」,身分又在最後
+       才另外算一次 —— 評測進行中把檔案換掉,就會產生「分數來自 A、身分宣告 B」
+       的報告,而且 rc=0、strict 裁判也過。那份報告的每一個數字都可能是別首歌的。
+       (不必是惡意:同步軟體、剪輯工具另存、批次腳本覆蓋都會這樣。)
+    ⭐ 快照**保留原檔名**、只把它放進隨機目錄:分軌快取的目錄名帶檔名前綴
+       (見 分軌快取._cache_name),用隨機檔名會讓每次評測都重跑 Demucs、白燒 GPU。
+    ⚠️ 誠實邊界:這道防線處理的是**評測中途換檔**造成的不一致,不是防篡改 ——
+       同一個 OS 使用者本來就能改快照,那不在威脅模型內。
+    """
+    d = Path(tempfile.mkdtemp(prefix="song-jury-src-"))
+    try:
+        snap = d / song.name
+        shutil.copy2(song, snap)
+        yield snap
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _evaluate(song: Path, audio: Path):
+    """song = 使用者給的路徑(只用來命名輸出與顯示);audio = 不可變快照(所有階段都讀它)。"""
     print(f"🎵 評審對象: {song.name}\n")
 
     notes = []          # 新元件若失敗/降級,理由收在這裡,最後誠實印出來
@@ -1249,7 +1278,7 @@ def _evaluate(song: Path):
     arr_json = song.with_name(song.stem + "_編曲層次.json")
     dem_env, dem_why = _pick_device_env(DEMUCS_NEED_MIB)
     print(f"[1/6] 編曲層次(Demucs 六軌分軌)… 裝置:{dem_why}")
-    _, err = _optional_stage([DEMUCS_PY, str(BASE / "編曲層次.py"), str(song),
+    _, err = _optional_stage([DEMUCS_PY, str(BASE / "編曲層次.py"), str(audio),
                               "--json", str(arr_json), "--stems", str(STEMS_DIR)],
                              "編曲層次", env=dem_env)
     arrangement, vocal_stem = None, None
@@ -1273,13 +1302,13 @@ def _evaluate(song: Path):
     # ── 第一層: 物理技術(含演唱表現,若拿得到人聲軌)──
     print("[2/6] 物理技術評分(song_scorer)…" + ("(含演唱表現)" if vocal_stem else "(無人聲軌,只評混音)"))
     phys_json = song.with_name(song.stem + "_評分.json")
-    cmd = [_venv_py(".venv"), str(BASE / "song_scorer.py"), str(song), "--json", str(phys_json)]
+    cmd = [_venv_py(".venv"), str(BASE / "song_scorer.py"), str(audio), "--json", str(phys_json)]
     if vocal_stem:
         cmd += ["--vocal", vocal_stem]
         # ⚖️ rhythm 修復配套(H2 D1「網格改建於鼓+貝斯」):從分軌快取產伴奏軌傳給 song_scorer。
         #    快取命中零 GPU;失敗只影響 rhythm 參照系(它反正凍結中),不擋主流程。
         _acc = song.with_name(song.stem + "_伴奏節奏軌.wav")
-        _, _acc_err = _optional_stage([DEMUCS_PY, str(BASE / "伴奏混音.py"), str(song),
+        _, _acc_err = _optional_stage([DEMUCS_PY, str(BASE / "伴奏混音.py"), str(audio),
                                        str(_acc), "--stems", str(STEMS_DIR)],
                                       "伴奏節奏軌", timeout=1200)
         if not _acc_err and _acc.exists():
@@ -1298,7 +1327,7 @@ def _evaluate(song: Path):
     if arrangement is not None:          # 分軌成功才有快取可用,失敗就跳過免得重跑 Demucs
         hjson = song.with_name(song.stem + "_和聲分析.json")
         print("[3/6] 和聲分析(和弦辨識)…")
-        _, err = _optional_stage([DEMUCS_PY, str(BASE / "和聲分析.py"), str(song),
+        _, err = _optional_stage([DEMUCS_PY, str(BASE / "和聲分析.py"), str(audio),
                                   "--json", str(hjson), "--stems", str(STEMS_DIR)],
                                  "和聲分析", env=dem_env)
         if err:
@@ -1334,7 +1363,7 @@ def _evaluate(song: Path):
     else:
         tmp_out = Path(tempfile.mkdtemp(prefix="_songeval_", dir=BASE))
         try:
-            _, _se_err = _optional_stage([_venv_py(".venv-ml"), "eval.py", "-i", str(song), "-o", str(tmp_out)],
+            _, _se_err = _optional_stage([_venv_py(".venv-ml"), "eval.py", "-i", str(audio), "-o", str(tmp_out)],
                                          "SongEval 美學", env=dev_env, cwd=_se_dir)
             if _se_err:
                 notes.append(f"SongEval:{_se_err}")
@@ -1351,7 +1380,7 @@ def _evaluate(song: Path):
     print("[5/6] Audiobox 美學評分(Meta 模型)...")
     audiobox = {}
     tmp_lst = BASE / f"_tmp_audiobox_{os.getpid()}.jsonl"
-    tmp_lst.write_text(json.dumps({"path": str(song)}) + "\n", encoding="utf-8")
+    tmp_lst.write_text(json.dumps({"path": str(audio)}) + "\n", encoding="utf-8")
     try:
         p, _ab_err = _optional_stage([_venv_exe(".venv-ml", "audio-aes"), str(tmp_lst), "--batch-size", "1"],
                                      "Audiobox 美學", env=dev_env)   # 跟 SongEval 同一個裝置決策
@@ -1379,7 +1408,7 @@ def _evaluate(song: Path):
     else:
         gm_json = song.with_name(song.stem + "_Gemini曲評.json")
         print("[6/6] Gemini 曲評(六維·聽真音檔·引時間碼)…")
-        _, err = _optional_stage([_venv_py(".venv"), str(BASE / "Gemini曲評.py"), str(song),
+        _, err = _optional_stage([_venv_py(".venv"), str(BASE / "Gemini曲評.py"), str(audio),
                                   "--lang", "zh", "--json", str(gm_json)], "Gemini 曲評")
         if err:
             notes.append(err)
@@ -1437,7 +1466,7 @@ def _evaluate(song: Path):
         print("[8/8] 真實距離(MuQ 馬氏)+ AI 感(SONICS,顯示軸)…")
         _rj = song.with_name(song.stem + "_真實距離.json")
         _, err = _optional_stage([str(_aud_py), str(BASE / "真實距離.py"),
-                                  str(song), "--json", str(_rj)], "真實距離")
+                                  str(audio), "--json", str(_rj)], "真實距離")
         if err:
             notes.append(err)
         else:
@@ -1500,7 +1529,9 @@ def _evaluate(song: Path):
     #    · source_audio_pcm_sha256:**解碼後**的聲音 → 換容器/改 metadata 也認得出
     #      (Codex R18-4:只靠檔案雜湊,尾端加幾個 byte 就變成「另一首歌」)
     #    · evaluation_id:這次評測的唯一識別 → 複製出來的兩份會完全一樣
-    merged.update(_identity_fields(song))
+    # ⛔ 身分要算**快照**的(Codex R23-P1-1):算原路徑的話,評測中途被換掉時
+    #    會發布一份「分數來自 A、身分宣告 B」的報告,而且完全看不出來。
+    merged.update(_identity_fields(audio))
     out_path = song.with_name(song.stem + "_評審團.json")
     _write_report(merged, out_path)   # 清洗非有限值 + allow_nan=False + 原子發布
     # ⛔ 以下全部是「顯示」:報告已原子發布並通過清洗,摘要再怎麼炸都不可以

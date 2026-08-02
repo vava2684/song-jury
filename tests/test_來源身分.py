@@ -37,8 +37,19 @@ def _report(tmp_path, name="a", **extra):
     return p
 
 
-def _declared(reason="unsupported_sample_fmt", contract=_GOOD_CONTRACT, **more):
+# 產出端對一首 s64 單聲道歌真的會寫出來的 shape(⚠️ reason 與 shape 要互相成立,
+# 見 test_降級原因要跟shape互相成立 —— 這個 fixture 就是「合法」的那一組)
+_S64_SHAPE = {"sample_rate": "48000", "channels": "1", "channel_layout": "mono",
+              "sample_fmt": "s64", "canonical": "", "canonical_speakers": "FC"}
+
+
+def _declared(reason="unsupported_sample_fmt", contract=_GOOD_CONTRACT,
+              shape=None, **more):
     st = {"status": "unavailable", "reason": reason, "generator_contract": contract}
+    if shape is None:
+        shape = dict(_S64_SHAPE)
+    if shape:
+        st["shape"] = shape
     st.update(more)
     return {"source_audio_pcm_status": st}
 
@@ -178,3 +189,152 @@ def test_比較器要講真正的降級原因(tmp_path):
     assert note["level"] == "exact-file"
     assert "白名單" in note["note"], f"🔴 沒講出真正的原因:{note['note']}"
     assert "沒有 ffmpeg" not in note["note"], f"🔴 又叫人去裝 ffmpeg:{note['note']}"
+
+
+# ── 不可變快照(Codex R23-P1-1)────────────────────────────────────
+def test_評分階段與來源身分只讀同一份不可變快照(tmp_path, monkeypatch):
+    """🔴 R23-P1-1 實測:各階段各自開使用者給的那個路徑、身分又在最後才另算一次 ——
+    評測進行中把檔案換掉,就會發布一份「分數來自 A、身分宣告 B」的報告,
+    rc=0、strict 裁判也過。⛔ 那份報告的每個數字都可能是別首歌的。
+
+    這條把兩個 stage runner 換成 stub(只記錄「這一刻讀到的內容」),
+    在第一個階段結束後把原路徑換掉,再看所有階段與身分讀到的是不是同一份。"""
+    import hashlib
+    import os as _os
+    import types as _types
+    J = load("評審團")
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF-AAAA" * 64)
+    other = tmp_path / "_乙.wav"
+    other.write_bytes(b"RIFF-BBBB" * 64)
+    first = hashlib.sha256(song.read_bytes()).hexdigest()
+    seen, swapped = [], []
+
+    def _rec(cmd):
+        for a in cmd:
+            s = str(a)
+            if s.lower().endswith((".wav", ".mp3")) and Path(s).exists():
+                seen.append(hashlib.sha256(Path(s).read_bytes()).hexdigest())
+        if not swapped:                      # 第一個階段跑完 → 原路徑被換成另一首
+            swapped.append(True)
+            _os.replace(other, song)
+
+    def _opt(cmd, label, **kw):
+        _rec(cmd)
+        return None, f"{label}:stub"
+
+    def _run(cmd, cwd, label, env=None):
+        _rec(cmd)
+        if "--json" in cmd:
+            Path(cmd[cmd.index("--json") + 1]).write_text("{}", encoding="utf-8")
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(J, "_optional_stage", _opt)
+    monkeypatch.setattr(J, "_run_stage", _run)
+    monkeypatch.setenv("SONG_JURY_SKIP_GEMINI", "1")
+    with J._immutable_input(song) as snap:
+        snap_dir = snap.parent
+        # ⭐ 快照要**保留原檔名**:分軌快取的目錄名帶檔名前綴,改名會讓每次評測
+        #    都重跑 Demucs(白燒 GPU)——那是很容易在重構時失手的地方。
+        assert snap.name == "甲.wav", f"🔴 快照改了檔名:{snap.name}"
+        assert snap != song and snap.read_bytes() == b"RIFF-AAAA" * 64
+        try:
+            J._evaluate(song, snap)
+        except SystemExit:
+            pass                              # 缺柱 → rc=2,報告照樣發布
+    assert not snap_dir.exists(), "🔴 快照目錄沒清掉"
+
+    assert swapped, "🔴 這次沒換到檔,等於沒驗到"
+    assert seen, "🔴 沒有任何階段被記錄到,這條沒驗到東西"
+    assert set(seen) == {first}, \
+        f"🔴 有階段讀到換過的檔(讀到 {len(set(seen))} 種內容):{sorted(set(seen))}"
+    d = json.loads((song.with_name("甲_評審團.json")).read_text(encoding="utf-8"))
+    assert d["source_file_sha256"] == first, "🔴 身分算的是換過的檔,不是評測用的那份"
+
+
+# ── 降級宣告的 reason↔shape 關聯(Codex R23-P1-2)──────────────────
+_SHAPE_OK = {"sample_rate": "48000", "channels": "6", "channel_layout": "unknown",
+             "sample_fmt": "s32", "canonical": "s32le", "canonical_speakers": ""}
+
+
+@pytest.mark.parametrize("reason,shape,expect", [
+    # 格式其實有支援 → 這是「漏寫 PCM」偽裝成刻意降級
+    ("unsupported_sample_fmt",
+     {**_SHAPE_OK, "channels": "2", "sample_fmt": "s16", "canonical": "s32le",
+      "canonical_speakers": "FL+FR"}, "是支援的"),
+    # 2 聲道講不出配置?1/2 聲道有產品規則,不可能講不出來
+    ("unknown_multichannel_layout",
+     {**_SHAPE_OK, "channels": "2", "sample_fmt": "s16", "canonical": "s32le",
+      "canonical_speakers": "FL+FR"}, "channels"),
+    # 沒有 ffprobe 哪來的 shape
+    ("no_ffmpeg", {**_SHAPE_OK}, "不可能同時成立"),
+    ("probe_failed", {**_SHAPE_OK}, "不可能同時成立"),
+    # 說不出是哪個格式/配置算不出來 = 沒有證據
+    ("unsupported_sample_fmt", {}, "一定要附 shape"),
+    ("unknown_multichannel_layout", {**_SHAPE_OK, "canonical": ""}, "缺 canonical"),
+    # decode_failed 的前提是前面每一關都過了
+    ("decode_failed", {**_SHAPE_OK, "canonical_speakers": ""}, "配置問題"),
+])
+def test_降級原因要跟shape互相成立(tmp_path, reason, shape, expect):
+    """🔴 Codex R23-P1-2 實測:只驗型別的話,四組自相矛盾的宣告都被正式批次收下 ——
+    等於「受支援格式卻沒算 PCM」換個殼就過關。⛔ 裁判是獨立的,不能假設
+    JSON 一定來自現在這版產出端。"""
+    st = {"status": "unavailable", "reason": reason,
+          "generator_contract": _GOOD_CONTRACT}
+    if shape:
+        st["shape"] = shape
+    p = _report(tmp_path, source_audio_pcm_status=st)
+    why = V.validate(p, require_contract=True, require_identity="declared")
+    assert why and expect in why, f"🔴 矛盾的宣告被收下了({reason}):{why!r}"
+
+
+@pytest.mark.parametrize("reason,shape", [
+    ("no_ffmpeg", None),
+    ("probe_failed", None),
+    ("unsupported_sample_fmt",
+     {"sample_rate": "48000", "channels": "1", "channel_layout": "mono",
+      "sample_fmt": "s64", "canonical": "", "canonical_speakers": "FC"}),
+    ("unknown_multichannel_layout", _SHAPE_OK),
+    ("decode_failed", {**_SHAPE_OK, "channel_layout": "5.1",
+                       "canonical_speakers": "FL+FR+FC+LFE+BL+BR"}),
+])
+def test_五種合法的降級宣告都要收(tmp_path, reason, shape):
+    """⚠️ 對照組:關聯 schema 不可以嚴到把**產出端真的會寫出來的**組合擋掉 ——
+    少了這幾條,上面那批可能只是「反正都會被擋」。"""
+    st = {"status": "unavailable", "reason": reason,
+          "generator_contract": _GOOD_CONTRACT}
+    if shape:
+        st["shape"] = shape
+    p = _report(tmp_path, source_audio_pcm_status=st)
+    assert V.validate(p, require_contract=True, require_identity="declared") == "", reason
+
+
+def test_產出端寫出來的降級一定過得了自己的裁判(tmp_path):
+    """⭐ 端對端:真的用產出端算一份 s64 的身分,直接餵給裁判 ——
+    ⛔ 產出端與裁判各自維護一份規則,漂移了就是這條會紅。"""
+    import shutil as _sh
+    import subprocess as _sp
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = load("評審團")
+    s64 = tmp_path / "s.mka"
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", "aevalsrc=0.25*sin(1000*t):s=48000:d=0.2", "-c:a", "pcm_s64le",
+             "-ac", "1", str(s64)], check=True, timeout=300)
+    fields = J._identity_fields(s64)
+    p = _report(tmp_path, **{k: v for k, v in fields.items() if k != "evaluation_id"})
+    assert V.validate(p, require_contract=True, require_identity="declared") == "", \
+        "🔴 產出端寫出來的降級宣告被自己的裁判擋下 —— 兩邊的規則漂移了"
+
+
+# ── 互斥旗標(Codex R23-P2-1)──────────────────────────────────────
+@pytest.mark.parametrize("order", [
+    ("--require-identity", "--allow-declared-downgrade"),
+    ("--allow-declared-downgrade", "--require-identity"),
+])
+def test_兩個互斥的身分旗標不可以同時給(tmp_path, order):
+    """🔴 R23-P2-1:舊版只看有沒有 --allow-declared-downgrade,兩個一起給時
+    **比較鬆的那個無聲勝出** —— 使用者以為要求了最強證據,其實收下了降級報告。"""
+    p = _report(tmp_path, **_declared())
+    rc, out = _cli(p, "--newer-than", str(time.time() - 60), "--require-contract", *order)
+    assert rc == 1 and out.startswith("VERIFY_BAD") and "互斥" in out, out
