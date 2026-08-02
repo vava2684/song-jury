@@ -340,9 +340,8 @@ MUTATIONS = [
     #   後者是另一種缺陷,描述與注入不一致就等於沒驗到那個 bug(Codex R15)。
     ("VerifyModels 先清理才叫裁判(成功路徑必定假陰性)",
      "完整驗證.py",
-     '                why = validate(report, newer_than=started, require_contract=True,',
-     '                _cleanup(vid)   # 變異:清理跑到裁判前面\n'
-     '                why = validate(report, newer_than=started, require_contract=True,',
+     '                #    (正式批次才接受「產出端明講的降級」—— 見 批次評測.py)',
+     '                _cleanup(vid)   # 變異:清理跑到裁判前面',
      "tests/test_installer_order.py::test_成功路徑_裁判看得到報告且收工後全清乾淨"),
 
     # ⚠ 殺樹在 Windows 上有兩道:主動 kill_tree + 最外層 finally 的 job.close()
@@ -618,8 +617,8 @@ MUTATIONS = [
 
     ("批次把 exit 2 當一般失敗(昂貴的不完整報告被丟掉)",
      "批次評測.py",
-     '    if r.returncode not in (0, 2):',
-     '    if r.returncode != 0:',
+     "    if r.returncode not in (0, 2, 4):",
+     "    if r.returncode != 0:",
      "tests/test_batch_and_windows.py::test_退出碼2的缺柱報告要讀進來不可當成程式炸掉"),
 
     ("安裝器又內嵌金鑰探針(繞過 金鑰驗證.py 的逐把/三態契約)",
@@ -805,8 +804,9 @@ MUTATIONS = [
 
     ("批次不看 returncode(程式炸掉但檔案已寫出 → 誤判成功)",
      "批次評測.py",
-     'if r.returncode not in (0, 2):\n        return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]',
-     'if False:\n        pass',
+     'if r.returncode not in (0, 2, 4):\n'
+     '        return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]',
+     "if False:\n        pass",
      "tests/test_batch_and_windows.py::test_子程序失敗但已寫出檔案時仍要判失敗"),
 
     ("批次不先刪舊產物(失敗時偷用上一輪的舊報告)",
@@ -1221,6 +1221,67 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R25 ────────────────────────────────────────────────
+    # ⚠️ 這三件事(兩道訊號各自送、有上限的等待、逾時升級 KILL)**互相是後備**:
+    #    單獨拿掉任何一條,另外兩條都會把它接住 —— 那是好的防禦深度,但也表示
+    #    單條變異觀察不到。所以合併成一條「整段退回 R24 的寫法」,那才是真的會壞。
+    ("中斷時的終止程序退回 R24 寫法(群組 kill 回 0 就不補送、又無上限地等)",
+     "install.sh",
+     '''      kill -TERM -"$_line_pid" 2>/dev/null
+      kill -TERM "$_line_pid"  2>/dev/null
+      # ⛔ 等待要有上限:到期就升級成 KILL,再收屍 —— 不可以無上限地等一個
+      #    「已經被要求結束、卻還活著」的程序。
+      _n=0
+      while kill -0 "$_line_pid" 2>/dev/null && [ "$_n" -lt 30 ]; do
+        sleep 0.1; _n=$((_n + 1))
+      done
+      if kill -0 "$_line_pid" 2>/dev/null; then
+        kill -KILL -"$_line_pid" 2>/dev/null
+        kill -KILL "$_line_pid"  2>/dev/null
+      fi
+      wait "$_line_pid" 2>/dev/null''',
+     '''      kill -TERM -"$_line_pid" 2>/dev/null || kill -TERM "$_line_pid" 2>/dev/null
+      wait "$_line_pid" 2>/dev/null''',
+     "tests/test_installer_order.py::test_sh在探針不理會TERM時要升級成KILL"),
+
+    ('批次把退出碼 4 當成失敗(丟掉一份有效的昂貴評測)',
+     '批次評測.py',
+     '    if r.returncode not in (0, 2, 4):',
+     '    if r.returncode not in (0, 2):',
+     'tests/test_來源身分.py::test_批次遇到退出碼4要繼續讀報告'),
+
+    ('網頁版把退出碼 4 當成評分失敗',
+     'app.py',
+     '    if r.returncode not in (0, 2, 4):',
+     '    if r.returncode not in (0, 2):',
+     'tests/test_rubric_pick.py::test_網頁版要處理快照殘留的退出碼'),
+
+    ('完整驗證把退出碼 4 壓成 1 而且不跑裁判',
+     '完整驗證.py',
+     '            elif r.returncode == 4:',
+     '            elif False:   # 變異:4 當一般失敗',
+     'tests/test_來源身分.py::test_完整驗證遇到退出碼4要驗報告但不可以說VERIFY_OK'),
+
+    ('快照殘留改回模組全域(上一輪的殘留算到下一輪)',
+     '評審團.py',
+     '    left = []                       # ⭐ 本輪的快照殘留(每次 main 都是新的)',
+     '    left = main.__dict__.setdefault("_left", [])   # 變異:跨呼叫共用',
+     'tests/test_來源身分.py::test_同一個程序連跑兩次不可以繼承上一輪的快照殘留'),
+
+    ("樣本格式表少一列(u8 的來源從此走不到 canonical)",
+     "評審團.py",
+     '    "u8": "s32le", "u8p": "s32le",',
+     '    "u8p": "s32le",',
+     "tests/test_來源身分.py::test_樣本格式表是鎖住的契約_整份都要對"),
+
+
+
+    ('冒煙測試的暫存檔不進統一清理(中斷就留在 TEMP)',
+     'install.sh',
+     '  [ -n "$_smoke_json" ] && rm -f "$_smoke_json"',
+     '  :   # 變異:不清冒煙暫存檔',
+     'tests/test_installer_order.py::test_sh在冒煙測試階段被中斷也不可以留下暫存檔'),
+
     # ── Codex R24 ────────────────────────────────────────────────
     ('快照改回 copy2(連唯讀屬性一起複製 → 收工刪不掉)',
      '評審團.py',
@@ -1234,11 +1295,11 @@ MUTATIONS = [
      '    for i in range(0):\n        if not d.exists():\n            return ""',
      'tests/test_來源身分.py::test_唯讀來源的快照也要刪得掉'),
 
-    ('快照沒收乾淨時沿用正常退出碼(自動化永遠不知道 TEMP 留了音訊)',
-     '評審團.py',
-     '    if _SNAPSHOT_LEFT:',
-     '    if False:   # 變異:當作沒事',
-     'tests/test_來源身分.py::test_快照刪不掉時要大聲講而且退出碼要不一樣'),
+    ("快照沒收乾淨時沿用正常退出碼(自動化永遠不知道 TEMP 留了音訊)",
+     "評審團.py",
+     "    if left:",
+     "    if False:   # 變異:當作沒事",
+     "tests/test_來源身分.py::test_快照刪不掉時要大聲講而且退出碼要不一樣"),
 
     ('快照建不出來時直接讓 OSError 冒出去(使用者只拿到 traceback)',
      '評審團.py',
@@ -1340,11 +1401,6 @@ MUTATIONS = [
      '  PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"',
      'tests/test_installer_order.py::test_sh在分軌體檢被中斷時要立刻停下來'),
 
-    ('中斷時不把訊號轉給探針(留下孤兒程序繼續吃資源)',
-     'install.sh',
-     '      kill -TERM -"$_line_pid" 2>/dev/null || kill -TERM "$_line_pid" 2>/dev/null\n      wait "$_line_pid" 2>/dev/null',
-     '      :   # 變異:不轉送訊號',
-     'tests/test_installer_order.py::test_sh在分軌體檢被中斷時要立刻停下來'),
 
     ("單檔驗證把相容模式的舊報告說成「本輪新產物」",
      "驗證報告.py",
@@ -1454,7 +1510,7 @@ def git_must(args):
 
 
 def run_pytest(target):
-    """回 (是否有測試真的 failed, 是否有測試真的跑到, 選到幾條測試)。
+    """回 (是否有測試真的 failed, 是否有測試真的跑到, 選到幾條測試, 子程序輸出)。
 
     🔴 2026-08-02 踩到:測試改名後,變異裡的目標 id 選不到任何測試 →
        XML 是空的 → 舊版把它算成「被 skip」(平台限制)。結果是**改名等於
@@ -1471,13 +1527,18 @@ def run_pytest(target):
     import xml.etree.ElementTree as ET
     with tempfile.TemporaryDirectory() as td:
         xml = Path(td) / "r.xml"
-        subprocess.run([PY, "-m", "pytest", target, "--no-header",
-                        "-p", "no:cacheprovider", f"--junit-xml={xml}"],
-                       cwd=REPO, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace",
-                       env={**__import__("os").environ, "PYTHONUTF8": "1"})
+        # ⛔ -B / PYTHONDONTWRITEBYTECODE(Codex R25-P2-4):變異是「寫檔 → 立刻跑」,
+        #    留下的 __pycache__ 會讓下一次執行有機會載到**上一版**的 bytecode ——
+        #    那正是本機 7/8 vs CI 8/8 這種非決定性最常見的來源。
+        r = subprocess.run([PY, "-B", "-m", "pytest", target, "--no-header",
+                            "-p", "no:cacheprovider", f"--junit-xml={xml}"],
+                           cwd=REPO, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           env={**__import__("os").environ, "PYTHONUTF8": "1",
+                                "PYTHONDONTWRITEBYTECODE": "1"})
+        out = ((r.stdout or "") + (r.stderr or ""))[-1500:]
         if not xml.exists():
-            return False, False, 0     # 連 XML 都沒產出 = 這次沒驗到
+            return False, False, 0, out    # 連 XML 都沒產出 = 這次沒驗到
         root = ET.parse(xml).getroot()
         cases = root.iter("testcase")
         n_fail = n_skip = n_pass = 0
@@ -1490,7 +1551,7 @@ def run_pytest(target):
             else:
                 n_pass += 1
     # 有任何一條真的 failed → 抓到了;全部都是 skipped(沒有 pass 也沒有 fail)→ 沒驗到
-    return n_fail > 0, (n_fail + n_pass) > 0, n_fail + n_pass + n_skip
+    return n_fail > 0, (n_fail + n_pass) > 0, n_fail + n_pass + n_skip, out
 
 
 def main(argv=None):
@@ -1511,9 +1572,12 @@ def main(argv=None):
     print("=" * 66)
 
     # 先確認乾淨狀態全綠,否則後面的結果沒有意義
-    _failed, _, _n = run_pytest("tests")
+    _failed, _, _n, _out = run_pytest("tests")
     if _failed:
         print("\n✗ 乾淨狀態下測試就沒過,先修好再跑變異驗證。")
+        # ⛔ 要看得到是**哪一條**沒過(Codex R25-P2-4):只印一句「先修好」的話,
+        #    在 CI 上得重跑一次完整測試才知道原因。
+        print(_out[-1200:])
         return 1
 
     # ⭐ 還原基準:跑之前先把每個會被動到的檔案存成 bytes(見最後的還原檢查)
@@ -1557,8 +1621,15 @@ def main(argv=None):
         if crlf:
             mutated = mutated.replace("\n", "\r\n")
         p.write_bytes(mutated.encode("utf-8"))
+        # ⛔ 先確認磁碟上真的是變異版才跑(Codex R25-P2-4):否則「寫入沒生效」
+        #    會被報成「測試是裝飾品」—— 那是完全不同的問題,會白追很久。
+        if p.read_bytes() != mutated.encode("utf-8"):
+            p.write_bytes(raw)
+            print(f"\n[{i}/{len(MUTATIONS)}] ❌ 寫不進去:{fname}(檔案被鎖住?)")
+            bad.append(desc + "(變異寫不進磁碟)")
+            continue
         try:
-            failed, ran, picked = run_pytest(target)
+            failed, ran, picked, out = run_pytest(target)
         finally:
             p.write_bytes(raw)                        # 一定要逐位元還原
         if picked == 0:
@@ -1575,6 +1646,11 @@ def main(argv=None):
         else:
             print(f"\n[{i}/{len(MUTATIONS)}] ❌ 沒抓到:{desc}")
             print(f"        → {target} 在缺陷存在時仍然通過,這條測試是裝飾品")
+            # ⛔ 把子 pytest 的輸出印出來(Codex R25-P2-4):不然「存活」只是一句
+            #    結論,查不到是真的沒抓到、還是這次根本沒跑到那條測試。
+            print("        ↳ 子 pytest 輸出尾段:")
+            for _ln in out.strip().splitlines()[-12:]:
+                print(f"          {_ln}")
             bad.append(desc)
 
     # ── 打包類:用 git rm --cached 模擬「這個檔沒進 repo」 ──────────────
@@ -1601,7 +1677,7 @@ def main(argv=None):
             bad.append(desc + "(git 故障,打包變異沒驗到)")
             continue
         try:
-            failed, ran, picked = run_pytest(target)
+            failed, ran, picked, out = run_pytest(target)
         finally:
             git_must(["add", "--", fname])          # 還原失敗也要炸,不可以靜靜留著
         if picked == 0:

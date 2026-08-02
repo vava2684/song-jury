@@ -54,9 +54,13 @@ SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || SJ_STEP_
 #    於是 sj_step.* 每跑一次就留一份在 TEMP(裡面可能有命令診斷與本機路徑)。
 #    → 全程只有這一個 EXIT trap;要清的東西都收進 cleanup_all。
 _line_status=""            # 分軌線體檢的狀態檔(那一段才會設)
+_smoke_json=""             # 冒煙測試的暫存 JSON(那一段才會設)
 cleanup_all() {
   rm -f "$SJ_STEP_LOG"
   [ -n "$_line_status" ] && rm -f "$_line_status"
+  # ⛔ 冒煙測試那份也要進來(Codex R25-P2-3):它以前用固定的 $$ 檔名、
+  #    只在線性成功/失敗路徑刪 —— 在 song_scorer 跑到一半被中斷就會留下。
+  [ -n "$_smoke_json" ] && rm -f "$_smoke_json"
   return 0
 }
 trap 'cleanup_all' EXIT
@@ -303,7 +307,21 @@ if [ "$HAS_ENV" = 1 ]; then
   _line_pid=""
   _line_stop() {          # $1 = INT | TERM
     if [ -n "$_line_pid" ]; then
-      kill -TERM -"$_line_pid" 2>/dev/null || kill -TERM "$_line_pid" 2>/dev/null
+      # ⛔ 兩道都要各自送(Codex R25-P1-2 實測):`群組 || 單一` 的寫法在 Git Bash 上
+      #    會因為「群組 kill 回 0」而**永遠不執行**第二道 —— 但 Windows-native 的
+      #    python 根本沒死,接下來的 wait 就一路等到探針自然結束(實測等滿 60 秒)。
+      kill -TERM -"$_line_pid" 2>/dev/null
+      kill -TERM "$_line_pid"  2>/dev/null
+      # ⛔ 等待要有上限:到期就升級成 KILL,再收屍 —— 不可以無上限地等一個
+      #    「已經被要求結束、卻還活著」的程序。
+      _n=0
+      while kill -0 "$_line_pid" 2>/dev/null && [ "$_n" -lt 30 ]; do
+        sleep 0.1; _n=$((_n + 1))
+      done
+      if kill -0 "$_line_pid" 2>/dev/null; then
+        kill -KILL -"$_line_pid" 2>/dev/null
+        kill -KILL "$_line_pid"  2>/dev/null
+      fi
       wait "$_line_pid" 2>/dev/null
     fi
     cleanup_all            # ⛔ 清**全部**(含 SJ_STEP_LOG),不是只清自己那一個
@@ -428,8 +446,11 @@ if [ "$HAS_ENV" = 1 ]; then
   # ⛔ 不可以只 grep 顯示文字:看不出退出碼、失敗時也查不到原因。
   #    也不可以只判「非空」:"N/A"、None、NaN、999 都會被 [ -n ] 當成成功
   #    (Codex 抓到 install.sh 沒跟上 PowerShell 版的驗證)。
-  _sj="${TMPDIR:-/tmp}/song_jury_smoke_$$.json"
-  rm -f "$_sj"          # 先刪舊產物,免得誤收上一次的檔
+  # ⛔ 隨機私密檔名 + 一建立就登記進 cleanup_all(Codex R25-P2-3):
+  #    固定的 $$ 名字既可預測、又只在線性路徑刪 —— 在 song_scorer 跑到一半
+  #    被中斷(或宿主終止)時就留在 TEMP 裡。
+  _sj="$(mktemp "${TMPDIR:-/tmp}/song_jury_smoke.XXXXXX")" || _sj="${TMPDIR:-/tmp}/song_jury_smoke_$$.json"
+  _smoke_json="$_sj"
   OUT=$(PYTHONUTF8=1 .venv/bin/python song_scorer.py demo_mix.wav --json "$_sj" 2>&1); RC=$?
   if [ "$RC" -ne 0 ]; then
     bad "冒煙測試沒過(退出碼 $RC)" "量測管線有問題"
@@ -448,7 +469,7 @@ print(v)" "$_sj" 2>/dev/null)
     if [ -n "$TOT" ]; then ok "冒煙測試通過:總分 $TOT / 100"; SMOKE_OK=1
     else bad "冒煙測試的 scores.total 不是 0-100 的有限數字" "產出格式不對"; fi
   fi
-  rm -f "$_sj"          # 成功失敗都清,不留舊產物給下一輪誤收
+  rm -f "$_sj"; _smoke_json=""          # 成功失敗都清,不留舊產物給下一輪誤收
 else
   bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"
 fi
@@ -469,6 +490,13 @@ if [ "$VERIFY_MODELS" = 1 ]; then
     case "$VRC" in
       0)   ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)" ;;
       2)   bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"; VERIFY_OK=0 ;;
+      # ⛔ 4 是**評測有效、但來源快照沒清乾淨**(Codex R24-P1-1 / R25-P1-1)——
+      #    與分軌線體檢的 internal_error 4 是不同命名空間,訊息要分得開:
+      #    這不是「裝壞了」,是 TEMP 裡留了一份音訊要人去刪。
+      4)   warn "完整驗證:九柱與格式都合格,但來源快照沒清乾淨(退出碼 4)"
+           printf "${C_DIM}  (上面有那個目錄的完整路徑 —— 裡面是一整份音訊,請手動刪掉)${C_OFF}
+"
+           VERIFY_OK=0 ;;
       # ⛔ 124/130 **原樣傳到最外層**,兩個平台一模一樣(Codex R17-2):
       #    折成 1 的話自動化分不出「逾時 / 使用者取消 / 真的裝壞」。
       124) bad "完整驗證逾時(已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設 SONG_JURY_VERIFY_TIMEOUT 加長再試"; VERIFY_OK=0

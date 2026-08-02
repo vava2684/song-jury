@@ -11,6 +11,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -374,10 +375,13 @@ def test_快照刪不掉時要大聲講而且退出碼要不一樣(tmp_path, mon
     #    不然殘留就留在真的 TEMP 裡(自己踩到:測試自己變成殘留來源)。
     iso = tmp_path / "temp"
     iso.mkdir()
+    # ⛔ 只設環境變數沒有用(自己踩到:真的 TEMP 裡留下 song-jury-src-*):
+    #    tempfile 會**快取** gettempdir() 的結果,程序裡第一次用過之後就不再看
+    #    環境變數了。要覆蓋現行程序,得直接改 tempfile.tempdir。
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
     for var in ("TMPDIR", "TEMP", "TMP"):
         monkeypatch.setenv(var, str(iso))
     monkeypatch.setattr(J, "_force_rmtree", lambda d, **kw: str(d))   # 假裝刪不掉
-    monkeypatch.setattr(J, "_SNAPSHOT_LEFT", [])
     monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: song)
     monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: __import__("contextlib").nullcontext())
     monkeypatch.setattr(J, "_evaluate", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
@@ -389,7 +393,7 @@ def test_快照刪不掉時要大聲講而且退出碼要不一樣(tmp_path, mon
     assert "快照沒清乾淨" in out and "song-jury-src-" in out, out
     # 真的把那個目錄清掉(這條測試自己製造的殘留不可以留下;它在 tmp_path 裡,
     # 就算這裡漏了 pytest 也會收走 —— 兩層保險)
-    for d in J._SNAPSHOT_LEFT:
+    for d in iso.glob("song-jury-src-*"):
         __import__("shutil").rmtree(d, ignore_errors=True)
 
 
@@ -402,6 +406,10 @@ def test_快照建不出來時要給人話不是traceback(tmp_path, monkeypatch)
     #    重現)干擾 —— 那種測試會為了別人的垃圾亂紅,也可能因為別人清掉而假綠。
     iso = tmp_path / "temp"
     iso.mkdir()
+    # ⛔ 只設環境變數沒有用(自己踩到:真的 TEMP 裡留下 song-jury-src-*):
+    #    tempfile 會**快取** gettempdir() 的結果,程序裡第一次用過之後就不再看
+    #    環境變數了。要覆蓋現行程序,得直接改 tempfile.tempdir。
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
     for var in ("TMPDIR", "TEMP", "TMP"):
         monkeypatch.setenv(var, str(iso))
 
@@ -496,3 +504,155 @@ def test_裁判不可以靜靜忽略打錯的參數(tmp_path, args):
                 source_audio_pcm_contract=_GOOD_CONTRACT)
     rc, out = _cli(p, *args)
     assert rc == 1 and out.startswith("VERIFY_BAD"), f"{args} → rc={rc} {out!r}"
+
+
+# ── 退出碼 4 要貫穿下游(Codex R25-P1-1)──────────────────────────
+def _rc4_stub(tmp_path, complete=True, broken=False):
+    """一支假的 評審團.py:寫出報告(可控完整性)然後回 4。"""
+    body = [
+        "import json, pathlib, sys",
+        "p = pathlib.Path(sys.argv[1])",
+        f"P8 = {list(P8)!r}",
+        ("pt = {'完整評測': %s, '缺柱': %s, '缺柱權重合計': 0.0, '曲側合成': 70.0,"
+         # ⚠️ 缺柱要挑**非 Gemini** 的(和聲):local 契約本來就允許 Gemini 造成的
+         #    缺柱(那是設計,不是 bug)——用律動當樣本會驗不到「缺柱要被擋」。
+         % (complete, "[]" if complete else "['和聲']")),
+        "      '柱分': {k: {'score': 70.0, 'items': {'x': 70.0}, 'missing': []} for k in P8},",
+        "      '曲側含柱': P8}",
+        "d = {'scoring_contract': '2026-07-25-v1', 'pillar_totals': pt,",
+        "     'evaluation_id': 'a'*32, 'source_file_sha256': 'b'*64,",
+        "     'source_audio_pcm_sha256': 'c'*64,",
+        f"     'source_audio_pcm_contract': {_GOOD_CONTRACT!r}}}",
+        "out = p.with_name(p.stem + '_評審團.json')",
+        ("out.write_text('這不是 JSON', encoding='utf-8')" if broken
+         else "out.write_text(json.dumps(d, ensure_ascii=False), encoding='utf-8')"),
+        "print(f'完整報告:{out}')",
+        "print('⛔ 來源快照沒清乾淨:C:/Temp/song-jury-src-xxxx')",
+        "sys.exit(4)",
+    ]
+    f = tmp_path / "評審團.py"
+    f.write_text("\n".join(body) + "\n", encoding="utf-8")
+    return f
+
+
+@pytest.mark.parametrize("complete,broken,expect_ok", [
+    (True, False, True),      # 合格完整報告 → 要收下(只是加警告)
+    (False, False, False),    # 缺柱 → 照原本的完整性規則擋
+    (True, True, False),      # 報告損壞 → 擋
+])
+def test_批次遇到退出碼4要繼續讀報告(tmp_path, monkeypatch, complete, broken, expect_ok):
+    """🔴 Codex R25-P1-1 實測:4 =「報告已產出,但來源快照沒收乾淨」,
+    舊版連 JSON 都不讀就整份丟掉 —— 一份跑了幾十分鐘的**有效**評測就這樣沒了。
+    ⛔ 但 4 會蓋掉原本的 2,所以完整性一定要**讀報告內容**,不能因為
+       「碼是 4 就當完整」(那會讓缺柱的結果混進批次表)。"""
+    import types as _types
+    B = load("批次評測")
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF")
+    stub = _rc4_stub(tmp_path, complete=complete, broken=broken)
+    real_run = B.run_tree
+
+    def fake_run_tree(cmd, **kw):
+        out = subprocess.run([sys.executable, str(stub), str(song)], capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=300)
+        return _types.SimpleNamespace(returncode=out.returncode, stdout=out.stdout,
+                                      stderr=out.stderr)
+
+    monkeypatch.setattr(B, "run_tree", fake_run_tree)
+    monkeypatch.setattr(B, "VENV_PY", sys.executable)
+    data, err = B.run_one(song)
+    if expect_ok:
+        assert data is not None and not err, f"🔴 rc=4 的**有效**報告被丟掉了:{err}"
+    else:
+        # ⚠️ 契約是「err 非空」= 這一首不進表(caller 據此跳過),
+        #    不是「data 一定是 None」—— 別把測試綁在實作細節上。
+        assert err, "🔴 缺柱/損壞的報告不該因為 rc=4 就被靜靜收下"
+    _ = real_run
+
+
+def test_完整驗證遇到退出碼4要驗報告但不可以說VERIFY_OK(tmp_path):
+    """⛔ 舊版把 4 壓成 1 且完全不跑裁判 —— 於是「評測有效、只是清理失敗」
+    這個新分類在安裝器眼裡跟「裝壞了」一模一樣(Codex R25-P1-1)。"""
+    work = tmp_path / "w"
+    work.mkdir()
+    for f in ("完整驗證.py", "驗證報告.py", "子程序.py", "設定讀取.py"):
+        shutil.copy(REPO / f, work / f)
+    (work / "demo_mix.wav").write_bytes(b"RIFF0000")
+    shutil.copy(_rc4_stub(tmp_path), work / "評審團.py")
+    r = subprocess.run([sys.executable, "完整驗證.py"], cwd=str(work), capture_output=True,
+                       text=True, encoding="utf-8", errors="replace", timeout=600,
+                       env={**os.environ, "PYTHONUTF8": "1",
+                            "SONG_JURY_VERIFY_TIMEOUT": "120"})
+    assert r.returncode == 4, f"🔴 4 被壓成 {r.returncode}:\n{r.stdout[-500:]}"
+    assert "VERIFY_OK" not in r.stdout, "🔴 快照沒清乾淨卻印了 VERIFY_OK"
+    assert "VERIFY_DIRTY" in r.stdout, f"🔴 沒有講出「報告可用但殘留未清」:{r.stdout[-300:]}"
+
+
+def test_同一個程序連跑兩次不可以繼承上一輪的快照殘留(tmp_path, monkeypatch):
+    """🔴 Codex R25-P2-1:殘留清單是模組全域、又不會在 main() 開頭清空 ——
+    被嵌入/測試/長跑服務重用時,上一輪的殘留會讓下一輪(其實乾淨)也回 4。"""
+    import contextlib as _ctx
+    J = load("評審團")
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    # ⛔ 只設環境變數沒有用(自己踩到:真的 TEMP 裡留下 song-jury-src-*):
+    #    tempfile 會**快取** gettempdir() 的結果,程序裡第一次用過之後就不再看
+    #    環境變數了。要覆蓋現行程序,得直接改 tempfile.tempdir。
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(var, str(iso))
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: song)
+    monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: _ctx.nullcontext())
+    monkeypatch.setattr(J, "_evaluate", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+    monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
+    codes = []
+    for attempt in range(2):
+        # 第一輪假裝刪不掉,第二輪正常
+        monkeypatch.setattr(J, "_force_rmtree",
+                            (lambda d, **kw: str(d)) if attempt == 0 else J._force_rmtree.__wrapped__
+                            if hasattr(J._force_rmtree, "__wrapped__") else _real_rmtree(J))
+        with pytest.raises(SystemExit) as e:
+            J.main()
+        codes.append(e.value.code)
+    assert codes == [4, 0], f"🔴 第二輪繼承了上一輪的殘留:{codes}"
+    for d in iso.glob("song-jury-src-*"):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _real_rmtree(J):
+    """拿回沒被 monkeypatch 前的實作(給上面那條第二輪用)。"""
+    import importlib.util as _u
+    spec = _u.spec_from_file_location("評審團_原", REPO / "評審團.py")
+    m = _u.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m._force_rmtree
+
+
+# ── 樣本格式表也要有獨立 golden(Codex R25-P2-2)──────────────────
+# ⛔ 「產出端 == 裁判」只擋得住單邊漂移:兩份一起改壞(或一起刪一列)照樣全綠。
+#    這份 golden 是第三個獨立來源,少一列/多一列/改一列都要紅。
+_GOLDEN_FMT = {
+    "u8": "s32le", "u8p": "s32le", "s16": "s32le", "s16p": "s32le",
+    "s32": "s32le", "s32p": "s32le",
+    "s64": "", "s64p": "",
+    "flt": "f64le", "fltp": "f64le", "dbl": "f64le", "dblp": "f64le",
+}
+
+
+def test_樣本格式表是鎖住的契約_整份都要對():
+    """🔴 Codex R25-P2-2:我在隔離副本同時從產出端與裁判刪掉合法的 `u8 -> s32le`,
+    118 條相關測試照樣全過 —— 典型的「兩份真理一起漂移」。"""
+    J = load("評審團")
+    for name, table in (("產出端", J._CANONICAL_BY_FMT), ("裁判", V.CANONICAL_BY_FMT)):
+        missing = {k: v for k, v in _GOLDEN_FMT.items() if k not in table}
+        extra = {k: v for k, v in table.items() if k not in _GOLDEN_FMT}
+        changed = {k: (table[k], v) for k, v in _GOLDEN_FMT.items()
+                   if k in table and table[k] != v}
+        assert not missing, f"🔴 {name}的樣本格式表少了:{missing}"
+        assert not extra, f"🔴 {name}的樣本格式表多了(身分定義變了,要升 contract):{extra}"
+        assert not changed, f"🔴 {name}的樣本格式表被改過:{changed}"
+    # s64 一定要在表裡而且對到空字串(那是「刻意不發布身分」的明確宣告,
+    # 不是「忘了列」——後者會走 fallback,那正是 R21 修掉的碰撞來源)
+    assert J._CANONICAL_BY_FMT["s64"] == "" and V.CANONICAL_BY_FMT["s64"] == ""

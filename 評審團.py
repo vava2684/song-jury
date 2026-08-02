@@ -1241,22 +1241,21 @@ def main():
                  "  含空白的路徑請用引號括起。")
     song = resolve_input(sys.argv[1])
     rc = 0
+    left = []                       # ⭐ 本輪的快照殘留(每次 main 都是新的)
     # ⛔ 鎖 → 快照 → 評測:順序不能反過來(先鎖住才輪得到我們複製那一份)
-    with _job_lock(song), _immutable_input(song) as audio:
+    with _job_lock(song), _immutable_input(song, left) as audio:
         try:
             _evaluate(song, audio)      # 它自己 sys.exit(0/2)
         except SystemExit as e:
             rc = e.code if isinstance(e.code, int) else 1
-    if _SNAPSHOT_LEFT:
+    if left:
         # ⛔ 收尾失敗要有**自己的**退出碼(Codex R24-P1-1):沿用 0/2 等於
         #    「一切正常」,只看退出碼的自動化永遠不會知道 TEMP 裡留了一份音訊。
-        print(f"⛔ 退出碼 4:評測完成,但快照沒收乾淨({len(_SNAPSHOT_LEFT)} 個)")
+        # ⚠️ 4 會蓋掉原本的 2 —— 所以下游**不可以**把 4 當成「完整評測」,
+        #    完整性一律讀報告裡的 pillar_totals.完整評測(三個下游都這樣做)。
+        print(f"⛔ 退出碼 4:評測完成,但快照沒收乾淨({len(left)} 個)")
         sys.exit(4)
     sys.exit(rc)
-
-
-# 快照沒收乾淨的路徑(⛔ 全域,因為 main 要據此改退出碼 —— 不可以無聲結束)
-_SNAPSHOT_LEFT = []
 
 
 def _force_rmtree(d: Path, retries: int = 3, pause: float = 0.25) -> str:
@@ -1292,7 +1291,7 @@ def _force_rmtree(d: Path, retries: int = 3, pause: float = 0.25) -> str:
 
 
 @contextlib.contextmanager
-def _immutable_input(song: Path):
+def _immutable_input(song: Path, left_out=None):
     """把來源複製成一份**私有快照**,評分階段與來源身分都只讀它。
 
     🔴 Codex R23-P1-1 實測:各階段各自開「使用者給的那個路徑」,身分又在最後
@@ -1330,7 +1329,11 @@ def _immutable_input(song: Path):
             print(f"\n⛔ 來源快照沒清乾淨:{left}\n"
                   f"   評測本身已完成,但那個目錄裡有一份完整音訊 —— 請手動刪掉。\n"
                   f"   (常見原因:來源是唯讀檔、或還有程式開著那個檔案)")
-            _SNAPSHOT_LEFT.append(left)
+            # ⛔ 回報用**呼叫端給的 list**,不是模組全域(Codex R25-P2-1 實測):
+            #    全域狀態不會在下一次 main() 開頭清空 —— 被嵌入/測試/長跑服務
+            #    重用時,上一輪的殘留會讓下一輪(其實乾淨)也回 4。
+            if left_out is not None:
+                left_out.append(left)
 
 
 def _evaluate(song: Path, audio: Path):

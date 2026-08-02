@@ -68,7 +68,10 @@ def test_index_lock故障時整支不可以還是綠的(tmp_path):
         # ⚠️ 健康檢查(target='tests')必須「沒失敗」,否則 main() 一開始就
         #    印『乾淨狀態下測試就沒過』回 1 —— 那樣不管有沒有缺陷都是非零,
         #    這條端對端測試就變成裝飾品(變異驗證抓到我這個錯)。
-        "M.run_pytest = lambda t: (t != 'tests', True, 1)\n"
+        # ⚠️ 回傳值要跟 run_pytest 的簽章一致(第四個是子 pytest 的輸出)——
+        #    少一個會 ValueError,那樣**不管有沒有缺陷都是非零**,這條端對端
+        #    測試就以錯誤的理由通過(R25 實測:三條變異因此驗不到)。
+        "M.run_pytest = lambda t: (t != 'tests', True, 1, '')\n"
         "sys.exit(M.main())\n", encoding="utf-8")
     out = subprocess.run([sys.executable, "probe.py"], cwd=str(clone),
                          capture_output=True, text=True, encoding="utf-8",

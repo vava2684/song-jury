@@ -158,11 +158,24 @@ def run_one(song: Path, timeout=3600):
     # ⛔ 也要看 returncode:程式中途炸掉但檔案已寫出時,光看檔案在不在會誤判成功。
     #    2 是「報告已完整發布但缺柱」的專用碼(Codex R11)—— 要繼續往下讀,
     #    交給下面的完整性檢查給出「缺柱:…」的誠實訊息,不是當成炸掉。
-    if r.returncode not in (0, 2):
+    # ⛔ 4 = 「報告已產出,但來源快照沒收乾淨」(Codex R24-P1-1 的新碼)——
+    #    那是**隱私/清理**問題,不是評測失敗。丟掉一份跑了幾十分鐘的有效報告
+    #    才是錯的(Codex R25-P1-1 實測:舊版連 JSON 都不讀就丟)。
+    if r.returncode not in (0, 2, 4):
         return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]
+    if r.returncode == 4:
+        _tail = [ln for ln in (r.stdout or "").splitlines() if "快照沒清乾淨" in ln]
+        print(f"      ⛔ 快照殘留(請手動刪掉):{_tail[-1] if _tail else '見上面輸出'}",
+              flush=True)
     if not out_json.exists():
         return None, (r.stderr or r.stdout or "")[-300:]
-    d = json.loads(out_json.read_text(encoding="utf-8"))
+    # ⛔ 讀不開的報告要收斂成一則錯誤,不可以讓整批炸掉(R25 新測試踩到):
+    #    批次是「一首接一首」跑幾十首,其中一份半殘 JSON 不該讓前面幾十首的
+    #    結果一起消失。
+    try:
+        d = json.loads(out_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return None, f"結果 JSON 讀不了({type(e).__name__}),拒收"
     # ⛔ 缺柱的結果不可以進批次表 —— 那是另一把尺,拿去算鑑別力會得到假結論。
     #    這裡必須 **fail-closed**:欄位不存在、型別不對,一律拒收。
     #    舊寫法是 `if _pt and not _pt.get("完整評測", True)` —— 完全沒有 pillar_totals 的

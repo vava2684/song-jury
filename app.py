@@ -191,8 +191,15 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     r = _run([_venv_py(".venv"), str(BASE / "評審團.py"), str(src)])
     # ⛔ 2 = 報告已完整發布但缺柱(Codex R11 專用碼):照樣往下讀,
     #    下面的完整性區塊會掛「⛔ 這不是一份完整評測」;丟掉昂貴產物才是錯的。
-    if r.returncode not in (0, 2):
+    # ⛔ 4 = 報告已產出但來源快照沒收乾淨(Codex R24-P1-1):照樣往下讀,
+    #    但要把殘留路徑顯示出來 —— 那是一整份音訊留在伺服器的 TEMP 裡。
+    if r.returncode not in (0, 2, 4):
         return [], None, "", f"❌ 音訊評分失敗:\n```\n{(r.stderr or r.stdout)[-1000:]}\n```"
+    _snap_warn = ""
+    if r.returncode == 4:
+        _lines = [ln for ln in (r.stdout or "").splitlines() if "快照沒清乾淨" in ln]
+        _snap_warn = ("\n\n⛔ **來源快照沒清乾淨**(評測本身有效):"
+                      f"{_lines[-1] if _lines else '見伺服器輸出'} —— 請手動刪掉。")
     jpath = _jpath_from_stdout(r.stdout)
     if not jpath or not jpath.exists():
         return [], None, "", f"❌ 找不到結果 JSON。\n```\n{r.stdout[-600:]}\n```"
@@ -263,6 +270,7 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     if incomplete_md:
         note = "⛔ **評測不完整**(詳見下方)——" + note.lstrip("✅⚠️ ") + incomplete_md
     note += notes_md          # 細項提醒獨立附加,不影響上面的完整性判定
+    note += _snap_warn        # ⛔ 快照殘留是伺服器上的一整份音訊,不可以只留在 log
     return table, arc_img, lyric_eval, note
 
 

@@ -1025,8 +1025,11 @@ def test_ps1中途被中斷時狀態檔不可以留在磁碟上(tmp_path, exe):
         f"🔴 中斷之後還留著 {got['Left']} 份狀態檔 —— 清理沒有在 finally 裡"
 
 
+# ⚠️ 每個訊號跑**兩輪**(Codex R25-P1-2):那個 bug 是非決定性的 ——
+#    同一份程式碼第一次通過、第二次等滿 60 秒。只跑一次的測試會週期性地假綠。
+@pytest.mark.parametrize("round_", [1, 2])
 @pytest.mark.parametrize("sig,rc_want", [("INT", 130), ("TERM", 143)])
-def test_sh在分軌體檢被中斷時要立刻停下來(tmp_path, sig, rc_want):
+def test_sh在分軌體檢被中斷時要立刻停下來(tmp_path, sig, rc_want, round_):
     """🔴 Codex R22-P2-4:`trap 'rm -f ...' EXIT INT TERM` 的 handler 只刪檔、沒有
     exit —— 實測 shell 會**繼續往下裝**,最外層還回 0。
     🔴 Codex R23-P2-2:handler 修好之後還有第二半 —— 探針跑在**前景**時,bash 會把
@@ -1133,3 +1136,125 @@ def test_sh正常跑完不可以留下任何暫存檔(tmp_path):
                        env={**os.environ, "TMPDIR": str(tmpdir).replace(chr(92), "/")})
     left = sorted(x.name for x in tmpdir.iterdir())
     assert left == [], f"🔴 正常跑完 TMPDIR 還有殘留:{left}\n{r.stdout[-400:]}"
+
+
+def test_sh在冒煙測試階段被中斷也不可以留下暫存檔(tmp_path):
+    """🔴 Codex R25-P2-3:單一 cleanup_all 當初沒有涵蓋冒煙測試那份 JSON ——
+    它用固定的 `$$` 檔名、又只在線性成功/失敗路徑刪,所以在 song_scorer
+    跑到一半被中斷時會留在 TEMP。⛔ 而既有的中斷測試都打在分軌探針那一段,
+    完全照不到這裡(同一類問題、不同階段)。"""
+    bash = _git_bash()
+    if not bash:
+        pytest.skip("這台沒有 Git Bash")
+    d = _stub_repo(tmp_path, 0)
+    # 分軌探針:秒回,讓流程往下走到冒煙測試
+    (d / "分軌線檢查.py").write_text(
+        "import json, sys\n"
+        "a = sys.argv[1:]\n"
+        "p = a[a.index('--status-json') + 1] if '--status-json' in a else None\n"
+        "if p:\n"
+        "    json.dump({'ok': True, 'kind': 'ok', 'rc': 0, 'why': ''},\n"
+        "              open(p, 'w', encoding='utf-8'))\n"
+        "sys.exit(0)\n", encoding="utf-8")
+    beat = tmp_path / "smoke.beat"
+    # song_scorer:先寫一點東西到 --json(製造「跑到一半」的暫存檔)再賴著
+    (d / "song_scorer.py").write_text(
+        "import pathlib, sys, time\n"
+        "a = sys.argv[1:]\n"
+        "out = a[a.index('--json') + 1] if '--json' in a else None\n"
+        "if out:\n"
+        "    pathlib.Path(out).write_text('{\"scores\": {\"total\": 1}}', encoding='utf-8')\n"
+        "for _i in range(600):\n"
+        "    time.sleep(0.1)\n"
+        f"    pathlib.Path(r'{beat}').write_text(str(_i))\n", encoding="utf-8")
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    runner = tmp_path / "run.sh"
+    posix = lambda q: str(q).replace(chr(92), "/")
+    runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -m\n"
+        f"export TMPDIR='{posix(tmpdir)}'\n"
+        f"cd '{posix(d)}'\n"
+        "bash install.sh --check-only --no-auto-tools > out.txt 2>&1 &\n"
+        "pid=$!\n"
+        f"for i in $(seq 1 400); do [ -s '{posix(beat)}' ] && break; sleep 0.1; done\n"
+        "kill -INT \"$pid\"\n"
+        "wait \"$pid\"; echo \"RC=$?\"\n",
+        encoding="utf-8", newline="\n")
+    r = subprocess.run([bash, str(runner)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600, cwd=str(tmp_path))
+    assert beat.exists(), f"🔴 沒跑到冒煙測試就結束了:{(d / 'out.txt').read_text(encoding='utf-8', errors='replace')[-500:]}"
+    left = sorted(x.name for x in tmpdir.iterdir())
+    assert left == [], f"🔴 冒煙階段被中斷後 TMPDIR 還有殘留:{left}"
+    assert "RC=130" in (r.stdout or ""), f"🔴 中斷沒有以 130 收場:{r.stdout!r}"
+
+
+def test_sh在探針不理會TERM時要升級成KILL(tmp_path):
+    """🔴 Codex R25-P1-2:`群組 kill || 單一 kill` + 無上限 `wait` 的組合,在
+    「訊號沒真的生效」時會一路等到探針自然結束(實測等滿 60 秒才回 130)。
+    ⚠️ 那是**非決定性**的:同一份程式碼有時候第一道就殺掉了,所以用一般的探針
+       測不穩。這條把條件寫死 —— 探針**明確忽略 TERM**,只有「有上限的等待 +
+       升級成 KILL」能救它。⛔ 沒有那道後備的話,這裡一定會等到天荒地老。"""
+    bash = _git_bash()
+    if not bash:
+        pytest.skip("這台沒有 Git Bash")
+    d = _stub_repo(tmp_path, 0)
+    beat = tmp_path / "probe.beat"
+    posix = lambda q: str(q).replace(chr(92), "/")
+    # ⭐ 只在「跑分軌線檢查」時走忽略 TERM 的路徑,其餘一律交還給真的 python ——
+    #    ⛔ 整支換掉的話,安裝器每一次呼叫 python(import 檢查、狀態驗證、冒煙測試)
+    #       都會掉進那個迴圈,整支卡死(自己踩到,第一版 600 秒逾時)。
+    wrapper = d / ".venv" / "bin" / "python"
+    real = wrapper.read_text(encoding="utf-8").strip().splitlines()[-1]
+    real = real.replace("exec ", "").replace(' "$@"', "").strip()
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *分軌線檢查.py*)\n"
+        "    trap '' TERM\n"                     # ⛔ 故意不理會 TERM
+        "    st=''\n"
+        "    while [ $# -gt 0 ]; do\n"
+        "      if [ \"$1\" = '--status-json' ]; then st=\"$2\"; fi\n"
+        "      shift\n"
+        "    done\n"
+        "    [ -n \"$st\" ] && printf '%s' "
+        "'{\"ok\": true, \"kind\": \"ok\", \"rc\": 0, \"why\": \"\"}' > \"$st\"\n"
+        "    for i in $(seq 1 600); do sleep 0.1; printf '%s' \"$i\" > "
+        f"'{posix(beat)}'; done\n"
+        "    exit 0 ;;\n"
+        "esac\n"
+        f"exec {real} \"$@\"\n",
+        encoding="utf-8", newline="\n")
+    (d / ".venv" / "bin" / "python").chmod(0o755)
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    runner = tmp_path / "run.sh"
+    runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -m\n"
+        f"export TMPDIR='{posix(tmpdir)}'\n"
+        f"cd '{posix(d)}'\n"
+        "bash install.sh --check-only --no-auto-tools > out.txt 2>&1 &\n"
+        "pid=$!\n"
+        f"for i in $(seq 1 400); do [ -s '{posix(beat)}' ] && break; sleep 0.1; done\n"
+        "start=$SECONDS\n"
+        "kill -INT \"$pid\"\n"
+        "wait \"$pid\"; rc=$?\n"
+        "echo \"RC=$rc\"\n"
+        "echo \"ELAPSED=$((SECONDS - start))\"\n",
+        encoding="utf-8", newline="\n")
+    r = subprocess.run([bash, str(runner)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600, cwd=str(tmp_path))
+    got = dict(x.split("=", 1) for x in (r.stdout or "").splitlines() if "=" in x)
+    out = (d / "out.txt").read_text(encoding="utf-8", errors="replace")
+    assert beat.exists(), f"🔴 探針沒跑起來,這次沒驗到:\n{out[-500:]}"
+    assert int(got.get("ELAPSED", "999")) <= 15, \
+        (f"🔴 等了 {got.get('ELAPSED')} 秒 —— 探針不理會 TERM 時沒有升級成 KILL,"
+         f"就這樣一路等到它自然結束")
+    assert got.get("RC") == "130", f"🔴 中斷沒有以 130 收場:{got}"
+    # 心跳要停(真的被 KILL 掉,不是還在跑)
+    b1 = beat.read_text(encoding="utf-8")
+    time.sleep(1.5)
+    assert beat.read_text(encoding="utf-8") == b1, "🔴 探針還活著 —— 升級終止沒生效"
+    assert sorted(x.name for x in tmpdir.iterdir()) == [], "🔴 TMPDIR 還有殘留"

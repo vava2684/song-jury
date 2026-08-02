@@ -438,12 +438,14 @@ if ($hasEnv) {
     # ⛔ 不可以只 grep 顯示文字:那樣既看不出程式是不是真的成功(退出碼),
     #    失敗時又完全查不到原因(Codex 實測遇過一次「冒煙測試沒過」但立刻重跑就過,
     #    因為沒印原始輸出,根本無從追查)。改成:看退出碼 + 解析 JSON + 失敗印輸出。
-    # ⛔ 同一個視窗重跑時 $PID 不變 → 一定要先刪,否則可能收到上一次的舊產物而誤判成功
-    $smokeJson = Join-Path $env:TEMP "song_jury_smoke_$PID.json"
-    Remove-Item $smokeJson -EA SilentlyContinue
+    # ⛔ 隨機私密檔名 + finally 清掉(Codex R25-P2-3):固定的 $PID 名字既可預測,
+    #    又只在線性路徑刪 —— song_scorer 跑到一半被中斷/宿主終止就留在 TEMP。
+    $smokeJson = Join-Path ([System.IO.Path]::GetTempPath()) `
+                           ("song-jury-smoke-" + [System.IO.Path]::GetRandomFileName() + ".json")
+    $script:SmokeOk = $false
+    try {
     $out = & .venv\Scripts\python.exe song_scorer.py demo_mix.wav --json $smokeJson 2>&1 | Out-String
     $rc = $LASTEXITCODE
-    $script:SmokeOk = $false
     if ($rc -ne 0) {
         Bad "冒煙測試沒過(退出碼 $rc)" "量測管線有問題"
         Write-Host ("      ↳ 原始輸出尾段:`n" + (($out -split "`n" | Select-Object -Last 12) -join "`n")) -ForegroundColor DarkGray
@@ -469,7 +471,10 @@ if ($hasEnv) {
         } catch {
             Bad "冒煙測試的 JSON 讀不了" $_.Exception.Message
         }
-        Remove-Item $smokeJson -EA SilentlyContinue
+    }
+    } finally {
+        # ⛔ 一定要在 finally:中斷或終止性錯誤都不可以把測試音的產出留在 TEMP
+        Remove-Item -LiteralPath $smokeJson -Force -EA SilentlyContinue
     }
 } else {
     Bad "基礎環境 .venv 不可用" "連量測都跑不了,九柱全部評不出來"
@@ -494,6 +499,12 @@ if ($VerifyModels) {
         switch ($vrc) {
             0   { Ok "完整驗證通過:九柱實跑+獨立 JSON 解析都過(載入/推論驗證;模型權重可沿用既有快取)" }
             2   { Bad "完整驗證:評測跑完但缺柱(退出碼 2)" "缺柱清單見上面評審團的輸出"
+                  $script:VerifyOk = $false }
+            # ⛔ 4 是**評測有效、但來源快照沒清乾淨**(Codex R24-P1-1 / R25-P1-1)——
+            #    與分軌線體檢那邊的 internal_error 4 是不同的命名空間,訊息要分得開:
+            #    這裡不是「裝壞了」,是 TEMP 裡留了一份音訊要人去刪。
+            4   { Warn "完整驗證:九柱與格式都合格,但**來源快照沒清乾淨**(退出碼 4)"
+                  Write-Host "  (上面有那個目錄的完整路徑 —— 裡面是一整份音訊,請手動刪掉)" -ForegroundColor DarkGray
                   $script:VerifyOk = $false }
             124 { Bad "完整驗證逾時(已中止整棵程序樹)" "首次下載模型可能不夠久 —— 設環境變數 SONG_JURY_VERIFY_TIMEOUT 加長再試"
                   # ⛔ 124/130 **原樣傳到最外層**,兩個平台一模一樣(Codex R17-2):

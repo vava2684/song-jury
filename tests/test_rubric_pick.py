@@ -111,3 +111,29 @@ def test_提示詞明文禁止平均雙分(A):
 def test_提示詞明講只評詞不評曲(A):
     seg = _指令段(A._lyric_prompt("夜風吹過窗縫"))
     assert "只評詞" in seg
+
+
+def test_網頁版要處理快照殘留的退出碼(A, tmp_path, monkeypatch):
+    """🔴 Codex R25-P1-1 實測:4 =「報告已產出,但來源快照沒收乾淨」——
+    舊版把它當成 `❌ 音訊評分失敗`,表格 0 列、報告完全不讀。
+    ⛔ 那是把一份跑了幾十分鐘的**有效**評測丟掉,而真正的問題(TEMP 裡留了
+       一整份音訊)反而沒有講清楚。"""
+    import json
+    import types as _t
+    P8 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")
+    pt = {"完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
+          "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in P8},
+          "曲側含柱": list(P8)}
+    rep = tmp_path / "甲_評審團.json"
+    rep.write_text(json.dumps({"scoring_contract": "2026-07-25-v1", "pillar_totals": pt,
+                               "scores": {"total": 70.0}}, ensure_ascii=False),
+                   encoding="utf-8")
+    left = "C:/Temp/song-jury-src-xxxx"
+    monkeypatch.setattr(A, "_run", lambda *a, **k: _t.SimpleNamespace(
+        returncode=4,
+        stdout=f"完整報告:{rep}\n⛔ 來源快照沒清乾淨:{left}\n", stderr=""))
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF")
+    table, _img, _lyr, note = A.evaluate("", str(song), "", None)
+    assert table, f"🔴 rc=4 的有效報告沒被讀進來(表格是空的):{note}"
+    assert "快照" in note and left in note, f"🔴 沒把殘留路徑講給使用者:{note}"

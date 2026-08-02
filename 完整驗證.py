@@ -116,6 +116,22 @@ def run(audio: Path, timeout: float, py: str = None) -> int:
             if r.returncode == 2:
                 print("⛔ 評測跑完但缺柱(退出碼 2)—— 缺柱清單見上面評審團的輸出")
                 rc = 2
+            elif r.returncode == 4:
+                # ⭐ 4 = 報告已產出,但**來源快照沒收乾淨**(Codex R24-P1-1 的新碼)。
+                #    ⛔ 舊版把它壓成 1、而且連裁判都不跑 —— 於是「評測有效但清理失敗」
+                #       這個新分類在安裝器眼裡跟「裝壞了」一模一樣(Codex R25-P1-1)。
+                #    → 照樣拆 JSON 驗一遍(報告該擋的還是要擋),但**絕不印 VERIFY_OK**,
+                #      退出碼保留 4 讓上層知道是清理問題而不是評測問題。
+                print("⛔ 評測完成但來源快照沒收乾淨(退出碼 4)—— 路徑見上面的輸出")
+                why = validate(report, newer_than=started, require_contract=True,
+                               require_identity="decoded")
+                if why:
+                    print(f"VERIFY_BAD {why}")
+                    rc = 1          # 報告本身不合格 → 那是評測問題,優先
+                else:
+                    print("VERIFY_DIRTY 九柱完整、格式合格,但來源快照殘留未清 ——"
+                          " 報告可用,請手動刪掉上面那個目錄")
+                    rc = 4
             elif r.returncode != 0:
                 print(f"⛔ 評審團失敗(退出碼 {r.returncode})")
                 rc = 1
