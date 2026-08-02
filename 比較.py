@@ -32,8 +32,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from 驗證報告 import (CONTRACTS, REQUIRED_PILLARS, identity_problem,   # noqa: E402
-                     validate_data)
+from 驗證報告 import (CONTRACTS, PCM_CONTRACTS, REQUIRED_PILLARS,   # noqa: E402
+                     identity_problem, validate_data)
 
 COMPARE_CONTRACT = "compare-v1"
 TIE_THRESHOLD = 1.0     # 曲側合成差距 < 1.0 分 → 顯示為並列(保守顯示規則,非統計檢定)
@@ -92,13 +92,18 @@ def load_report(path: Path) -> dict:
         "evaluation_id": d.get("evaluation_id") or "",
         "source_file_sha256": (d.get("source_file_sha256")
                                or d.get("source_audio_sha256") or ""),
-        # ⚠️ 解碼身分要連**版本**一起帶(Codex R19-1):標準面換了就是換一把尺,
-        #    不同版本的雜湊不可以互比 —— 所以 key 把版本前綴進去,版本不同自然不撞。
+        # ⚠️ 解碼身分要連**版本**一起帶(Codex R19-1):標準面換了就是換一把尺。
+        # ⛔ 沒有版本(或版本不認得)的雜湊**一律不採用**(Codex R20-P1-2):
+        #    舊版會自己補一個 "pcm-v1" 當成有效證據,於是「全都缺版本」的一批
+        #    反而被標成最高等級 decoded-audio —— 對不存在的證據蓋章。
         "source_audio_pcm_sha256": (
-            f'{d.get("source_audio_pcm_contract") or "pcm-v1"}#'
-            f'{d["source_audio_pcm_sha256"]}'
-            if d.get("source_audio_pcm_sha256") else ""),
-        "pcm_contract": d.get("source_audio_pcm_contract") or "",
+            f'{d["source_audio_pcm_contract"]}#{d["source_audio_pcm_sha256"]}'
+            if (d.get("source_audio_pcm_sha256")
+                and d.get("source_audio_pcm_contract") in PCM_CONTRACTS) else ""),
+        "pcm_contract": (d.get("source_audio_pcm_contract")
+                         if d.get("source_audio_pcm_contract") in PCM_CONTRACTS else ""),
+        # 報告裡「有寫」解碼雜湊(不管版本認不認得)—— 用來分辨兩種降級原因
+        "pcm_raw_present": bool(d.get("source_audio_pcm_sha256")),
         "report_bytes_sha256": hashlib.sha256(raw).hexdigest(),
         # ⛔ report_id 必須不可碰撞:不同資料夾的同名報告會在 per_pillar 互相覆蓋,
         #    高分那份被低分那份用同一個 key 蓋掉(Codex R16-1 實測 n=2 但表只剩一筆)。
@@ -222,6 +227,13 @@ def _identity_note(items):
         level = "exact-file"
         why = (f"這批的解碼身分版本不一致({sorted(contracts)})—— 不同標準面算出來的"
                f"雜湊不可互比,這一層自動退回檔案雜湊。請用同一版重評再比。")
+    elif with_eval == n and with_file == n and any(
+            i.get("pcm_raw_present") and not i.get("source_audio_pcm_sha256")
+            for i in items):
+        # ⛔ 有報告**寫了**解碼雜湊卻沒有(或不認得)版本 → 那一層不算數,誠實退回
+        level = "exact-file"
+        why = ("有報告的解碼身分缺版本或版本不認得 —— 那個雜湊不能當同源證據,"
+               "這一層退回檔案雜湊(請用新版重評以取得可比較的解碼身分)。")
     elif with_eval == n and with_file == n:
         level = "exact-file"
         why = ("每份都帶 evaluation_id 與**檔案** sha256,但缺解碼後雜湊 ——"

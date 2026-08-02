@@ -219,8 +219,8 @@ MUTATIONS = [
 
     ("批次 full 不過獨立裁判(半殘 JSON 冒充九柱完整)",
      "批次評測.py",
-     '        why = validate(out_json, require_contract=True)',
-     '        why = ""',
+     "validate(out_json, require_contract=True, require_identity=True)",
+     'None if False else ""',
      "tests/test_batch_and_windows.py::test_full模式要過獨立裁判"),
 
     ("進度檔不驗批次契約(--skip-existing 跨契約偷用舊結果)",
@@ -1046,24 +1046,11 @@ MUTATIONS = [
     #   (結構前綴 or 原生解碼各自都足以分辨)—— 變異驗證抓到我這個裝飾品。
     # ⚠ 要**整段退回**才是 R18 當時的行為:只拿掉結構前綴、或只改 ffmpeg 參數,
     #   另一半都還能讓兩個版本的雜湊分開 —— 變異驗證抓到我這個裝飾品。
-    ("PCM 身分退回 R18 的強制正規化(mono 與 dual-mono 撞成同一個身分)",
+    ("PCM 身分退回「一律 s32le」(浮點來源的低振幅/超刻度會撞號)",
      "評審團.py",
-     '        r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),\n'
-     '                            "-map", "0:a:0", "-f", "s32le", "-"],\n'
-     "                           capture_output=True, timeout=900)\n"
-     "        if r.returncode != 0 or not r.stdout:\n"
-     '            return ""\n'
-     "        h = hashlib.sha256()\n"
-     '        h.update(f"{PCM_IDENTITY_CONTRACT}|{shape}|".encode("utf-8"))\n'
-     "        h.update(r.stdout)\n"
-     "        return h.hexdigest()",
-     '        r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),\n'
-     '                            "-map", "0:a:0", "-f", "s16le", "-ac", "2", "-ar", "44100", "-"],\n'
-     "                           capture_output=True, timeout=900)\n"
-     "        if r.returncode != 0 or not r.stdout:\n"
-     '            return ""\n'
-     "        return hashlib.sha256(r.stdout).hexdigest()",
-     "tests/test_pillars.py::test_不同取樣率與聲道的版本不可以撞成同一個身分"),
+     '    return "f64le" if (sample_fmt or "").lower() in _FLOAT_FMTS else "s32le"',
+     '    return "s32le"',
+     "tests/test_pillars.py::test_浮點來源不可以在正規化時撞成同一個身分"),
 
     ("算不到身分時照樣寫空字串(整份報告被 schema 判畸形)",
      "評審團.py",
@@ -1080,20 +1067,14 @@ MUTATIONS = [
     ("安裝證據不要求解碼後身分(產出端迴歸也照樣 VERIFY_OK)",
      "驗證報告.py",
      '        need = [k for k in ("evaluation_id", "source_file_sha256",\n'
-     '                            "source_audio_pcm_sha256")\n'
+     '                            "source_audio_pcm_sha256", "source_audio_pcm_contract")\n'
      "                if not d.get(k)]",
      '        need = [k for k in ("evaluation_id",) if not d.get(k)]',
      "tests/test_compare.py::test_安裝證據要求三個身分欄位都在"),
 
-    ("比較器不看 PCM 版本(不同標準面算出來的雜湊被硬比)",
-     "比較.py",
-     '        "source_audio_pcm_sha256": (\n'
-     '            f\'{d.get("source_audio_pcm_contract") or "pcm-v1"}#\'\n'
-     '            f\'{d["source_audio_pcm_sha256"]}\'\n'
-     '            if d.get("source_audio_pcm_sha256") else ""),',
-     '        "source_audio_pcm_sha256": d.get("source_audio_pcm_sha256") or "",',
-     "tests/test_compare.py::test_不同PCM版本的雜湊不可以互比"),
-
+    # ⚠ 「版本前綴」與「版本白名單」是同一件事的兩半:白名單那道(見上一條)
+    #   已經把未知版本的雜湊整個丟掉,所以單獨拔前綴測不出差別 —— 那不是缺陷,
+    #   是冗餘。前綴留著是為了將來出現第二個合法版本時仍然分得開。
     ("helper 自己出錯又跟設定錯誤共用碼(使用者被導去改沒問題的環境變數)",
      "分軌線檢查.py",
      "        _write_status(status, ok=False, kind=INTERNAL, rc=4,\n"
@@ -1117,6 +1098,96 @@ MUTATIONS = [
      '    $lineKind = ""   # 變異:不看狀態檔,退回猜',
      "tests/test_installer_order.py::test_ps1要照狀態檔的種類給建議",
      "win32"),
+
+    # ── Codex 第二十輪:浮點碰撞、fail-open、狀態檔誤信、例外沒收斂 ──────────
+    ("ffprobe 退回靠欄位順序(sample_fmt 被當成別的欄位 → 浮點來源全走整數路徑)",
+     "評審團.py",
+     '                            "-of", "default=nw=0", str(p)],',
+     '                            "-of", "default=nw=1:nk=1", str(p)],',
+     "tests/test_pillars.py::test_ffprobe要讀keyvalue不可以靠欄位順序"),
+
+    ("批次對本輪新產物退回相容驗證(半殘身分靜靜收件)",
+     "批次評測.py",
+     "validate(out_json, require_contract=True, require_identity=True)",
+     "validate(out_json, require_contract=True)",
+     "tests/test_batch_and_windows.py::test_full模式對本輪新產物要用strict身分"),
+
+    ("strict 不要求解碼身分的版本(有雜湊沒版本照樣過)",
+     "驗證報告.py",
+     '        need = [k for k in ("evaluation_id", "source_file_sha256",\n'
+     '                            "source_audio_pcm_sha256", "source_audio_pcm_contract")\n'
+     "                if not d.get(k)]",
+     '        need = [k for k in ("evaluation_id", "source_file_sha256",\n'
+     '                            "source_audio_pcm_sha256")\n'
+     "                if not d.get(k)]",
+     "tests/test_compare.py::test_安裝證據要求三個身分欄位都在"),
+
+    ("比較器又自己補一個版本(對不存在的證據蓋章)",
+     "比較.py",
+     '            if (d.get("source_audio_pcm_sha256")\n'
+     '                and d.get("source_audio_pcm_contract") in PCM_CONTRACTS) else ""),',
+     '            if d.get("source_audio_pcm_sha256") else ""),',
+     "tests/test_compare.py::test_不同PCM版本的雜湊不可以互比"),
+
+    ("安裝器採信與實際 rc 矛盾的狀態檔(殘留或被改過的檔會給錯建議)",
+     "install.ps1",
+     '    if ($lineStatus -and (\n'
+     '            ("$($lineStatus.rc)" -ne "$lineRc") -or\n'
+     "            ([bool]$lineStatus.ok -ne ($lineRc -eq 0)) -or\n"
+     '            [string]::IsNullOrWhiteSpace("$($lineStatus.kind)"))) {',
+     "    if ($false) {",
+     "tests/test_installer_order.py::test_ps1不可以採信與實際結果矛盾的狀態檔",
+     "win32"),
+
+    ("install.sh 採信矛盾狀態檔(同上,POSIX 版)",
+     "install.sh",
+     '    if [ "$_line_json" = "MISMATCH" ]; then',
+     '    if [ "$_line_json" = "永遠不會等於這個" ]; then',
+     "tests/test_installer_order.py::test_sh不可以採信與實際結果矛盾的狀態檔"),
+
+    ("helper 的未預期例外又落回 rc=1(被安裝器讀成缺套件)",
+     "分軌線檢查.py",
+     "    except Exception as e:      # noqa: BLE001 —— 這支自己出事也不能被說成缺套件",
+     "    except ZeroDivisionError as e:      # 變異:只接一種不可能發生的例外",
+     "tests/test_installer_order.py::test_helper的未預期例外一律收斂成4"),
+
+    ("bootstrap 那層也不接(main 之外的例外會裸奔)",
+     "分軌線檢查.py",
+     "    except Exception as e:      # noqa: BLE001\n"
+     "        import traceback\n"
+     "        traceback.print_exc()",
+     "    except ZeroDivisionError as e:      # 變異:保護傘破洞\n"
+     "        import traceback\n"
+     "        traceback.print_exc()",
+     "tests/test_installer_order.py::test_import階段就爆掉也要收斂成4並寫得出狀態檔"),
+
+    ("import 階段的例外沒被接住(連狀態檔都寫不出來)",
+     "分軌線檢查.py",
+     "    if _IMPORT_ERROR is not None:\n"
+     "        # 在保護傘裡丟出來 → bootstrap 收斂成 internal_error / rc 4\n"
+     "        raise _IMPORT_ERROR",
+     "    pass   # 變異:import 失敗不處理",
+     "tests/test_installer_order.py::test_import階段就爆掉也要收斂成4並寫得出狀態檔"),
+
+    ("完整驗證的 CLI --timeout 不驗(nan 一路傳到 subprocess)",
+     "完整驗證.py",
+     '    ap.add_argument("--timeout", type=_secs, default=default_timeout)',
+     '    ap.add_argument("--timeout", type=float, default=default_timeout)',
+     "tests/test_installer_order.py::test_完整驗證的CLI_timeout也要驗"),
+
+    ("網頁版的 timeout 又被 int() 截成 0",
+     "app.py",
+     "    _JOB_TIMEOUT = max(1, round(positive_finite(\"SONG_JURY_WEB_TIMEOUT\", 7200.0,\n"
+     "                                                lo=0.0, hi=86400.0)))",
+     '    _JOB_TIMEOUT = int(positive_finite("SONG_JURY_WEB_TIMEOUT", 7200.0, lo=0.0, hi=86400.0))',
+     "tests/test_installer_order.py::test_網頁版的timeout不可以被截成0"),
+
+    ("狀態檔退回非原子寫入(半份 JSON 會被讀成有效狀態)",
+     "分軌線檢查.py",
+     "        tmp.write_text(json.dumps(fields, ensure_ascii=False), encoding=\"utf-8\")\n"
+     "        os.replace(tmp, p)",
+     '        p.write_text(json.dumps(fields, ensure_ascii=False), encoding="utf-8")',
+     "tests/test_installer_order.py::test_狀態檔要原子寫入且用完就清"),
 
 ]
 

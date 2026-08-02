@@ -28,7 +28,10 @@ pt = {"完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合�
 p.with_name(p.stem + "_評審團.json").write_text(
     json.dumps({"scoring_contract": "2026-07-25-v1", "pillar_totals": pt,
                 "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64,
-                "source_audio_pcm_sha256": "c" * 64}, ensure_ascii=False),
+                "source_audio_pcm_sha256": "c" * 64,
+                "source_audio_pcm_contract":
+                    "pcm-v3/native-rate/native-layout/native-sample-fmt"},
+               ensure_ascii=False),
     encoding="utf-8")
 (p.parent / (p.stem + "_評分.json")).write_text("mid", encoding="utf-8")
 sys.exit(0)
@@ -494,6 +497,122 @@ def test_ps1要照狀態檔的種類給建議(tmp_path, exe, kind, rc, expect):
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=600, cwd=str(d))
     assert expect in r.stdout, f"🔴 kind={kind} 應該給「{expect}」的建議:\n{r.stdout[-900:]}"
+
+
+def _tamper_stub(json_kind, json_rc, real_rc):
+    """狀態檔說一套、實際退出碼另一套 —— 模擬殘留檔或被改過的檔。"""
+    return ("import json, sys\n"
+            "a = sys.argv[1:]\n"
+            "p = a[a.index('--status-json') + 1] if '--status-json' in a else None\n"
+            "if p:\n"
+            f"    json.dump({{'ok': {json_rc == 0}, 'kind': {json_kind!r}, 'rc': {json_rc},\n"
+            "               'why': 'stub', 'recovered': True},\n"
+            "              open(p, 'w', encoding='utf-8'))\n"
+            f"print('tamper stub rc={real_rc}')\n"
+            f"sys.exit({real_rc})\n")
+
+
+@pytest.mark.parametrize("exe", _ps_engines(), ids=lambda e: Path(e).stem if e else "none")
+def test_ps1不可以採信與實際結果矛盾的狀態檔(tmp_path, exe):
+    """🔴 Codex R20-P2-1:狀態檔寫 kind=config_error 但實際 exit 4 時,
+    舊版照樣顯示「設定值有問題」—— 使用者被導去改一個根本沒問題的環境變數。
+    殘留檔、被改過的檔、半份 JSON 都會造成這種矛盾。
+    ⛔ 規則:狀態檔只是**診斷補充**,與實際 rc 不一致就整份忽略;
+       成功與否**永遠只看實際 rc**。"""
+    if sys.platform != "win32":
+        pytest.skip("install.ps1 是 Windows 安裝器")
+    if not exe:
+        pytest.skip("這台沒有 PowerShell")
+    d = _stub_repo(tmp_path, 0)
+    (d / "分軌線檢查.py").write_text(_tamper_stub("config_error", 3, 4), encoding="utf-8")
+    script = ("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); "
+              f"& '{d / 'install.ps1'}' -CheckOnly -NoAutoTools")
+    r = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=600, cwd=str(d))
+    assert "不一致" in r.stdout, f"🔴 沒有察覺狀態檔與實際結果矛盾:\n{r.stdout[-900:]}"
+    assert "設定值有問題" not in r.stdout, "🔴 採信了矛盾狀態檔的 kind"
+    assert "自己出錯了" in r.stdout, "應該照實際 rc=4 給 internal 的建議"
+
+
+def test_sh不可以採信與實際結果矛盾的狀態檔(tmp_path):
+    bash = _git_bash()
+    if not bash:
+        pytest.skip("這台沒有 Git Bash")
+    d = _stub_repo(tmp_path, 0)
+    (d / "分軌線檢查.py").write_text(_tamper_stub("config_error", 3, 4), encoding="utf-8")
+    r = subprocess.run([bash, str(d / "install.sh"), "--check-only", "--no-auto-tools"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=600, cwd=str(d))
+    assert "不一致" in r.stdout, f"🔴 沒有察覺矛盾:\n{r.stdout[-900:]}"
+    assert "自己出錯了" in r.stdout
+
+
+def test_狀態檔要原子寫入且用完就清(tmp_path):
+    """半份 JSON(中斷/競速)不可以被讀成有效狀態;檔案也不該留在磁碟上。"""
+    helper = (REPO / "分軌線檢查.py").read_text(encoding="utf-8")
+    assert "os.replace(tmp, p)" in helper, "🔴 狀態檔不是原子寫入"
+    ps1 = (REPO / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO / "install.sh").read_text(encoding="utf-8")
+    assert "GetRandomFileName" in ps1, "🔴 PS 用可預測的固定檔名(殘留會被誤用)"
+    assert "Remove-Item $statusFile" in ps1 and "finally" in ps1, "🔴 PS 沒有保證清掉"
+    assert "trap 'rm -f \"$_line_status\"'" in sh, "🔴 sh 沒有 trap 清理"
+
+
+def test_helper的未預期例外一律收斂成4(tmp_path):
+    """🔴 Codex R20-P2-2:probe() 回 None 之後讀 res.ok 會 AttributeError → rc=1,
+    而 1 在安裝器眼裡是「缺套件」。任何未預期例外都要變成 internal_error/4。"""
+    probe = tmp_path / "boom.py"
+    probe.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, r'{REPO}')\n"
+        "import 分軌線檢查 as D\n"
+        "D.probe = lambda *a, **k: None\n"
+        # ⚠️ 這條打的是 **main 自己那層**的收斂;bootstrap 那層由
+        #    test_import階段就爆掉… 負責。兩層分開測才不會互相掩護(變異驗證抓到)。
+        "sys.exit(D.main([sys.executable]))\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=300,
+                       env={**os.environ, "PYTHONUTF8": "1"})
+    assert r.returncode == 4, f"要收斂成 4(拿到 {r.returncode}):{r.stdout}{r.stderr}"
+    assert "internal_error" in r.stdout
+
+
+def test_import階段就爆掉也要收斂成4並寫得出狀態檔(tmp_path):
+    """⛔ 連 main 都進不去的情況:舊版是裸 traceback rc=1(=「缺套件」)。"""
+    for mod in ("分軌線檢查.py", "設定讀取.py"):
+        shutil.copy(REPO / mod, tmp_path / mod)
+    (tmp_path / "評審團.py").write_text("raise RuntimeError('import 就炸')\n",
+                                        encoding="utf-8")
+    st = tmp_path / "st.json"
+    r = subprocess.run([sys.executable, "分軌線檢查.py", "--status-json", str(st),
+                        sys.executable],
+                       cwd=str(tmp_path), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=300,
+                       env={**os.environ, "PYTHONUTF8": "1"})
+    assert r.returncode == 4, f"要收斂成 4(拿到 {r.returncode})"
+    assert st.exists(), "🔴 連狀態檔都沒寫 —— 安裝器只能瞎猜"
+    import json as _json
+    assert _json.loads(st.read_text(encoding="utf-8"))["kind"] == "internal_error"
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "0", "-5", "abc"])
+def test_完整驗證的CLI_timeout也要驗(bad):
+    """🔴 Codex R20-P2-3:`--timeout nan` 以前一路傳到 subprocess,訊息還印「逾時 nans」。"""
+    r = subprocess.run([sys.executable, str(REPO / "完整驗證.py"), "--timeout", bad,
+                        "--audio", str(REPO / "demo_mix.wav")],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=300, cwd=str(REPO),
+                       env={**os.environ, "PYTHONUTF8": "1"})
+    assert r.returncode != 0, f"{bad!r} 應該被擋下"
+    assert "實跑 評審團" not in r.stdout, f"🔴 {bad!r} 竟然開始跑評測了"
+
+
+def test_網頁版的timeout不可以被截成0():
+    """🔴 Codex R20-P2-3:0.5 是合法的正數,int() 會截成 0 → 又變回非正逾時。"""
+    app = (REPO / "app.py").read_text(encoding="utf-8")
+    assert "int(positive_finite" not in app, "🔴 又直接 int() 了"
+    assert "max(1, round(positive_finite" in app
 
 
 def test_安裝器要分開設定錯誤與工具自己出錯():

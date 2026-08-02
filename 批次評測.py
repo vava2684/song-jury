@@ -188,7 +188,7 @@ def run_one(song: Path, timeout=3600):
         # ⛔ 「完整評測: true」只是產出端的自述 —— full 批次是正式資料入口,
         #    必須過**獨立裁判**(Codex R16-7:stub 只寫 {"完整評測":true,"缺柱":[]}
         #    就被收進表,八柱 score、items/missing、合成自洽、契約全沒驗)。
-        why = validate(out_json, require_contract=True)
+        why = validate(out_json, require_contract=True, require_identity=True)
         if why:
             return None, f"獨立裁判拒收:{why}"
         d["_batch_contract"] = FULL_CONTRACT

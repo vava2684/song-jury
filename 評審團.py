@@ -455,20 +455,46 @@ def _file_sha256(p: Path, chunk=1 << 20) -> str:
 # 解碼身分的**演算法版本**:標準面換了就是換了一把尺,新舊不可互比。
 # ⛔ 沒有版本欄位的話,日後改標準面時,新舊報告會被當成同一種 identity 硬比
 #    (Codex R19-1)。
-PCM_IDENTITY_CONTRACT = "pcm-v2/native-rate/native-layout/s32le"
+PCM_IDENTITY_CONTRACT = "pcm-v3/native-rate/native-layout/native-sample-fmt"
+
+# 原始樣本格式 → 解碼時要用哪個**可逆**的容器格式
+# ⛔ 不可以一律 s32le(Codex R20-P1-1 實測兩種真實碰撞):
+#    · 低於 s32 LSB 的浮點訊號(1e-12)會被量化成 0 → 與靜音撞號;
+#    · 超出滿刻度的浮點(1.1 vs 1.2)會被 clip 成同一個值 → 撞號。
+#    浮點來源要留在浮點面上(f32 → f64 是精確擴展),整數來源才用 s32le 無損上轉。
+_FLOAT_FMTS = ("flt", "fltp", "dbl", "dblp")
+
+
+def _canonical_fmt(sample_fmt: str) -> str:
+    return "f64le" if (sample_fmt or "").lower() in _FLOAT_FMTS else "s32le"
+
+
+_SHAPE_KEYS = ("sample_rate", "channels", "channel_layout", "sample_fmt")
 
 
 def _audio_shape(exe_probe, p: Path):
-    """問 ffprobe 拿原始結構(取樣率 / 聲道數 / 佈局)。拿不到回 None。"""
+    """問 ffprobe 拿原始結構;回 dict,拿不到回 None。
+
+    ⛔ 一定要讀 **key=value**(`-of default=nw=0`),不可以用 `nk=1` 靠位置對應:
+       ffprobe 是照**它自己的欄位順序**印的(實測是 sample_fmt 排在 sample_rate
+       前面),照參數順序去 index 會拿到別的欄位 —— 我第一版就這樣把
+       channel_layout 當成 sample_fmt,浮點來源全被當成整數處理。"""
     try:
         r = subprocess.run([exe_probe, "-v", "error", "-select_streams", "a:0",
-                            "-show_entries", "stream=sample_rate,channels,channel_layout",
-                            "-of", "default=nw=1:nk=1", str(p)],
+                            "-show_entries", "stream=" + ",".join(_SHAPE_KEYS),
+                            "-of", "default=nw=0", str(p)],
                            capture_output=True, text=True, timeout=120)
-        vals = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
-        if r.returncode != 0 or len(vals) < 2:
+        if r.returncode != 0:
             return None
-        return "|".join(vals[:3])
+        got = {}
+        for line in (r.stdout or "").splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                if k.strip() in _SHAPE_KEYS:
+                    got[k.strip()] = v.strip()
+        if not {"sample_rate", "channels"} <= set(got):
+            return None
+        return got
     except Exception:
         return None
 
@@ -479,15 +505,18 @@ def _pcm_sha256(p: Path) -> str:
     ⭐ 用途:換容器、改 metadata、重新封裝都不會改變它,比較器據此擋掉
        「同一首歌換個殼再上場」(Codex R18-4)。
 
-    🔴 Codex R19-1 抓到的 false positive:舊版強制 `-ac 2 -ar 44100`,那是
-       **多對一**的正規化 —— 實測「48k 單聲道」與「由它轉成的 44.1k 雙單聲道」
-       雜湊完全相同,兩個結構不同的來源被硬判成同源。而且不同 ffmpeg/resampler
-       版本還可能反過來讓同一段聲音算出不同雜湊。
-       → 現在不做取樣率/聲道轉換,只把樣本格式統一成 s32le(無損上轉),
-         並把**原始結構**(rate|channels|layout)與版本字串一起餵進雜湊。
+    🔴 Codex R19-1:舊版強制 `-ac 2 -ar 44100` 是**多對一**正規化 —— 實測
+       「48k 單聲道」與「由它轉成的 44.1k 雙單聲道」雜湊完全相同。
+    🔴 Codex R20-P1-1:改成保留 rate/channels 之後,「一律轉 s32le」仍然不是無損 ——
+       實測兩組真實碰撞:① 1e-12 的浮點訊號被量化成 0,與靜音撞號;
+       ② 超出滿刻度的 1.1 與 1.2 被 clip 成同一個值。
+       → 現在**連樣本格式都保留**:浮點來源解成 f64le(f32→f64 精確),
+         整數來源才用 s32le(無損上轉),並把原始
+         rate|channels|layout|sample_fmt 與 canonical 格式一起餵進雜湊。
 
-    ⚠️ 邊界不變:它擋的是「解碼後在同一個格式面上位元相同」;lossy 重壓
-       (320k → 192k)會得到不同結果,那需要 acoustic fingerprint,本系統不做。
+    ⚠️ 邊界(都不假裝做得到):lossy 重壓、重新取樣、改聲道數都會得到不同身分;
+       跨 ffmpeg/decoder 版本也**不保證** bit-exact —— 但那個方向是「算不出相同」
+       (退回檔案雜湊那層),不會造成假的同源判定。
     ⚠️ 沒有 ffmpeg/ffprobe 或解碼失敗 → 回空字串,**呼叫端不要寫這個欄位**
        (寫空字串會被身分 schema 判成畸形 —— Codex R19-2 實測)。"""
     exe = shutil.which("ffmpeg")
@@ -497,14 +526,17 @@ def _pcm_sha256(p: Path) -> str:
     shape = _audio_shape(probe, p)
     if not shape:
         return ""
+    fmt = _canonical_fmt(shape.get("sample_fmt", ""))
     try:
         r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", str(p),
-                            "-map", "0:a:0", "-f", "s32le", "-"],
+                            "-map", "0:a:0", "-f", fmt, "-"],
                            capture_output=True, timeout=900)
         if r.returncode != 0 or not r.stdout:
             return ""
         h = hashlib.sha256()
-        h.update(f"{PCM_IDENTITY_CONTRACT}|{shape}|".encode("utf-8"))
+        # 固定順序組字串:dict 的順序不該影響身分
+        shape_txt = "|".join(f"{k}={shape.get(k, '')}" for k in _SHAPE_KEYS)
+        h.update(f"{PCM_IDENTITY_CONTRACT}|{shape_txt}|canonical={fmt}|".encode("utf-8"))
         h.update(r.stdout)
         return h.hexdigest()
     except Exception:

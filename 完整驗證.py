@@ -166,7 +166,16 @@ def main(argv=None) -> int:
     except ConfigError as e:
         print(f"VERIFY_BAD 設定值有問題:{e}")
         return 3
-    ap.add_argument("--timeout", type=float, default=default_timeout)
+    def _secs(raw):
+        """⛔ CLI 也要走同一個驗證(Codex R20-P2-3):`--timeout nan` 以前
+           會一路傳到 subprocess 才炸,而且訊息是「逾時 nans」。"""
+        try:
+            return positive_finite("--timeout", default_timeout, lo=0.0, hi=86400.0,
+                                   env={"--timeout": raw})
+        except ConfigError as e:
+            raise argparse.ArgumentTypeError(str(e))
+
+    ap.add_argument("--timeout", type=_secs, default=default_timeout)
     ap.add_argument("--python", default=None, help="用哪支直譯器跑評審團(預設:本程序)")
     a = ap.parse_args(argv)
     if not a.audio.exists():

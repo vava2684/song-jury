@@ -245,28 +245,38 @@ if ($hasEnv) {
     # ⚠️ PYTHONUTF8 要**存了再設、finally 還原**:這是呼叫者的環境,不是我們的
     #    (同檔金鑰探針那段已經是這個寫法;R17-5 抓到這裡漏了)。
     $oldUtf8Line = $env:PYTHONUTF8
-    $statusFile = Join-Path ([System.IO.Path]::GetTempPath()) "song-jury-demucs-$PID.json"
-    Remove-Item $statusFile -EA SilentlyContinue
+    # ⛔ 狀態檔要**不可預測**且用完就刪(Codex R20-P2-1):固定 %TEMP%\...-$PID.json
+    #    會被上一次的殘留(刪不掉時)或別的程序放的假檔誤導診斷。
+    $statusFile = Join-Path ([System.IO.Path]::GetTempPath()) `
+                            ("song-jury-demucs-" + [System.IO.Path]::GetRandomFileName() + ".json")
     $lineRc = 1
+    $lineStatus = $null
     try {
         $env:PYTHONUTF8 = "1"
         # ⛔ **不要**把子程序的輸出接進 PowerShell 管線(Codex R19-3):
         #    PS 5.1 在 cp950 下會用 big5 去解 UTF-8,捕捉到的字串本身就壞掉
-        #    (韓文/emoji 直接變 ?),2>&1 還會把 stderr 包成 ErrorRecord,
-        #    Out-String 再灌進一整段 PowerShell 診斷。讓它直接寫終端最乾淨:
-        #    即時、原汁原味、沒有編碼中間人。
+        #    (韓文/emoji 直接變 ?),2>&1 還會把 stderr 包成 ErrorRecord。
+        #    讓它直接寫終端最乾淨:即時、原汁原味、沒有編碼中間人。
         & .venv\Scripts\python.exe 分軌線檢查.py --status-json $statusFile
         $lineRc = $LASTEXITCODE
+        if (Test-Path $statusFile) {
+            try { $lineStatus = (Get-Content $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json) }
+            catch { Warn "分軌線體檢的狀態檔讀不了($($_.Exception.Message))—— 只依退出碼判斷" }
+        }
     } finally {
         if ($null -eq $oldUtf8Line) { Remove-Item Env:PYTHONUTF8 -EA SilentlyContinue }
         else { $env:PYTHONUTF8 = $oldUtf8Line }
+        Remove-Item $statusFile -Force -EA SilentlyContinue    # ⛔ 中斷也要清
     }
-    # ⭐ 判斷一律讀機器可讀的 UTF-8 JSON,不 grep 人類訊息
-    $lineStatus = $null
-    if (Test-Path $statusFile) {
-        try { $lineStatus = (Get-Content $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json) }
-        catch { Warn "分軌線體檢的狀態檔讀不了($($_.Exception.Message))—— 只能靠退出碼判斷" }
-        Remove-Item $statusFile -EA SilentlyContinue
+    # ⭐ 狀態檔只是**診斷用**的補充,而且必須與實際退出碼一致才採信
+    #    (Codex R20-P2-1:殘留或被改過的檔案會把 rc=4 說成設定問題)。
+    #    成功與否**永遠只看實際 rc**,狀態檔不能把失敗說成成功。
+    if ($lineStatus -and (
+            ("$($lineStatus.rc)" -ne "$lineRc") -or
+            ([bool]$lineStatus.ok -ne ($lineRc -eq 0)) -or
+            [string]::IsNullOrWhiteSpace("$($lineStatus.kind)"))) {
+        Warn "分軌線體檢的狀態檔與實際結果不一致(檔案 rc=$($lineStatus.rc)/ok=$($lineStatus.ok),實際 rc=$lineRc)—— 已忽略狀態檔"
+        $lineStatus = $null
     }
     $lineKind = if ($lineStatus) { "$($lineStatus.kind)" } else { "" }
     $hasDemucs = ($lineRc -eq 0)

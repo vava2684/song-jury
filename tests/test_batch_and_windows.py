@@ -56,6 +56,10 @@ _八柱 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實
 # ⚠️ R16 起批次會過獨立裁判(full)或 local 契約檢查 → fixture 要是「真的合格」的報告
 完整JSON = {
     "scoring_contract": "2026-07-25-v1",
+    # ⚠️ R20 起「本輪新產物」一律 strict:批次剛跑完的報告要帶完整身分
+    "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64,
+    "source_audio_pcm_sha256": "c" * 64,
+    "source_audio_pcm_contract": "pcm-v3/native-rate/native-layout/native-sample-fmt",
     "pillar_totals": {
         "完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
         "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in _八柱},
@@ -270,3 +274,19 @@ def test_下游分析拒絕沒有契約的store(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as ei:
         Q.main()
     assert "batch_contract" in str(ei.value) or "舊格式" in str(ei.value)
+
+
+def test_full模式對本輪新產物要用strict身分(monkeypatch, tmp_path):
+    """🔴 Codex R20-P1-2:批次剛跑完的報告是**本輪新產物**,卻只用相容驗證 ——
+    產出端半殘(少寫身分)時整批照樣靜靜收件。這條路徑前面還會先刪舊產物,
+    沒有任何為 legacy 放寬的理由。"""
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    半殘 = json.loads(json.dumps(完整JSON, ensure_ascii=False))
+    半殘.pop("source_audio_pcm_sha256")
+    半殘.pop("source_audio_pcm_contract")
+    monkeypatch.setattr(B, "FULL_MODE", True)
+    _stub_run(monkeypatch, returncode=0, write_json=半殘)
+    d, err = B.run_one(song)
+    assert d is None, "🔴 少了解碼身分的新產物被收進批次表了"
+    assert "身分" in err

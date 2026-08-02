@@ -54,7 +54,10 @@ def _venv_py(venv):
 # ⛔ 不可以直接 int(env)(Codex R19-5):打錯字會在載入階段變成裸 ValueError,
 #    網頁版連起不起得來都看不出原因。設定值一律走共用解析器。
 try:
-    _JOB_TIMEOUT = int(positive_finite("SONG_JURY_WEB_TIMEOUT", 7200.0, lo=0.0, hi=86400.0))
+    # ⛔ 不可以直接 int():0.5 秒是合法的正數,int() 會截成 0 —— 又變回
+    #    「非正數逾時」那個 bug(Codex R20-P2-3)。至少留 1 秒。
+    _JOB_TIMEOUT = max(1, round(positive_finite("SONG_JURY_WEB_TIMEOUT", 7200.0,
+                                                lo=0.0, hi=86400.0)))
 except ConfigError as _e:
     raise SystemExit(f"⛔ 設定值有問題:{_e}")
 

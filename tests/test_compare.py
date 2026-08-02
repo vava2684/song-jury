@@ -40,6 +40,8 @@ def _report(tmp_path, name, scores, contract="2026-07-25-v1",
     doc = {"scoring_contract": contract, "pillar_totals": pt,
            "source_file_sha256": audio_sha or (f"{abs(hash(seed)):064x}"[:64]),
            "source_audio_pcm_sha256": pcm_sha or (f"{abs(hash((seed, 'p'))):064x}"[:64]),
+           # ⚠️ 解碼雜湊一定要配版本(R20:沒版本的雜湊不採用,strict 也會擋)
+           "source_audio_pcm_contract": V.PCM_CONTRACTS[0],
            "evaluation_id": eval_id or f"{abs(hash((seed, 'e'))):032x}"[:32]}
     p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     return p
@@ -316,7 +318,8 @@ def test_舊格式報告要誠實標示身分防線比較弱(tmp_path):
     b = _report(tmp_path, "舊乙", 80)
     for f in (a, b):
         d = json.loads(f.read_text(encoding="utf-8"))
-        for k in ("source_file_sha256", "source_audio_pcm_sha256", "evaluation_id"):
+        for k in ("source_file_sha256", "source_audio_pcm_sha256",
+                  "source_audio_pcm_contract", "evaluation_id"):
             d.pop(k, None)
         f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
     out = C.compare_pk([a, b], "zh")
@@ -420,9 +423,10 @@ def test_證據等級要說清楚強到哪裡(tmp_path):
     a, b = _report(tmp_path, "甲", 70), _report(tmp_path, "乙", 80)
     assert C.compare_pk([a, b], "zh")["source_identity"]["level"] == "decoded-audio"
 
-    for f in (a, b):                      # 拿掉解碼後雜湊 → 降級
+    for f in (a, b):                      # 拿掉解碼後雜湊(連版本)→ 降級
         d = json.loads(f.read_text(encoding="utf-8"))
         d.pop("source_audio_pcm_sha256")
+        d.pop("source_audio_pcm_contract", None)
         f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
     out = C.compare_pk([a, b], "zh")
     assert out["source_identity"]["level"] == "exact-file"
@@ -461,9 +465,11 @@ def test_安裝證據要求三個身分欄位都在(tmp_path):
     下游卻只剩最弱的證據 —— 所以 strict 模式三個都要(Codex R19-2)。"""
     full = {"scoring_contract": "2026-07-25-v1",
             "evaluation_id": "a" * 32, "source_file_sha256": "b" * 64,
-            "source_audio_pcm_sha256": "c" * 64}
+            "source_audio_pcm_sha256": "c" * 64,
+            "source_audio_pcm_contract": V.PCM_CONTRACTS[0]}
     base = json.loads(_report(tmp_path, "甲", 70).read_text(encoding="utf-8"))
-    for drop in ("evaluation_id", "source_file_sha256", "source_audio_pcm_sha256"):
+    for drop in ("evaluation_id", "source_file_sha256", "source_audio_pcm_sha256",
+                 "source_audio_pcm_contract"):
         d = {**base, **full}
         d.pop(drop)
         raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
@@ -479,7 +485,7 @@ def test_不同PCM版本的雜湊不可以互比(tmp_path):
     日後改演算法時新舊報告會被當成同一種 identity 硬比。"""
     a = _report(tmp_path, "甲", 70, pcm_sha="e" * 64)
     b = _report(tmp_path, "乙", 80, pcm_sha="e" * 64)   # 同雜湊、不同版本
-    for f, ver in ((a, "pcm-v2/native-rate/native-layout/s32le"), (b, "pcm-v9/未來版")):
+    for f, ver in ((a, V.PCM_CONTRACTS[0]), (b, "pcm-v9/未來版")):
         d = json.loads(f.read_text(encoding="utf-8"))
         d["source_audio_pcm_contract"] = ver
         f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")

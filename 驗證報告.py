@@ -83,7 +83,9 @@ IDENTITY_FIELDS = {
     "source_audio_sha256": (_HEX64, "64 位小寫 hex(R17 舊名)"),
 }
 # 認得的解碼身分版本(⛔ 換標準面 = 換一把尺,新舊不可互比 —— Codex R19-1)
-PCM_CONTRACTS = ("pcm-v2/native-rate/native-layout/s32le",)
+# ⛔ v2(一律 s32le)已被證明會把不同的浮點來源撞成同一個身分(Codex R20-P1-1),
+#    所以**不列在認得的版本裡** —— 舊 v2 報告會誠實退回 exact-file,不再當同源硬證據。
+PCM_CONTRACTS = ("pcm-v3/native-rate/native-layout/native-sample-fmt",)
 
 
 def identity_problem(d: dict) -> str:
@@ -104,6 +106,9 @@ def identity_problem(d: dict) -> str:
     c = d.get("source_audio_pcm_contract")
     if c is not None and (not isinstance(c, str) or not c.strip()):
         return f"source_audio_pcm_contract 不是合法的版本字串(拿到 {c!r:.40})"
+    # ⛔ 有版本卻沒雜湊是無意義的組合(Codex R20-P1-2):版本是用來描述那個雜湊的
+    if c and not d.get("source_audio_pcm_sha256"):
+        return "有 source_audio_pcm_contract 卻沒有對應的 source_audio_pcm_sha256"
     return ""
 
 
@@ -141,11 +146,17 @@ def validate_data(raw: bytes, name: str = "<memory>", require_contract: bool = F
         # ⛔ 一定要含解碼後雜湊(Codex R19-2):安裝本來就強制 ffmpeg,
         #    產出端若迴歸成不算 PCM,九柱照樣 VERIFY_OK,下游卻只剩最弱的證據。
         need = [k for k in ("evaluation_id", "source_file_sha256",
-                            "source_audio_pcm_sha256")
+                            "source_audio_pcm_sha256", "source_audio_pcm_contract")
                 if not d.get(k)]
         if need:
             return (f"報告缺少來源身分欄位 {need} —— 這個模式要求新版產出端的完整證據"
                     f"(舊格式相容只給既有報告用;PCM 雜湊要有 ffmpeg/ffprobe)")
+        # ⛔ 雜湊與版本一定要**成對**,而且版本必須是認得的(Codex R20-P1-2):
+        #    「有雜湊、沒版本」以前照樣過 strict,下游還會把它當成最高等級的證據。
+        pc = d.get("source_audio_pcm_contract")
+        if pc not in PCM_CONTRACTS:
+            return (f"不認得的解碼身分版本:{pc!r} —— 認得的是 {list(PCM_CONTRACTS)}"
+                    f"(換過標準面的舊報告請用新版重評)")
 
     # ⭐ 計分契約:報告自報版本 → 裁判查表拿權重與柱集合。
     # ⛔ 不認得的版本一律拒收:那可能是新契約(裁判要跟上)或竄改,

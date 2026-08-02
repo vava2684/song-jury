@@ -39,6 +39,7 @@
 """
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -50,8 +51,16 @@ sys.path.insert(0, str(BASE))
 
 # ⛔ 模組清單與「用哪支 python」都跟評審團.py 拿,不可以在這裡另抄一份 ——
 #    抄了就會有「安裝器說可以、實際跑分說不行」的兩套真理(Codex R13 的老 bug)。
-from 評審團 import DEMUCS_LINE_MODS, DEMUCS_PY   # noqa: E402
 from 設定讀取 import ConfigError, positive_finite   # noqa: E402
+
+# ⛔ 評審團.py 很重(它自己也會做環境解析)—— import 階段爆掉的話,舊版是
+#    裸 traceback rc=1,連 bootstrap 都來不及接(Codex R20-P2-2 實測)。
+#    先接住,等 main() 在保護傘裡才丟出來 → 收斂成 rc=4 並寫得出狀態檔。
+try:
+    from 評審團 import DEMUCS_LINE_MODS, DEMUCS_PY   # noqa: E402
+    _IMPORT_ERROR = None
+except Exception as _imp_err:      # noqa: BLE001
+    DEMUCS_LINE_MODS, DEMUCS_PY, _IMPORT_ERROR = (), "", _imp_err
 
 RETRY_PAUSE = 5.0
 BUDGET_ENV = "SONG_JURY_DEMUCS_PROBE_TIMEOUT"
@@ -172,13 +181,22 @@ def _write_status(path, **fields):
        靠「解析人類訊息找 RECOVERED / missing_module」本來就不該是契約。"""
     if not path:
         return
+    # ⛔ 原子寫入(Codex R20-P2-1):中斷或競速時,半份 JSON 會讓安裝器讀到殘缺狀態。
+    # ⛔ 例外一律吃下來,但**要說出來**:狀態檔寫不出來只代表「只能靠退出碼」,
+    #    不可以讓它把整支 helper 帶進未分類的失敗(那會被讀成別的意思)。
     try:
-        Path(path).write_text(json.dumps(fields, ensure_ascii=False), encoding="utf-8")
-    except OSError as e:
+        p = Path(path)
+        tmp = p.with_name(p.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(fields, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception as e:      # noqa: BLE001
         print(f"⚠ 狀態檔寫不出來({type(e).__name__});安裝器只能靠退出碼判斷", flush=True)
 
 
 def main(argv=None) -> int:
+    if _IMPORT_ERROR is not None:
+        # 在保護傘裡丟出來 → bootstrap 收斂成 internal_error / rc 4
+        raise _IMPORT_ERROR
     args = list(argv) if argv is not None else sys.argv[1:]
     status = None
     if "--status-json" in args:
@@ -194,6 +212,7 @@ def main(argv=None) -> int:
         return 2
     try:
         res = probe(py)
+        return _report_result(res, py, status)
     except ConfigError as e:
         # ⛔ 設定錯誤有自己的碼:被歸進 rc=1 的話,安裝器會叫人重裝 requirements
         print(f"DEMUCS_LINE_BAD 設定值有問題\n"
@@ -210,6 +229,14 @@ def main(argv=None) -> int:
         _write_status(status, ok=False, kind=INTERNAL, rc=4,
                       why=f"{type(e).__name__}: {e}", recovered=False)
         return 4
+
+
+def _report_result(res, py, status) -> int:
+    """把 LineResult 翻成輸出 + 狀態檔 + 退出碼。
+
+    ⛔ 這段也要在 main 的保護傘裡(Codex R20-P2-2):舊版只包住 probe(),
+       之後讀 res.ok / 格式化訊息 / 寫狀態檔若出事,就變成裸 traceback rc=1,
+       而 1 在安裝器眼裡是「缺套件」。"""
     if res.ok:
         print(f"DEMUCS_LINE_OK {py}")
         if res.recovered:
@@ -232,5 +259,33 @@ def main(argv=None) -> int:
     return rc
 
 
+def bootstrap(argv=None) -> int:
+    """最外層保護傘:**任何**未預期例外都收斂成 4,並盡量把 status 寫出去。
+
+    🔴 Codex R20-P2-2 實測:probe() 回 None 之後讀 res.ok 會 AttributeError → rc=1;
+       import-time 例外更是連 main 都進不去 → rc=1 + 裸 traceback。
+       1 在安裝器眼裡是「缺套件」,於是工具自己的 bug 會叫使用者去重裝幾 GB。
+    ⚠️ KeyboardInterrupt / SystemExit 不在這裡吃掉:那是使用者或呼叫端的決定。"""
+    args = list(sys.argv[1:] if argv is None else argv)
+    status = None
+    if "--status-json" in args:
+        i = args.index("--status-json")
+        status = args[i + 1] if i + 1 < len(args) else None
+    try:
+        return main(args)
+    except Exception as e:      # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        print(f"DEMUCS_LINE_BAD 分軌線體檢自己出錯了\n"
+              f"           種類:{INTERNAL}\n"
+              f"           實際:{type(e).__name__}: {e}")
+        try:
+            _write_status(status, ok=False, kind=INTERNAL, rc=4,
+                          why=f"{type(e).__name__}: {e}", recovered=False)
+        except Exception:       # noqa: BLE001
+            pass
+        return 4
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(bootstrap())

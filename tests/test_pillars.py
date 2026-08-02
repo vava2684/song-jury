@@ -201,3 +201,58 @@ def test_不同取樣率與聲道的版本不可以撞成同一個身分(tmp_pat
     hm, hd = J._pcm_sha256(mono), J._pcm_sha256(dual)
     assert hm and hd, "兩個都要算得出來"
     assert hm != hd, "🔴 不同取樣率/聲道的版本撞成同一個身分 —— 會被硬判同源"
+
+
+def _f32(path, expr, dur=0.2):
+    import subprocess as _sp
+    _sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", f"aevalsrc={expr}:s=48000:d={dur}",
+             "-c:a", "pcm_f32le", "-ac", "1", str(path)], check=True, timeout=300)
+
+
+@pytest.mark.parametrize("a_expr,b_expr,why", [
+    ("0", "0.000000000001*sin(t)", "低於 s32 最小刻度的浮點訊號會被量化成 0"),
+    ("1.1", "1.2", "超出滿刻度的浮點會被 clip 成同一個值"),
+])
+def test_浮點來源不可以在正規化時撞成同一個身分(tmp_path, a_expr, b_expr, why):
+    """🔴 Codex R20-P1-1 實測兩組真實碰撞:一律轉 s32le **不是**無損 ——
+    {why}。浮點來源要留在浮點面上(f32→f64 精確),否則兩個不同的音訊
+    會拿到同一個解碼身分,然後被比較器硬判成同源。"""
+    import shutil as _sh
+    from conftest import load as _load
+    if not (_sh.which("ffmpeg") and _sh.which("ffprobe")):
+        pytest.skip("這台沒有 ffmpeg/ffprobe")
+    J = _load("評審團")
+    a, b = tmp_path / "a.wav", tmp_path / "b.wav"
+    _f32(a, a_expr)
+    _f32(b, b_expr)
+    assert J._file_sha256(a) != J._file_sha256(b), "fixture 本身要是兩個不同的檔"
+    ha, hb = J._pcm_sha256(a), J._pcm_sha256(b)
+    assert ha and hb, "兩邊都要算得出身分"
+    assert ha != hb, f"🔴 {why} —— 兩個不同的音訊撞成同一個解碼身分"
+
+
+def test_浮點來源要用浮點面_整數來源才用s32(tmp_path):
+    """canonical 格式由**原始樣本格式**決定,不是一律 s32le。"""
+    from conftest import load as _load
+    J = _load("評審團")
+    assert J._canonical_fmt("flt") == "f64le"
+    assert J._canonical_fmt("fltp") == "f64le"
+    assert J._canonical_fmt("dblp") == "f64le"
+    assert J._canonical_fmt("s16") == "s32le"
+    assert J._canonical_fmt("") == "s32le"
+
+
+def test_ffprobe要讀keyvalue不可以靠欄位順序(tmp_path):
+    """🔴 自己踩到:ffprobe 是照**它自己的順序**印的(sample_fmt 排在 sample_rate
+    前面),用 `nk=1` 靠位置對應會把 channel_layout 當成 sample_fmt ——
+    浮點來源全被當成整數處理,R20-P1-1 的修法整個失效。"""
+    import shutil as _sh
+    from conftest import REPO as R, load as _load
+    if not _sh.which("ffprobe"):
+        pytest.skip("這台沒有 ffprobe")
+    J = _load("評審團")
+    shape = J._audio_shape(_sh.which("ffprobe"), R / "demo_mix.wav")
+    assert isinstance(shape, dict), "要回 dict(key=value),不是靠位置的 list"
+    assert shape.get("sample_rate") and shape.get("channels")
+    assert "sample_fmt" in shape

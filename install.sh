@@ -278,16 +278,39 @@ HAS_DEMUCS=0
 if [ "$HAS_ENV" = 1 ]; then
   # ⛔ 輸出直接給終端(即時、不經手);判斷讀機器可讀的 UTF-8 JSON,不 grep 人類訊息
   #    (Codex R19-3:靠解析中文訊息本來就不該是契約,換個 code page 就會壞)
+  # ⛔ mktemp 已經是私密隨機名;再加 trap 保證中斷也清掉(Codex R20-P2-1)
   _line_status="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX")"
+  trap 'rm -f "$_line_status"' EXIT INT TERM
   PYTHONUTF8=1 .venv/bin/python 分軌線檢查.py --status-json "$_line_status"
   LINE_RC=$?
   LINE_KIND=""
   LINE_RECOVERED=""
   if [ -s "$_line_status" ]; then
-    LINE_KIND=$(PYTHONUTF8=1 .venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8')).get('kind',''))" "$_line_status" 2>/dev/null)
-    LINE_RECOVERED=$(PYTHONUTF8=1 .venv/bin/python -c "import json,sys;print('1' if json.load(open(sys.argv[1],encoding='utf-8')).get('recovered') else '')" "$_line_status" 2>/dev/null)
+    # ⭐ 狀態檔只是診斷補充:**必須與實際 rc 一致**才採信,成功與否永遠只看實際 rc。
+    #    (殘留或被改過的檔案會把 rc=4 說成設定問題 —— 那會給出完全錯的修復指示)
+    _line_json=$(PYTHONUTF8=1 .venv/bin/python - "$_line_status" "$LINE_RC" <<'PYCHK'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    rc = int(sys.argv[2])
+    ok_matches = bool(d.get("ok")) == (rc == 0)
+    if str(d.get("rc")) != str(rc) or not ok_matches or not str(d.get("kind") or "").strip():
+        print("MISMATCH")
+    else:
+        print((d.get("kind") or "") + "\t" + ("1" if d.get("recovered") else ""))
+except Exception:
+    print("MISMATCH")
+PYCHK
+)
+    if [ "$_line_json" = "MISMATCH" ]; then
+      warn "分軌線體檢的狀態檔與實際結果不一致 —— 已忽略狀態檔,只依退出碼判斷"
+    else
+      LINE_KIND=${_line_json%%	*}
+      LINE_RECOVERED=${_line_json##*	}
+    fi
   fi
   rm -f "$_line_status"
+  trap - EXIT INT TERM
   if [ "$LINE_RC" = 0 ]; then
     HAS_DEMUCS=1
     if [ -n "$LINE_RECOVERED" ]; then
