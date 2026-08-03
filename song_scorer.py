@@ -26,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 
+from 暫存清理 import force_rmtree
+
 # Windows 繁中主控台預設 cp950,印不出報告的全形符號,強制改用 UTF-8
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -667,9 +669,12 @@ def separate_with_demucs(mix_path, owned_out=None):
                         "-o", str(out), str(mix_path)], check=True)
         return str(next(out.rglob("vocals.wav"))), out
     except Exception:
-        if owned_out is not None and out in owned_out:
+        # ⛔ **確認真的刪掉了才可以放掉 owner**(Codex R28-P1-1):舊版先移除再
+        #    ignore_errors 刪 —— 刪除也失敗時目錄還在、卻已經沒有人負責它,
+        #    外層 finally 不會再試,也沒有人告訴使用者那裡有一整份分軌。
+        left = force_rmtree(out)
+        if not left and owned_out is not None and out in owned_out:
             owned_out.remove(out)
-        shutil.rmtree(out, ignore_errors=True)
         raise
 
 
@@ -765,13 +770,20 @@ def main():
                 json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
             print(f"\nJSON 報告已存至:{args.json_out}")
     finally:
-        for _d in _owned_tmp:
-            _left = _d if Path(_d).exists() else None
-            shutil.rmtree(_d, ignore_errors=True)
-            if Path(_d).exists():
-                print(f"⛔ 分軌暫存沒清乾淨:{_d}(裡面是一整份分軌,請手動刪掉)",
+        # ⛔ 收尾失敗不可以無聲、也不可以沿用「一切正常」的退出碼(Codex R28-P1-1):
+        #    那裡面是一整份分軌。有例外正在往外傳時就只報告(退出碼本來就非零),
+        #    正常跑完卻清不掉 → 用專屬的 4(與 評審團.py 同一個語意)。
+        _dirty = [x for x in (force_rmtree(_d) for _d in _owned_tmp) if x]
+        if _dirty:
+            for _x in _dirty:
+                print(f"⛔ 分軌暫存沒清乾淨:{_x}(裡面是一整份分軌,請手動刪掉)",
                       file=sys.stderr)
-            _ = _left
+            # ⚠️ 「正常結束」包含 sys.exit(0)(CLI 的正常收場)——
+            #    只看 exc_info 是不是 None 的話,那條路會靜靜地回 0(自己踩到)。
+            _exc = sys.exc_info()[1]
+            if _exc is None or (isinstance(_exc, SystemExit)
+                                and _exc.code in (None, 0)):
+                sys.exit(4)
 
 
 if __name__ == "__main__":

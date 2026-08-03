@@ -37,6 +37,7 @@ ENV = {**os.environ, "PYTHONUTF8": "1"}
 
 # 鎖檔的全域位置(⛔ 不放 BASE:兩份 ZIP 副本會各鎖各的,互斥失效 —— Codex R10)
 from 狀態目錄 import locks_dir, state_root, StateDirError, safe_open_lock
+from 暫存清理 import force_rmtree
 from 子程序 import run_tree
 
 # Windows:子程序不要各自彈出主控台黑框(一次評測會開好幾個子程序)。Linux 無此旗標 → 空 dict。
@@ -1299,36 +1300,10 @@ def main():
     sys.exit(rc)
 
 
-def _force_rmtree(d: Path, retries: int = 3, pause: float = 0.25) -> str:
-    """盡力刪掉整個目錄;回「還在的路徑」(空字串 = 真的乾淨了)。
-
-    🔴 Codex R24-P1-1 實測:舊版是 `shutil.rmtree(d, ignore_errors=True)` ——
-       Windows 上兩種很普通的情況都會刪失敗,而那個旗標把失敗**整個吞掉**:
-       ① 來源是唯讀檔(copy2 連唯讀屬性一起複製過來);
-       ② 快照還被某個 handle 開著(防毒、索引、剛結束的子程序)。
-       結果是一整份**可能還沒公開**的歌留在系統 TEMP 裡,而且完全沒有訊息。
-    ⭐ 所以:唯讀就 chmod 再刪、短暫重試、最後**回報真相**由呼叫端決定怎麼辦。"""
-    def _fix_and_retry(func, path, _exc):
-        try:
-            os.chmod(path, stat.S_IWRITE)
-            func(path)
-        except OSError:
-            pass                       # 這一輪失敗沒關係,外層還會再試
-
-    # ⚠️ onerror 在 3.12 起被 onexc 取代:兩個都給不行(TypeError),要挑一個
-    kw = ({"onexc": _fix_and_retry} if sys.version_info >= (3, 12)
-          else {"onerror": _fix_and_retry})
-    for i in range(retries):
-        if not d.exists():
-            return ""
-        try:
-            shutil.rmtree(d, **kw)
-        except OSError:
-            pass
-        if not d.exists():
-            return ""
-        time.sleep(pause)
-    return str(d) if d.exists() else ""
+# ⛔ 實作只留一份(暫存清理.force_rmtree):這套系統有四種暫存,每一種裡面
+#    都可能是一整份音訊/分軌/歌詞 —— 規則各寫一份遲早有人漏掉一半(R24~R28
+#    每一輪都在同一個地方跌倒)。
+_force_rmtree = force_rmtree
 
 
 @contextlib.contextmanager

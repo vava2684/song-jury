@@ -560,3 +560,49 @@ def test_探測音訊結構不可以用系統code_page解輸出(monkeypatch, tmp
     assert shape and shape["sample_fmt"] == "s16", \
         f"🔴 沒有指定 encoding —— 這台機器會靜靜地失去解碼身分:{shape}"
     J.subprocess.run = real_run
+
+
+# ── 分軌快取的暫存(Codex R28-P2-3)────────────────────────────────
+def test_沒人在寫的舊分軌暫存要被回收(tmp_path, monkeypatch):
+    """🔴 Codex R28-P2-3:`_stems/.tmp_*` 只清「自己這次的」,而且全部
+    ignore_errors —— 程序被強制終止之後,那份 `.tmp_*` 裡可能是**整套分軌**,
+    而它是隱藏目錄,使用者幾乎不可能發現。"""
+    import os as _os
+    import time as _t
+    from conftest import load as _load
+    C = _load("分軌快取")
+    stems = tmp_path / "_stems"
+    stems.mkdir()
+    dead = stems / ".tmp_舊的_1234_abcd"
+    dead.mkdir()
+    (dead / "vocals.flac").write_bytes(b"FLAC" + b"x" * 200)
+    old = _t.time() - 99999
+    _os.utime(dead, (old, old))
+    assert C.sweep_stale_tmp(stems, grace=60) == 1, "🔴 舊的 .tmp_ 沒被回收"
+    assert not dead.exists()
+
+
+def test_有人正在寫的分軌暫存絕不可以被回收(tmp_path):
+    """⛔ 判「還有沒有人在寫」只能靠鎖:PID 會被重用,跨機器共享目錄時
+    別台的 PID 在這台毫無意義。這條證明鎖真的擋得住。"""
+    import os as _os
+    import time as _t
+    from conftest import load as _load
+    C = _load("分軌快取")
+    T = _load("暫存清理")
+    stems = tmp_path / "_stems"
+    stems.mkdir()
+    live = stems / ".tmp_寫到一半_999_beef"
+    live.mkdir()
+    (live / "vocals.flac").write_bytes(b"FLAC")
+    hold = T.take(live / ".lock")               # 模擬「另一個程序正在寫」
+    assert hold is not None
+    old = _t.time() - 99999
+    _os.utime(live, (old, old))
+    try:
+        assert C.sweep_stale_tmp(stems, grace=60) == 0, "🔴 把正在寫的分軌刪掉了"
+        assert (live / "vocals.flac").exists()
+    finally:
+        T.release(hold)
+    # 寫的人走了之後才可以收
+    assert C.sweep_stale_tmp(stems, grace=60) == 1

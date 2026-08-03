@@ -755,25 +755,43 @@ def test_上傳補正檔複製到一半失敗也不可以留下暫存(tmp_path, 
     assert owned == [], "🔴 已經刪掉的目錄還留在 owned 裡(main 會再刪一次並誤報)"
 
 
-def _load_song_scorer():
+def _load_song_scorer(monkeypatch):
     """載入 song_scorer,但不需要它那些重量級相依。
 
-    ⛔ 不可以改成「沒有 librosa 就 skip」:那樣 CI(刻意不裝 librosa)永遠驗不到
-       這兩條,對應的變異也會變成「無法驗證」—— 覆蓋面靜靜縮小。
-    ⚠️ 我們只呼叫 separate_with_demucs,它完全不碰 librosa。"""
+    ⛔ 不可以改成「沒有 librosa 就 skip」:那樣 CI(刻意不裝 librosa)永遠驗不到,
+       對應的變異也會變成「無法驗證」—— 覆蓋面靜靜縮小。
+    ⛔ 也不可以直接塞進 sys.modules 就不管(Codex R28-P2-5):假模組會**留在全域**,
+       之後任何 `import librosa/scipy/...` 都會拿到「對任何屬性回 lambda」的假貨,
+       測試順序一變就可能以錯誤的理由通過或失敗。用 monkeypatch.setitem 自動還原。
+    ⚠️ 我們只呼叫 separate_with_demucs / main 的收尾,完全不碰 librosa 的真功能。"""
     import types as _t
     for name in ("librosa", "pyloudnorm", "parselmouth", "soundfile", "scipy"):
         if name not in sys.modules:
             mod = _t.ModuleType(name)
             mod.__getattr__ = lambda _n: (lambda *a, **k: None)
-            sys.modules[name] = mod
+            monkeypatch.setitem(sys.modules, name, mod)
     return load("song_scorer")
+
+
+def test_假模組不可以留在全域(monkeypatch):
+    """⛔ 這條專門守 P2-5:載入完之後,原本不存在的模組不可以還留在 sys.modules。"""
+    before = {n for n in ("librosa", "pyloudnorm", "parselmouth", "soundfile", "scipy")
+              if n in sys.modules}
+
+    def _inner(mp):
+        _load_song_scorer(mp)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _inner(mp)
+    after = {n for n in ("librosa", "pyloudnorm", "parselmouth", "soundfile", "scipy")
+             if n in sys.modules}
+    assert after == before, f"🔴 假模組留在全域了:{sorted(after - before)}"
 
 
 def test_song_scorer的分軌暫存要有人清(tmp_path, monkeypatch):
     """🔴 Codex R27-P1-2:`song_scorer.py --demucs` 的 `tempfile.mkdtemp()` 沒有主人 ——
     那裡面是 Demucs 的**完整分軌**(等於整首歌再一份),不是一個小 JSON。"""
-    S = _load_song_scorer()
+    S = _load_song_scorer(monkeypatch)
     iso = tmp_path / "temp"
     iso.mkdir()
     monkeypatch.setattr(S.tempfile, "tempdir", str(iso)) if hasattr(S, "tempfile") else None
@@ -801,16 +819,101 @@ def test_song_scorer的分軌暫存要有人清(tmp_path, monkeypatch):
         _sh.rmtree(x, ignore_errors=True)
     assert sorted(x.name for x in iso.iterdir()) == [], \
         f"🔴 分軌暫存留下來了:{sorted(x.name for x in iso.iterdir())}"
-    # 而且 main 真的有那條 finally(不是只有函式回傳而已)
-    src = (REPO / "song_scorer.py").read_text(encoding="utf-8")
-    assert "for _d in _owned_tmp:" in src and "finally:" in src, \
-        "🔴 main 沒有負責清掉暫存目錄"
+
+
+# ⚠️ 「正常」= CLI 的正常收場(sys.exit(0));「失敗」= 非零退出;「中斷」= Ctrl+C。
+#    三條都要進到同一個 finally —— 那正是這條在守的東西。
+@pytest.mark.parametrize("how", ["正常", "失敗", "中斷"])
+def test_song_scorer的main一定會收掉分軌暫存(tmp_path, monkeypatch, how):
+    """🔴 Codex R28-P2-4:舊版只 grep 原始碼有沒有 `for _d in _owned_tmp:` 與
+    `finally:` —— 把整段清理放進 `if False` 但留著那一行,測試照樣綠。
+    ⛔ 這條**真的呼叫 main()**:把昂貴的分析換成 stub,只留收尾這件事。"""
+    S = _load_song_scorer(monkeypatch)
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(iso))
+    mix = tmp_path / "mix.wav"
+    mix.write_bytes(b"RIFF0000")
+    made = {}
+
+    def fake_sep(path, owned_out=None):
+        d = Path(_tf.mkdtemp(prefix="song-jury-demucs-"))
+        (d / "vocals.wav").write_bytes(b"RIFF" + b"v" * 300)
+        if owned_out is not None:
+            owned_out.append(d)
+        made["d"] = d
+        return str(d / "vocals.wav"), d
+
+    monkeypatch.setattr(S, "separate_with_demucs", fake_sep)
+
+    def _boom_mix(*a, **k):
+        if how == "失敗":
+            raise SystemExit(3)
+        if how == "中斷":
+            raise KeyboardInterrupt()
+        raise SystemExit(0)        # 正常收場
+
+    monkeypatch.setattr(S, "analyze_mix", _boom_mix)
+    monkeypatch.setattr(S.sys, "argv", ["song_scorer.py", str(mix), "--demucs"])
+    exc = KeyboardInterrupt if how == "中斷" else SystemExit
+    with pytest.raises(exc):
+        S.main()
+    assert made, "🔴 這次沒有走到分軌那一步,等於沒驗到"
+    assert not made["d"].exists(), f"🔴 main 沒有收掉分軌暫存({how}):{made['d']}"
+    assert sorted(x.name for x in iso.iterdir()) == [], \
+        f"🔴 TEMP 還有殘留({how}):{sorted(x.name for x in iso.iterdir())}"
+
+
+def test_song_scorer清不掉時要用專屬退出碼(tmp_path, monkeypatch):
+    """🔴 Codex R28-P1-1:正常評分完成、但收尾刪不掉時,舊版只印一行就以
+    **退出碼 0** 結束 —— 只看退出碼的自動化永遠不知道那裡留了一整份分軌。"""
+    S = _load_song_scorer(monkeypatch)
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(iso))
+    mix = tmp_path / "mix.wav"
+    mix.write_bytes(b"RIFF0000")
+    stuck = Path(_tf.mkdtemp(prefix="song-jury-demucs-"))
+    (stuck / "vocals.wav").write_bytes(b"RIFF")
+
+    monkeypatch.setattr(S, "separate_with_demucs",
+                        lambda p, owned_out=None: (owned_out.append(stuck),
+                                                   (str(stuck / "vocals.wav"), stuck))[1])
+    monkeypatch.setattr(S, "analyze_mix",
+                        lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+    monkeypatch.setattr(S, "force_rmtree", lambda d, **kw: str(d))    # 假裝刪不掉
+    monkeypatch.setattr(S.sys, "argv", ["song_scorer.py", str(mix), "--demucs"])
+    with pytest.raises(SystemExit) as e:
+        S.main()
+    assert e.value.code == 4, f"🔴 清不掉卻回 {e.value.code}(要 4)"
+    import shutil as _sh
+    _sh.rmtree(stuck, ignore_errors=True)
+
+
+def test_分軌失敗且刪不掉時owner要留著(tmp_path, monkeypatch):
+    """🔴 Codex R28-P1-1:舊版先從 owner 移除、再 ignore_errors 刪 ——
+    刪除也失敗時目錄還在、卻已經沒有人負責它,外層 finally 不會再試。"""
+    S = _load_song_scorer(monkeypatch)
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    import subprocess as _sp
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(iso))
+    monkeypatch.setattr(S, "force_rmtree", lambda d, **kw: str(d))    # 假裝刪不掉
+    monkeypatch.setattr(_sp, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("demucs 掛了")))
+    owned = []
+    with pytest.raises(RuntimeError):
+        S.separate_with_demucs(str(tmp_path / "mix.wav"), owned)
+    assert owned, "🔴 刪不掉卻把 owner 放掉了 —— 之後沒有人會再處理那份分軌"
 
 
 def test_song_scorer的分軌失敗時就地清乾淨(tmp_path, monkeypatch):
     """⛔ demucs 自己炸掉時,呼叫端還沒拿到任何東西 —— 這時候要就地清,
     不可以留一個半成品目錄等別人。"""
-    S = _load_song_scorer()
+    S = _load_song_scorer(monkeypatch)
     iso = tmp_path / "temp"
     iso.mkdir()
     import subprocess as _sp

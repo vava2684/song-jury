@@ -1221,6 +1221,49 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R28 ────────────────────────────────────────────────
+    ('分軌失敗時先放掉 owner 再刪(刪不掉就沒人負責那份分軌)',
+     'song_scorer.py',
+     '        left = force_rmtree(out)\n        if not left and owned_out is not None and out in owned_out:',
+     '        left = ""\n        force_rmtree(out)\n        if owned_out is not None and out in owned_out:',
+     'tests/test_來源身分.py::test_分軌失敗且刪不掉時owner要留著'),
+
+    ('song_scorer 清不掉時沿用正常退出碼(自動化不知道 TEMP 留了整份分軌)',
+     'song_scorer.py',
+     '            if _exc is None or (isinstance(_exc, SystemExit)\n                                and _exc.code in (None, 0)):\n                sys.exit(4)',
+     '            if False:\n                sys.exit(4)',
+     'tests/test_來源身分.py::test_song_scorer清不掉時要用專屬退出碼'),
+
+    ('song_scorer 的 main 不收暫存(整段清理停用)',
+     'song_scorer.py',
+     '        _dirty = [x for x in (force_rmtree(_d) for _d in _owned_tmp) if x]',
+     '        _dirty = []   # 變異:整段清理停用',
+     'tests/test_來源身分.py::test_song_scorer的main一定會收掉分軌暫存'),
+
+    ('網頁回收改回用時間判死(時鐘跳/長工作會刪掉還活著的請求)',
+     'app.py',
+     '            if marker.exists() and is_busy(marker):',
+     '            if marker.exists() and (now - d.stat().st_mtime) <= ttl:',
+     'tests/test_rubric_pick.py::test_還活著的請求就算看起來很舊也不可以刪'),
+
+    ('解除租約失敗靜靜吞掉(產物多留到下次鎖拿得到為止)',
+     'app.py',
+     '        print(f"⛔ 網頁暫存的租約解不掉:{Path(d) / _ACTIVE}"\n              f"({type(e).__name__}: {e})", flush=True)',
+     '        pass   # 變異:靜靜吞掉',
+     'tests/test_rubric_pick.py::test_解除租約失敗要講出來'),
+
+    ("舊的分軌暫存不回收(整套分軌永遠留在隱藏目錄裡)",
+     "分軌快取.py",
+     "    sweep_stale_tmp(stems_dir)",
+     "    pass   # 變異:不回收",
+     "tests/test_packaging.py::test_分軌前要掃掉沒人在寫的舊暫存"),
+
+    ('分軌暫存的回收不看鎖(把別人正在寫的分軌刪掉)',
+     '分軌快取.py',
+     '            if lock.exists() and is_busy(lock):',
+     '            if False:   # 變異:不看鎖',
+     'tests/test_pillars.py::test_有人正在寫的分軌暫存絕不可以被回收'),
+
     # ── Codex R27 ────────────────────────────────────────────────
     ('上傳補正檔複製失敗時不收拾(半份音訊留在 TEMP + 裸 OSError)',
      '評審團.py',
@@ -1234,29 +1277,14 @@ MUTATIONS = [
      '    pass   # 變異:不登記',
      'tests/test_來源身分.py::test_song_scorer的分軌暫存要有人清'),
 
-    ('song_scorer 的 main 不清暫存(留一整份分軌在 TEMP)',
-     'song_scorer.py',
-     '        for _d in _owned_tmp:',
-     '        for _d in []:   # 變異:不清',
-     'tests/test_來源身分.py::test_song_scorer的分軌暫存要有人清'),
 
-    ('分軌失敗時不就地清乾淨(留一個半成品目錄)',
-     'song_scorer.py',
-     '        shutil.rmtree(out, ignore_errors=True)\n        raise',
-     '        raise',
-     'tests/test_來源身分.py::test_song_scorer的分軌失敗時就地清乾淨'),
+    ("分軌失敗時不就地清乾淨(留一個半成品目錄)",
+     "song_scorer.py",
+     "        left = force_rmtree(out)",
+     '        left = ""',
+     "tests/test_來源身分.py::test_song_scorer的分軌失敗時就地清乾淨"),
 
-    ('網頁回收不看租約(把還在跑的請求目錄刪掉)',
-     'app.py',
-     '            if age <= (abandon if active else ttl):',
-     '            if age <= ttl:   # 變異:不看租約',
-     'tests/test_rubric_pick.py::test_網頁回收不可以刪掉還在跑的請求'),
 
-    ('網頁的租約變成免死金牌(被中斷的請求永遠不回收)',
-     'app.py',
-     '            if age <= (abandon if active else ttl):',
-     '            if active or age <= ttl:   # 變異:active 就永遠不刪',
-     'tests/test_rubric_pick.py::test_被中斷的請求最後還是要回收'),
 
     # ── Codex R26 ────────────────────────────────────────────────
     ('上傳補正檔沒人清(一整份音訊永久留在 TEMP)',
@@ -1285,7 +1313,7 @@ MUTATIONS = [
 
     ("網頁版的舊產物不回收(受管目錄變成永久堆積)",
      "app.py",
-     "            if age <= (abandon if active else ttl):\n                continue",
+     "            if (now - d.stat().st_mtime) <= ttl:\n                continue",
      "            continue   # 變異:什麼都不回收",
      "tests/test_rubric_pick.py::test_網頁版的歌詞與圖要放進受管暫存並會被回收"),
 
@@ -1369,11 +1397,11 @@ MUTATIONS = [
      '            shutil.copy2(song, snap)',
      'tests/test_來源身分.py::test_唯讀來源的快照也要刪得掉'),
 
-    ('快照收尾改回 ignore_errors(刪不掉整個吞掉,音訊留在 TEMP)',
-     '評審團.py',
-     '    for i in range(retries):\n        if not d.exists():\n            return ""',
-     '    for i in range(0):\n        if not d.exists():\n            return ""',
-     'tests/test_來源身分.py::test_唯讀來源的快照也要刪得掉'),
+    ("快照收尾改回 ignore_errors(刪不掉整個吞掉,音訊留在 TEMP)",
+     "暫存清理.py",
+     '    for _ in range(max(1, retries)):\n        if not d.exists():\n            return ""',
+     '    for _ in range(0):\n        if not d.exists():\n            return ""',
+     "tests/test_來源身分.py::test_唯讀來源的快照也要刪得掉"),
 
     ("快照沒收乾淨時沿用正常退出碼(自動化永遠不知道 TEMP 留了音訊)",
      "評審團.py",

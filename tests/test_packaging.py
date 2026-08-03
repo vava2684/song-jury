@@ -582,3 +582,26 @@ def test_安裝器要原樣傳出政策錯誤碼5():
     assert sh_tail.index("exit 5") < sh_tail.index("exit 1"), "install.sh 同理"
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     assert "| **5** |" in readme, "README 的退出碼表要列出 5"
+
+
+def test_分軌前要掃掉沒人在寫的舊暫存(tmp_path, monkeypatch):
+    """🔴 Codex R28-P2-3:`_stems/.tmp_*` 只清「自己這次的」——程序被強制終止之後
+    那份可能是**整套分軌**,而且是隱藏目錄。⛔ 分軌入口要先掃一次。"""
+    import sys as _sys
+    import types as _t
+    from conftest import load as _load
+    for n in ("torch", "torchaudio", "demucs"):
+        if n not in _sys.modules:
+            mod = _t.ModuleType(n)
+            mod.__getattr__ = lambda _n: (lambda *a, **k: None)
+            monkeypatch.setitem(_sys.modules, n, mod)
+    C = _load("分軌快取")
+    seen = {}
+    monkeypatch.setattr(C, "sweep_stale_tmp", lambda d, **kw: seen.setdefault("d", d) or 0)
+    stems = tmp_path / "_stems"
+    stems.mkdir()
+    try:
+        C.separate(tmp_path / "x.wav", stems, "htdemucs")
+    except Exception:
+        pass
+    assert seen.get("d") == stems, "🔴 分軌入口沒有先掃舊的 .tmp_"

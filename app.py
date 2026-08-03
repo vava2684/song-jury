@@ -19,6 +19,7 @@ import gradio as gr
 
 from 子程序 import run_tree
 from 狀態目錄 import state_root
+from 暫存清理 import force_rmtree, is_busy, release, take
 from 設定讀取 import ConfigError, positive_finite
 import requests
 from urllib.parse import urlparse
@@ -123,38 +124,37 @@ def _web_tmp_root() -> Path:
     return d
 
 
-# 一個請求最久允許「還在跑」多久 —— 超過就當成被中斷的孤兒,可以回收。
-# ⚠️ 它必須 **>> 一次評測的時間**(首次還會下載模型),預設 6 小時。
-_WEB_ABANDON = max(_WEB_TMP_TTL, positive_finite("SONG_JURY_WEB_ABANDON_AGE",
-                                                 21600.0, lo=0.0, hi=604800.0))
-_ACTIVE = ".active"          # 還在跑的請求會有這個標記
+_ACTIVE = ".active"          # 還在跑的請求會**持有**這個鎖檔(不是只是放著)
+_HELD = {}                   # 這個程序自己持有的租約:{目錄字串: 持有物}
 
 
-def _sweep_web_tmp(ttl: float = None, abandon: float = None) -> int:
-    """回收「已完成而且過了保留期」的舊產物;回幾個目錄被清掉。
+def _sweep_web_tmp(ttl: float = None) -> int:
+    """回收「沒有人在用、而且過了保留期」的舊產物;回幾個目錄被清掉。
 
-    🔴 Codex R27-P2-1:舊版只看 mtime —— 一個還在跑的請求(情感弧線/Ollama 詞評
-       可能好幾分鐘)只要超過保留期,**下一個請求就會把它正在用的目錄刪掉**,
-       使用者拿到一張不存在的圖。目錄的 mtime 也不會因為裡面的檔案被寫入而更新。
-    ⭐ 所以改成租約:請求開始時放 `.active`,回傳前拿掉(= completed)。
-       · completed 且超過保留期 → 回收;
-       · 還 active 但超過**放棄期**(預設 6 小時)→ 當成被中斷的孤兒,才回收。
-    ⛔ 刪不掉不可以靜靜吞掉(那又回到「以為清了、其實沒有」)—— 印出完整路徑。"""
+    🔴 Codex R27-P2-1:舊版只看 mtime,會把**還在跑**的請求目錄刪掉。
+    🔴 Codex R28-P2-1:第一版的 `.active` 只是個「檔案在不在」的哨兵,判死仍然
+       靠牆鐘 —— 時鐘往前跳、機器休眠、或工作本來就比放棄期長
+       (SONG_JURY_WEB_TIMEOUT 允許到 24 小時)都會把活著的工作誤判成孤兒。
+    ⭐ 現在 `.active` 是**真的 OS 鎖**(Windows msvcrt / POSIX flock):
+       · 鎖拿不到 → 有人正在用 → **不管多舊都不回收**;
+       · 鎖拿得到 → 持有者已經結束(正常完成或崩潰)→ 過了保留期就回收。
+       程序被砍時 OS 會自動放掉鎖,所以孤兒最後還是收得掉。
+    ⛔ 刪不掉不可以靜靜吞掉 —— 印出完整路徑。"""
     ttl = _WEB_TMP_TTL if ttl is None else ttl
-    abandon = _WEB_ABANDON if abandon is None else abandon
     now = time.time()
     n = 0
     for d in _web_tmp_root().iterdir():
         try:
-            if not d.is_dir():
+            if not d.is_dir() or str(d) in _HELD:
+                continue                       # 自己這個程序正在用的,直接跳過
+            marker = d / _ACTIVE
+            if marker.exists() and is_busy(marker):
+                continue                       # ⛔ 有人持有租約 → 絕不回收
+            if (now - d.stat().st_mtime) <= ttl:
                 continue
-            age = now - d.stat().st_mtime
-            active = (d / _ACTIVE).exists()
-            if age <= (abandon if active else ttl):
-                continue
-            shutil.rmtree(d, ignore_errors=True)
-            if d.exists():
-                print(f"⛔ 網頁暫存清不掉:{d}(請手動刪掉)", flush=True)
+            left = force_rmtree(d)
+            if left:
+                print(f"⛔ 網頁暫存清不掉:{left}(請手動刪掉)", flush=True)
             else:
                 n += 1
         except OSError as e:
@@ -163,20 +163,31 @@ def _sweep_web_tmp(ttl: float = None, abandon: float = None) -> int:
 
 
 def _web_workdir() -> Path:
-    """給這一次請求用的目錄(先回收舊的,再開新的;開出來的先標成 active)。"""
+    """給這一次請求用的目錄(先回收舊的,再開新的;開出來的**持有**租約)。"""
     _sweep_web_tmp()
     d = Path(tempfile.mkdtemp(prefix="req-", dir=_web_tmp_root()))
-    (d / _ACTIVE).write_text("1", encoding="utf-8")
+    h = take(d / _ACTIVE)
+    if h is None:
+        # 理論上不會發生(目錄是剛建的)—— 但不可以假裝有租約
+        print(f"⛔ 網頁暫存拿不到租約:{d}(這個請求的產物可能被提早回收)", flush=True)
+    else:
+        _HELD[str(d)] = h
     return d
 
 
 def _web_done(d) -> None:
-    """請求結束:拿掉 active 標記 → 之後就照保留期回收。"""
+    """請求結束:放掉租約 → 之後就照保留期回收。"""
+    if d is None:
+        return
+    h = _HELD.pop(str(d), None)
+    release(h)
     try:
-        if d is not None:
-            (Path(d) / _ACTIVE).unlink(missing_ok=True)
-    except OSError:
-        pass
+        (Path(d) / _ACTIVE).unlink(missing_ok=True)
+    except OSError as e:
+        # ⛔ 不可以靜靜吞掉(Codex R28-P2-2):marker 留著會讓這份產物多留到
+        #    下一次「鎖拿得到」才被回收 —— 使用者與維運都該知道。
+        print(f"⛔ 網頁暫存的租約解不掉:{Path(d) / _ACTIVE}"
+              f"({type(e).__name__}: {e})", flush=True)
 
 
 # ⭐ 啟動時也掃一次(Codex R27-P2-2):只在「下一個請求」才回收的話,
@@ -184,8 +195,10 @@ def _web_done(d) -> None:
 #    ⚠️ 誠實邊界:這是**機會性**回收(啟動 + 每次請求),不是背景排程的時間保證。
 try:
     _sweep_web_tmp()
-except Exception:            # noqa: BLE001 —— 回收失敗絕不可以擋住服務啟動
-    pass
+except Exception as _e:      # noqa: BLE001 —— 回收失敗絕不可以擋住服務啟動
+    # ⛔ 但也不可以靜靜吞掉(Codex R28-P2-2):「啟動時有掃」不等於「掃成功」。
+    print(f"⛔ 啟動時的網頁暫存回收失敗({type(_e).__name__}: {_e});"
+          f"目錄:{state_root() / 'web-tmp'}", flush=True)
 
 
 def _score_table(merged):

@@ -31,8 +31,11 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 from pathlib import Path
+
+from 暫存清理 import force_rmtree, is_busy, release, take
 
 # ⛔ 沒有身分紀錄的舊快取預設**不採信**(它可能是另一首同名歌的分軌,一旦認領就永遠錯下去)。
 #    確知舊快取正確的人,才用這個環境變數明確授權沿用。
@@ -153,12 +156,60 @@ def cache_dir_of(audio_path: Path, stems_dir: Path, model_name: str) -> Path:
     return newp                    # 都沒有 → 回新路徑(等著被建立)
 
 
+# 舊的 .tmp_ 至少要這麼舊才回收(預設 1 小時)——⚠️ 這是**第二道**保險,
+# 第一道是鎖:鎖拿不到就完全不碰。兩道都過才刪。
+TMP_GRACE = 3600.0
+
+
+def sweep_stale_tmp(stems_dir: Path, grace: float = None) -> int:
+    """回收 `_stems` 裡沒人在寫、而且夠舊的 `.tmp_*`;回收幾個回幾。
+
+    🔴 Codex R28-P2-3:舊版只清「自己這次的 tmp」,而且全部 ignore_errors ——
+       程序被強制終止(或 rmtree 自己失敗)之後,那份 `.tmp_*` 裡可能是**整套分軌**,
+       而它是隱藏目錄,使用者幾乎不可能發現。
+    ⛔ 判「還有沒有人在寫」只能靠鎖,不能靠 PID:PID 會被重用,而且跨機器共享
+       目錄時別台的 PID 在這台毫無意義。"""
+    grace = TMP_GRACE if grace is None else grace
+    now = time.time()
+    n = 0
+    try:
+        entries = list(Path(stems_dir).glob(".tmp_*"))
+    except OSError:
+        return 0
+    for d in entries:
+        try:
+            if not d.is_dir():
+                continue
+            # ⚠️ 年紀要**先量**:探鎖會建出 .lock,那會更新目錄的 mtime,
+            #    年紀瞬間變成 0 → 永遠不會被回收(自己踩到)。
+            age = now - d.stat().st_mtime
+            lock = d / ".lock"
+            if lock.exists() and is_busy(lock):
+                continue                     # ⛔ 有人正在寫 → 不管多舊都不碰
+            if age <= grace:
+                continue
+            left = force_rmtree(d)
+            if left:
+                print(f"      ⛔ 舊的分軌暫存清不掉:{left}(請手動刪掉)", flush=True)
+            else:
+                n += 1
+        except OSError as e:
+            print(f"      ⛔ 舊的分軌暫存回收失敗:{d}({type(e).__name__}: {e})",
+                  flush=True)
+    return n
+
+
 def separate(audio_path: Path, stems_dir: Path, model_name: str):
     """用 demucs 分軌;已有快取就直接讀。回 (dict[stem]=波形, sr, sources順序, from_cache)。
 
     波形 shape 為 (channels, samples) 的 float32 numpy。
     分軌檔放在 cache_dir_of() 指的資料夾;要拿路徑請呼叫它,不要自己拼。
     """
+    # ⭐ 每次分軌前先收掉沒人在寫的舊 .tmp_(它們可能是整套分軌)
+    # ⛔ 要排在重量級 import **之前**:回收不該取決於 demucs 裝好了沒 ——
+    #    裝壞的機器反而最容易留下半份分軌(自己踩到:放在後面時測試根本沒跑到)。
+    sweep_stale_tmp(stems_dir)
+
     import torch
     import torchaudio
     from demucs.pretrained import get_model
@@ -251,8 +302,11 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
     #    會共用同一個暫存夾互相覆寫。
     tmp = stems_dir / f".tmp_{cache.name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     if tmp.exists():
-        shutil.rmtree(tmp, ignore_errors=True)
+        force_rmtree(tmp)
     tmp.mkdir(parents=True, exist_ok=True)
+    # ⭐ 這一份正在寫 → 持有租約(Codex R28-P2-3):別的程序掃到它時,
+    #    鎖拿不到就知道「有人正在寫」,不會把寫到一半的分軌刪掉。
+    _hold = take(tmp / ".lock")
     stems = {}
     try:
         for i, s in enumerate(sources):
@@ -264,6 +318,12 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
         tmp.joinpath("_source.json").write_text(
             json.dumps({**ident, "sources": sources}, ensure_ascii=False, indent=1),
             encoding="utf-8")
+        # ⛔ 發佈前一定要先放掉鎖並刪掉鎖檔(自己踩到):Windows 不讓你改名一個
+        #    「裡面還有開啟中的檔案」的目錄 → os.replace 會 PermissionError;
+        #    而且鎖檔也不該被一起發佈進正式快取。
+        release(_hold)
+        _hold = None
+        (tmp / ".lock").unlink(missing_ok=True)
         try:
             os.replace(tmp, cache)          # 原子發佈
         except OSError as e:
@@ -279,8 +339,15 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
                 shutil.rmtree(cache, ignore_errors=True)
                 os.replace(tmp, cache)
     except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)   # 中途炸掉不留半成品
+        release(_hold)
+        _hold = None
+        left = force_rmtree(tmp)                 # 中途炸掉不留半成品
+        if left:
+            print(f"      ⛔ 分軌暫存清不掉:{left}(裡面是半份分軌,請手動刪掉)",
+                  flush=True)
         raise
+    finally:
+        release(_hold)
     return stems, sr, sources, False
 
 

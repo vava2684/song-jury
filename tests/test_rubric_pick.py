@@ -10,6 +10,8 @@
 """
 import sys
 import types
+from pathlib import Path
+
 import pytest
 from conftest import load, REPO
 
@@ -214,15 +216,63 @@ def test_網頁回收不可以刪掉還在跑的請求(A, tmp_path, monkeypatch)
 
 
 def test_被中斷的請求最後還是要回收(A, tmp_path, monkeypatch):
-    """⚠️ 租約不可以變成「永遠不刪」的免死金牌:程序被砍時 active 標記會留著,
-    所以超過**放棄期**就要當成孤兒回收(否則受管目錄會無限長大)。"""
+    """⚠️ 租約不可以變成「永遠不刪」的免死金牌:程序被砍時 OS 會放掉鎖,
+    那份產物就該照保留期回收(否則受管目錄會無限長大)。"""
     import os as _os
     import time as _t
     root = tmp_path / "state"
     monkeypatch.setattr(A, "state_root", lambda: root)
     d = A._web_workdir()
     (d / "歌詞.txt").write_text("被中斷的", encoding="utf-8")
+    # 模擬「程序死了」:放掉租約但**留著 marker**(崩潰時就是這個樣子)
+    A.release(A._HELD.pop(str(d), None))
     very_old = _t.time() - 99999
     _os.utime(d, (very_old, very_old))
-    assert A._sweep_web_tmp(ttl=60, abandon=3600) == 1, "🔴 孤兒目錄永遠不會被回收"
+    assert A._sweep_web_tmp(ttl=60) == 1, "🔴 孤兒目錄永遠不會被回收"
     assert not d.exists()
+
+
+def test_還活著的請求就算看起來很舊也不可以刪(A, tmp_path, monkeypatch):
+    """🔴 Codex R28-P2-1:第一版的 `.active` 只是「檔案在不在」的哨兵,判死仍然
+    靠牆鐘 —— 時鐘往前跳、機器休眠、或工作本來就比放棄期長
+    (SONG_JURY_WEB_TIMEOUT 允許到 24 小時)都會把**還活著**的工作誤判成孤兒,
+    使用者拿到一張不存在的圖。⛔ 判準只能是「鎖拿不拿得到」。"""
+    import os as _os
+    import time as _t
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    d = A._web_workdir()                       # 這個請求「還在跑」(持有租約)
+    (d / "歌詞.txt").write_text("還在跑", encoding="utf-8")
+    very_old = _t.time() - 999999              # 時鐘往前跳 / 睡了很久 / 工作很長
+    _os.utime(d, (very_old, very_old))
+    # ⚠️ 要走「**別的**程序持有租約」那條路:sweep 對自己簿子上的目錄會直接跳過,
+    #    那樣不管判準是鎖還是時間都不會刪 —— 測試就驗不到真正的防線
+    #    (變異驗證抓到我這條是裝飾品)。把它從簿子拿掉、但**不放鎖**。
+    holder = A._HELD.pop(str(d))
+    try:
+        assert A._sweep_web_tmp(ttl=60) == 0, "🔴 把還活著的請求刪掉了"
+        assert (d / "歌詞.txt").exists()
+        # 而且別的程序看到的也是「有人在用」(不是只有自己這個程序知道)
+        assert A.is_busy(d / A._ACTIVE), "🔴 租約不是真的 OS 鎖,別的程序看不到"
+    finally:
+        A.release(holder)
+    assert not A.is_busy(d / A._ACTIVE), "🔴 放掉之後鎖還鎖著"
+
+
+def test_解除租約失敗要講出來(A, tmp_path, monkeypatch, capsys):
+    """🔴 Codex R28-P2-2:`except OSError: pass` —— marker 刪不掉時完全沒有聲音,
+    那份產物會多留到「下次鎖拿得到」為止,而維運完全不知道。"""
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    d = A._web_workdir()
+    real_unlink = Path.unlink
+
+    def _boom(self, *a, **k):
+        if self.name == A._ACTIVE:
+            raise OSError(13, "Permission denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+    A._web_done(d)
+    out = capsys.readouterr().out
+    assert "租約" in out and str(d) in out, f"🔴 沒有講出哪個目錄解不掉:{out!r}"
