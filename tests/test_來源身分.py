@@ -755,10 +755,25 @@ def test_上傳補正檔複製到一半失敗也不可以留下暫存(tmp_path, 
     assert owned == [], "🔴 已經刪掉的目錄還留在 owned 裡(main 會再刪一次並誤報)"
 
 
+def _load_song_scorer():
+    """載入 song_scorer,但不需要它那些重量級相依。
+
+    ⛔ 不可以改成「沒有 librosa 就 skip」:那樣 CI(刻意不裝 librosa)永遠驗不到
+       這兩條,對應的變異也會變成「無法驗證」—— 覆蓋面靜靜縮小。
+    ⚠️ 我們只呼叫 separate_with_demucs,它完全不碰 librosa。"""
+    import types as _t
+    for name in ("librosa", "pyloudnorm", "parselmouth", "soundfile", "scipy"):
+        if name not in sys.modules:
+            mod = _t.ModuleType(name)
+            mod.__getattr__ = lambda _n: (lambda *a, **k: None)
+            sys.modules[name] = mod
+    return load("song_scorer")
+
+
 def test_song_scorer的分軌暫存要有人清(tmp_path, monkeypatch):
     """🔴 Codex R27-P1-2:`song_scorer.py --demucs` 的 `tempfile.mkdtemp()` 沒有主人 ——
     那裡面是 Demucs 的**完整分軌**(等於整首歌再一份),不是一個小 JSON。"""
-    S = load("song_scorer")
+    S = _load_song_scorer()
     iso = tmp_path / "temp"
     iso.mkdir()
     monkeypatch.setattr(S.tempfile, "tempdir", str(iso)) if hasattr(S, "tempfile") else None
@@ -795,7 +810,7 @@ def test_song_scorer的分軌暫存要有人清(tmp_path, monkeypatch):
 def test_song_scorer的分軌失敗時就地清乾淨(tmp_path, monkeypatch):
     """⛔ demucs 自己炸掉時,呼叫端還沒拿到任何東西 —— 這時候要就地清,
     不可以留一個半成品目錄等別人。"""
-    S = load("song_scorer")
+    S = _load_song_scorer()
     iso = tmp_path / "temp"
     iso.mkdir()
     import subprocess as _sp
