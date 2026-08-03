@@ -37,7 +37,7 @@ ENV = {**os.environ, "PYTHONUTF8": "1"}
 
 # 鎖檔的全域位置(⛔ 不放 BASE:兩份 ZIP 副本會各鎖各的,互斥失效 —— Codex R10)
 from 狀態目錄 import locks_dir, state_root, StateDirError, safe_open_lock
-from 暫存清理 import force_rmtree
+from 暫存清理 import emit_dirty, force_rmtree, parse_dirty
 from 子程序 import run_tree
 
 # Windows:子程序不要各自彈出主控台黑框(一次評測會開好幾個子程序)。Linux 無此旗標 → 空 dict。
@@ -1306,6 +1306,9 @@ def main():
         print(f"⛔ 退出碼 4:評測完成,但有 {len(left)} 份暫存沒收乾淨:")
         for _kind, _path in left:
             print(f"   · [{_kind}] {_path}")
+        # ⛔ 上面那幾行是給人看的;下游(網頁/批次)讀的是這一行
+        #    —— 種類與純路徑都在裡面,改寫人話不會弄壞它(Codex R30-P2-1)。
+        emit_dirty(left)
         sys.exit(4)
     sys.exit(rc)
 
@@ -1418,13 +1421,13 @@ def _evaluate(song: Path, audio: Path, dirty_out=None):
     #    照樣往下讀報告,但把殘留帶到最外層(退出碼與訊息見 main)。
     _phys = _run_stage(cmd, cwd=BASE, label="物理技術(song_scorer)", accepted=(4,))
     if _phys.returncode == 4:
-        _hits = [ln for ln in ((_phys.stderr or "") + (_phys.stdout or "")).splitlines()
-                 if "沒清乾淨" in ln]
-        for _ln in _hits:
-            _path = _ln.split("沒清乾淨:", 1)[-1].strip()
-            notes.append(f"分軌暫存沒清乾淨:{_path}")
-            dirty_out.append(("demucs_stems", _path))
-        if not _hits:
+        # ⛔ 讀**機器記錄**,不切人話(Codex R30-P2-1):中文訊息後面還接著
+        #    「(裡面是一整份分軌,請手動刪掉)」,切字串會把它併進路徑。
+        _rec = parse_dirty((_phys.stdout or "") + "\n" + (_phys.stderr or ""))
+        for _it in (_rec or []):
+            notes.append(f"分軌暫存沒清乾淨:{_it['path']}")
+            dirty_out.append((_it["kind"] or "demucs_stems", _it["path"]))
+        if not _rec:
             # ⛔ 子程序已經明講「有殘留」(rc=4),訊息認不得**不等於**沒事 ——
             #    這裡若什麼都不記,最外層的 left 是空的 → 整條鏈退回 0,
             #    那份分軌就從「講出來的殘留」變成「沒有人知道的殘留」。

@@ -63,7 +63,13 @@ $juryRc = $LASTEXITCODE   # ⛔ 立刻保存 —— 退出碼是完整性契約,
 #         網頁版產物放進受管目錄 + 租約 + TTL 回收(R24/R26/R27)。
 #      🔒 租約三態(acquired / busy / backend_error):寫入端拿不到租約就**不寫**
 #         (fail-closed),回收端兩種都當「有人在用」不回收;
-#         鎖檔一律走 狀態目錄.safe_open_lock(擋 symlink/hardlink,R29)。
+#         鎖檔一律走 狀態目錄.safe_open_lock(擋 symlink/hardlink,R29);
+#         web-tmp 等受管目錄走 ensure_private_subdir(每一層都拒 symlink/junction,R30)。
+#      📤 「哪些暫存沒清乾淨」是**機器介面**:產出端發一行
+#         ##SONG_JURY_CLEANUP##{"cleanup_dirty":[{"kind","path"}]},網頁/批次只讀它,
+#         人話只給終端機看;⛔ 讀不到記錄 ≠ 乾淨(rc=4 一律 fail-closed 記「路徑不明」)。
+#      ✅ 完成訊息要跟著實際結果降級:情感弧線沒跑出來就不可以說「音訊+情感完成／
+#         三關完成」(R30-P2-2);⛔ 只有報告已發布才可以用退出碼 4。
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" pk    --lang zh 甲_評審團.json 乙_評審團.json
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" takes --group A t1_評審團.json t2_評審團.json
 

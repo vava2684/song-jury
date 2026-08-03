@@ -535,6 +535,12 @@ def _rc4_stub(tmp_path, complete=True, broken=False):
          else "out.write_text(json.dumps(d, ensure_ascii=False), encoding='utf-8')"),
         "print(f'完整報告:{out}')",
         "print('⛔ 暫存沒清乾淨[source_snapshot]:C:/Temp/song-jury-src-xxxx')",
+        # ⭐ 真的產出端除了人話,還會發一行**機器記錄**(Codex R30-P2-1)——
+        #    stub 也要發,否則下面測到的是「讀不到記錄」的 fail-closed 分支,
+        #    而不是正常路徑(那就等於沒驗到種類與純路徑有沒有送到)。
+        f"sys.path.insert(0, {str(REPO)!r})",
+        "from 暫存清理 import emit_dirty",
+        "emit_dirty([('source_snapshot', 'C:/Temp/song-jury-src-xxxx')])",
         "sys.exit(4)",
     ]
     f = tmp_path / "評審團.py"
@@ -726,8 +732,11 @@ def test_批次要把暫存殘留寫進store與總結(tmp_path, monkeypatch, cap
     data, err = B.run_one(song)
     assert data is not None and not err
     dirty = data.get("_cleanup_dirty")
-    assert dirty and "song-jury-src-xxxx" in dirty[0], \
-        f"🔴 殘留路徑沒有進到結果(store 就存不到):{data.get('_cleanup_dirty')!r}"
+    # ⛔ R30-P2-1:store 裡要是**結構化的 (種類, 純路徑)**,不是切出來的一段中文。
+    #    舊版存進去的是 `C:/Temp/…(裡面是一整份分軌,請手動刪掉)` —— 貼進檔案總管
+    #    開不了、寫腳本刪也刪不掉,而且完全看不出是哪一種暫存。
+    assert dirty == [{"kind": "source_snapshot", "path": "C:/Temp/song-jury-src-xxxx"}], \
+        f"🔴 殘留沒有結構化地進到結果(store 就存不到):{dirty!r}"
 
 
 def test_上傳補正檔複製到一半失敗也不可以留下暫存(tmp_path, monkeypatch):
@@ -866,9 +875,11 @@ def test_song_scorer的main一定會收掉分軌暫存(tmp_path, monkeypatch, ho
         f"🔴 TEMP 還有殘留({how}):{sorted(x.name for x in iso.iterdir())}"
 
 
-def test_song_scorer清不掉時要用專屬退出碼(tmp_path, monkeypatch):
+def test_song_scorer清不掉時要用專屬退出碼(tmp_path, monkeypatch, capsys):
     """🔴 Codex R28-P1-1:正常評分完成、但收尾刪不掉時,舊版只印一行就以
-    **退出碼 0** 結束 —— 只看退出碼的自動化永遠不知道那裡留了一整份分軌。"""
+    **退出碼 0** 結束 —— 只看退出碼的自動化永遠不知道那裡留了一整份分軌。
+    ⭐ R30 追加:退出碼講「有殘留」,**路徑與種類**要用機器記錄發出去 ——
+       只印中文的話,呼叫端只能去切字串,切出來的還會夾著「(裡面是…)」。"""
     S = _load_song_scorer(monkeypatch)
     iso = tmp_path / "temp"
     iso.mkdir()
@@ -889,6 +900,10 @@ def test_song_scorer清不掉時要用專屬退出碼(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as e:
         S.main()
     assert e.value.code == 4, f"🔴 清不掉卻回 {e.value.code}(要 4)"
+    T = load("暫存清理")
+    rec = T.parse_dirty(capsys.readouterr().out)
+    assert rec == [{"kind": "demucs_stems", "path": str(stuck)}], \
+        f"🔴 沒把殘留用機器記錄發出去(呼叫端只能去切人話):{rec!r}"
     import shutil as _sh
     _sh.rmtree(stuck, ignore_errors=True)
 
@@ -1157,3 +1172,121 @@ def test_子程序回4但訊息認不得也不可以當成沒殘留(tmp_path, mo
     assert (song.with_name("甲_評審團.json")).exists(), "報告還是要發布"
     assert e.value.code == 4, \
         f"🔴 訊息認不得就把 rc=4 吞掉了(回 {e.value.code})—— 殘留變成沒人知道"
+
+
+# ── R30:清理狀態是「機器介面」,不是人話 ─────────────────────────
+def _jury_stdout_with_dirty(tmp_path, monkeypatch, child_stderr, child_record):
+    """真的跑一次 評審團.main():子程序回 4(可選擇要不要發機器記錄),
+    回 (退出碼, 評審團自己的 stdout)。"""
+    import contextlib as _ctx
+    import io as _io
+    import types as _types
+    J = load("評審團")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF" + b"z" * 200)
+
+    def _run(cmd, cwd, label, env=None, accepted=()):
+        if "song_scorer.py" in " ".join(str(c) for c in cmd):
+            Path(cmd[cmd.index("--json") + 1]).write_text("{}", encoding="utf-8")
+            if 4 not in tuple(accepted):
+                raise SystemExit(f"{label} 失敗(exit 4)")
+            _buf = _io.StringIO()
+            if child_record:
+                J.emit_dirty(child_record, stream=_buf)
+            return _types.SimpleNamespace(returncode=4, stdout=_buf.getvalue(),
+                                          stderr=child_stderr)
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(J, "_run_stage", _run)
+    monkeypatch.setattr(J, "_optional_stage", lambda cmd, label, **kw: (None, f"{label}:stub"))
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: (song, song))
+    monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: _ctx.nullcontext())
+    monkeypatch.setenv("SONG_JURY_SKIP_GEMINI", "1")
+    monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
+    cap = _io.StringIO()
+    with _ctx.redirect_stdout(cap), pytest.raises(SystemExit) as e:
+        J.main()
+    return e.value.code, cap.getvalue()
+
+
+def test_殘留的種類與純路徑要端對端送到網頁與批次(tmp_path, monkeypatch):
+    """🔴 Codex R30-P2-1(實跑重現):清理狀態靠**切中文字串**傳遞 ——
+    網頁選到的是另一行,`[demucs_stems]` 整個不見;批次 store 存進去的是
+    `C:/Temp/stems-left(裡面是一整份分軌,請手動刪掉)` —— 那不是一個路徑,
+    貼進檔案總管開不了,寫腳本刪也刪不掉。
+    ⭐ 機器介面(固定前綴 + JSON)才是契約,人話只給終端機看。"""
+    T = load("暫存清理")
+    真路徑 = "C:/Temp/stems-left"
+    rc, out = _jury_stdout_with_dirty(
+        tmp_path, monkeypatch,
+        child_stderr=f"⛔ 分軌暫存沒清乾淨:{真路徑}(裡面是一整份分軌,請手動刪掉)\n",
+        child_record=[("demucs_stems", 真路徑)])
+    assert rc == 4
+    rec = T.parse_dirty(out)
+    assert rec, f"🔴 評審團沒發出機器記錄,下游只能去切人話:\n{out[-400:]}"
+    assert {"kind": "demucs_stems", "path": 真路徑} in rec, \
+        f"🔴 種類或路徑不對(路徑被說明文字污染?):{rec}"
+    assert all("(" not in x["path"] for x in rec), f"🔴 路徑裡混進了說明文字:{rec}"
+
+
+def test_改寫人話不可以弄壞下游的清理狀態(tmp_path, monkeypatch):
+    """⛔ 人話是會改的(翻譯、換句、加說明)。下游若靠切字串,改一次文案就壞一次
+    —— 而壞掉的樣子是「看起來乾淨」。機器記錄要完全不受人話影響。"""
+    T = load("暫存清理")
+    真路徑 = "/var/tmp/stems-left"
+    rc, out = _jury_stdout_with_dirty(
+        tmp_path, monkeypatch,
+        child_stderr="WARNING: leftover stems directory could not be removed\n",
+        child_record=[("demucs_stems", 真路徑)])
+    assert rc == 4
+    assert T.parse_dirty(out) and \
+        {"kind": "demucs_stems", "path": 真路徑} in T.parse_dirty(out), \
+        "🔴 換了句型就解析不到了 —— 那表示下游還在讀人話"
+
+
+def test_解析不到清理記錄也不可以說成乾淨(tmp_path, monkeypatch):
+    """⛔ fail-closed:rc=4 是**退出碼契約**,記錄讀不到(被截斷/舊版子程序/
+    輸出被吞)不等於沒殘留。網頁與批次都要照樣講出來。"""
+    T = load("暫存清理")
+    assert T.parse_dirty("完全沒有記錄的一堆人話") is None, \
+        "🔴 parse_dirty 對「沒有記錄」要回 None,不可以回 [](那會被當成乾淨)"
+    assert T.parse_dirty(T.CLEANUP_TAG + "{壞掉的 json") is None
+    rc, out = _jury_stdout_with_dirty(
+        tmp_path, monkeypatch,
+        child_stderr="stems left somewhere\n", child_record=None)
+    assert rc == 4, f"🔴 子程序回 4、記錄又讀不到,最外層卻回 {rc}"
+
+
+def test_只有報告已發布才可以用退出碼4(tmp_path, monkeypatch):
+    """⛔ 優先序 invariant(Codex R30 建議的契約測試):4 的意思是
+    「評測有效、只是沒清乾淨」——所以下游會**照樣讀報告**。
+    若哪天有一條路徑在報告還沒發布時就登記殘留,4 會蓋掉真正的失敗碼,
+    使用者拿到「評測完成」卻沒有任何報告。這條把它焊死。"""
+    import contextlib as _ctx
+    import types as _types
+    J = load("評審團")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF" + b"z" * 200)
+
+    def _run(cmd, cwd, label, env=None, accepted=()):
+        if "song_scorer.py" in " ".join(str(c) for c in cmd):
+            raise SystemExit("物理技術(song_scorer) 失敗(exit 9)")
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(J, "_run_stage", _run)
+    monkeypatch.setattr(J, "_optional_stage", lambda cmd, label, **kw: (None, f"{label}:stub"))
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: (song, song))
+    monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: _ctx.nullcontext())
+    monkeypatch.setenv("SONG_JURY_SKIP_GEMINI", "1")
+    monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
+    with pytest.raises(SystemExit) as e:
+        J.main()
+    assert not song.with_name("甲_評審團.json").exists(), "這次本來就不該有報告"
+    assert e.value.code != 4, \
+        "🔴 報告根本沒發布卻回 4 —— 下游會拿著『評測有效』去找一份不存在的報告"

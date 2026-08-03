@@ -1223,10 +1223,97 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R30 ────────────────────────────────────────────────
+    ("評審團退回切人話拿路徑(說明文字被當成路徑的一部分)",
+     "評審團.py",
+     '        _rec = parse_dirty((_phys.stdout or "") + "\\n" + (_phys.stderr or ""))',
+     '        _rec = [{"kind": "demucs_stems", "path": ln.split("沒清乾淨:", 1)[-1].strip()}\n'
+     '                for ln in ((_phys.stdout or "") + (_phys.stderr or "")).splitlines()\n'
+     '                if "沒清乾淨" in ln]',
+     "tests/test_來源身分.py::test_殘留的種類與純路徑要端對端送到網頁與批次"),
+
+    ("評審團不發清理記錄(下游只剩人話可以切)",
+     "評審團.py",
+     "        emit_dirty(left)",
+     "        pass   # 變異:不發機器記錄",
+     "tests/test_來源身分.py::test_殘留的種類與純路徑要端對端送到網頁與批次"),
+
+    ("song_scorer 不發清理記錄(路徑只存在於中文訊息裡)",
+     "song_scorer.py",
+     '            emit_dirty([("demucs_stems", _x) for _x in _dirty])',
+     "            pass   # 變異:不發機器記錄",
+     "tests/test_來源身分.py::test_song_scorer清不掉時要用專屬退出碼"),
+
+    ("parse_dirty 把「沒有記錄」當成「乾淨」(回 [] 而不是 None)",
+     "暫存清理.py",
+     "    found = None\n    for ln in (text or \"\").splitlines():",
+     "    found = []\n    for ln in (text or \"\").splitlines():",
+     "tests/test_來源身分.py::test_解析不到清理記錄也不可以說成乾淨"),
+
+    ("網頁退回切人話(種類消失、說明文字被當成路徑)",
+     "app.py",
+     '        _rec = parse_dirty(r.stdout or "") or [',
+     '        _rec = [{"kind": "", "path": ln.strip()}\n'
+     '                for ln in (r.stdout or "").splitlines() if "沒清乾淨" in ln] or [',
+     "tests/test_rubric_pick.py::test_網頁的殘留提示要有種類與純路徑"),
+
+    ("網頁讀不到記錄就當成乾淨(那份音訊沒人知道)",
+     "app.py",
+     '        _rec = parse_dirty(r.stdout or "") or [\n'
+     '            {"kind": "unknown", "path": "(路徑不明 —— 見伺服器輸出)"}]',
+     '        _rec = parse_dirty(r.stdout or "") or []',
+     "tests/test_rubric_pick.py::test_網頁讀不到清理記錄也要照樣示警"),
+
+    ("批次退回切人話(store 存的不是一個能用的路徑)",
+     "批次評測.py",
+     '        _dirty = parse_dirty(r.stdout or "") or [',
+     '        _dirty = [ln.split("沒清乾淨", 1)[-1].lstrip("::").strip()\n'
+     '                  for ln in (r.stdout or "").splitlines() if "沒清乾淨" in ln] or [',
+     "tests/test_來源身分.py::test_批次要把暫存殘留寫進store與總結"),
+
+    ("弧線跳過了還是說「音訊+情感完成」",
+     "app.py",
+     '        note = (("✅ 音訊+情感完成。" if arc_status == "done"\n'
+     '                 else "✅ 音訊完成(情感弧線未完成,見下方)。")',
+     '        note = (("✅ 音訊+情感完成。" if True\n'
+     '                 else "✅ 音訊完成(情感弧線未完成,見下方)。")',
+     "tests/test_rubric_pick.py::test_弧線沒跑出來就不可以說音訊加情感完成"),
+
+    ("弧線跳過了還是說「三關完成」",
+     "app.py",
+     '            note = ((("✅ 三關完成。" if arc_status == "done"',
+     '            note = ((("✅ 三關完成。" if True',
+     "tests/test_rubric_pick.py::test_弧線沒跑出來時選了模型也不可以說三關完成"),
+
+    ("跑了沒產出圖也算「情感完成」(arc_status 一開始就樂觀)",
+     "app.py",
+     '        arc_status = "failed"        # 先當作沒成功,拿到圖才升級(fail-closed)',
+     '        arc_status = "done"          # 變異:先當作成功',
+     "tests/test_rubric_pick.py::test_弧線跑了卻沒產出圖也要降級"),
+
+    ("web-tmp 退回只 mkdir(父目錄被換成 symlink/junction 就導到外面)",
+     "app.py",
+     '    return ensure_private_subdir(state_root(), "web-tmp", "網頁暫存目錄 web-tmp")',
+     '    d = state_root() / "web-tmp"\n    d.mkdir(parents=True, exist_ok=True)\n    return d',
+     "tests/test_rubric_pick.py::test_web_tmp是junction也要拒絕",
+     "win32"),
+
+    ("web-tmp 退回只 mkdir(POSIX symlink 版)",
+     "app.py",
+     '    return ensure_private_subdir(state_root(), "web-tmp", "網頁暫存目錄 web-tmp")',
+     '    d = state_root() / "web-tmp"\n    d.mkdir(parents=True, exist_ok=True)\n    return d',
+     "tests/test_rubric_pick.py::test_web_tmp的父目錄也要是私人普通目錄"),
+
+    ("報告沒發布也可以用退出碼 4(優先序被 4 蓋掉)",
+     "評審團.py",
+     "    if left:\n        # ⛔ 收尾失敗要有**自己的**退出碼",
+     "    if left or rc not in (0, 2):\n        # ⛔ 收尾失敗要有**自己的**退出碼",
+     "tests/test_來源身分.py::test_只有報告已發布才可以用退出碼4"),
+
     # ── Codex R29 ────────────────────────────────────────────────
     ('子程序回 4 但訊息認不得就當成沒殘留(整條鏈退回 0)',
      '評審團.py',
-     '        if not _hits:',
+     '        if not _rec:',
      '        if False:',
      'tests/test_來源身分.py::test_子程序回4但訊息認不得也不可以當成沒殘留'),
 

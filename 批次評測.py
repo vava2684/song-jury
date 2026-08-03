@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from statistics import mean, pstdev
 
+from 暫存清理 import parse_dirty
 from 子程序 import run_tree
 from 驗證報告 import REQUIRED_PILLARS, validate
 
@@ -166,13 +167,15 @@ def run_one(song: Path, timeout=3600):
     # ⛔ 殘留路徑要**結構化地帶出去**(Codex R26-P1-2):只印在即時輸出的話,
     #    幾十首之後就被推走了,批次結束後沒人知道要刪哪裡;--skip-existing 下次
     #    跳過這首時更不會再提醒一次。→ 寫進結果 dict → 進 store → 進總結。
-    # ⚠️ 種類要跟著出來(Codex R29-P1-1):四種暫存的處理方式不同,
-    #    一律寫「來源快照」會把 demucs 分軌誤導成別的東西。
-    _dirty = [ln.split("沒清乾淨", 1)[-1].lstrip("::").strip()
-              for ln in (r.stdout or "").splitlines()
-              if "沒清乾淨" in ln]
+    # ⛔ 讀**機器記錄**,不切人話(Codex R30-P2-1):舊版切出來的是
+    #    `C:/Temp/stems-left(裡面是一整份分軌,請手動刪掉)` —— 那不是一個路徑,
+    #    而且種類整個不見了。⛔ 解析不到 ≠ 乾淨,rc=4 一律 fail-closed 記一筆。
+    _dirty = []
     if r.returncode == 4:
-        print(f"      ⛔ 暫存殘留(請手動刪掉):{_dirty or '見上面輸出'}", flush=True)
+        _dirty = parse_dirty(r.stdout or "") or [
+            {"kind": "unknown", "path": "(路徑不明 —— 見上面輸出)"}]
+        print("      ⛔ 暫存殘留(請手動刪掉):"
+              + "；".join(f"[{x['kind']}] {x['path']}" for x in _dirty), flush=True)
     if not out_json.exists():
         return None, (r.stderr or r.stdout or "")[-300:]
     # ⛔ 讀不開的報告要收斂成一則錯誤,不可以讓整批炸掉(R25 新測試踩到):
@@ -420,7 +423,9 @@ def main():
         for k, paths in _dirty_rows:
             print(f"   · {Path(k).name}")
             for x in paths:
-                print(f"     {x}")
+                # ⚠️ 舊 store 存的是純字串,新的是 {kind, path} —— 兩種都要印得出來
+                print(f"     [{x['kind']}] {x['path']}" if isinstance(x, dict)
+                      else f"     {x}")
     print(f"完整數據:{store}")
 
 

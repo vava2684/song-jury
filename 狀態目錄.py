@@ -79,6 +79,23 @@ def state_root() -> Path:
     return _ensure_private_dir(d, "狀態目錄")
 
 
+def ensure_private_subdir(parent: Path, name: str, what: str = None) -> Path:
+    """`parent/name` 這個私人子目錄 —— 與 `_locks` **同一套驗證**。
+
+    ⛔ Codex R30-P2-3(WSL 實證):葉節點的鎖檔走了 safe_open_lock,可是
+       `web-tmp` 這個**父目錄**只用 `mkdir(exist_ok=True)` 就開了 ——
+       預植 `web-tmp -> /somewhere/else` 之後,租約照樣拿得到,而 request 目錄
+       與**還沒公開的歌詞**已經沿著 symlink 寫到狀態目錄外面去了。
+       產品對使用者的承諾是「放進自己的受管私人目錄」,那就每一層都要算數。
+
+    ⚠️ parent 一定要由**呼叫端**傳進來(不是這裡自己叫 state_root()):
+       呼叫端各自持有自己的 `state_root` 參照,這裡若繞過它去讀模組層那份,
+       覆寫就只會生效一半 —— 鎖走覆寫後的根、目錄卻建在真正的使用者狀態目錄裡。
+       (自己踩過:改成自取 state_root() 之後,一批網頁測試安靜地跑去用真的狀態目錄。)
+    """
+    return _ensure_private_dir(Path(parent) / name, what or f"{name} 目錄")
+
+
 def locks_dir() -> Path:
     """工作鎖目錄:狀態目錄底下的 _locks,同樣「私人普通資料夾」標準(Codex R12:
     `_locks` 本身被換成 symlink 時,鎖檔會被導出互斥域 —— 目錄也要驗,不只鎖檔)。"""

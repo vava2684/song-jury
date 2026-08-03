@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from 暫存清理 import force_rmtree
+from 暫存清理 import emit_dirty, force_rmtree
 
 # Windows 繁中主控台預設 cp950,印不出報告的全形符號,強制改用 UTF-8
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -778,6 +778,9 @@ def main():
             for _x in _dirty:
                 print(f"⛔ 分軌暫存沒清乾淨:{_x}(裡面是一整份分軌,請手動刪掉)",
                       file=sys.stderr)
+            # ⛔ 人話給人看,呼叫端要讀的是這一行(Codex R30-P2-1):
+            #    切中文字串會把「(裡面是…)」也當成路徑的一部分。
+            emit_dirty([("demucs_stems", _x) for _x in _dirty])
             # ⚠️ 「正常結束」包含 sys.exit(0)(CLI 的正常收場)——
             #    只看 exc_info 是不是 None 的話,那條路會靜靜地回 0(自己踩到)。
             _exc = sys.exc_info()[1]

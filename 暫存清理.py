@@ -25,6 +25,7 @@
 """
 import contextlib
 import os
+import json
 import shutil
 import stat
 import sys
@@ -115,6 +116,50 @@ def _unlock_fd(fd) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass
+
+
+# ⛔ 「哪些暫存沒清乾淨」是**機器要讀的東西**,不可以叫下游去切人話
+#    (Codex R30-P2-1 實測:App 與批次各自 split 中文字串,結果種類整個不見、
+#     說明文字還被併進「路徑」——store 裡存的是
+#     `C:/Temp/stems-left(裡面是一整份分軌,請手動刪掉)`,那不是一個路徑)。
+#    → 產出端發布**一行、固定前綴、有 schema** 的記錄;人話只給終端機看。
+CLEANUP_TAG = "##SONG_JURY_CLEANUP##"
+
+
+def emit_dirty(items, stream=None):
+    """發布一次清理記錄。items = [(kind, path), ...]。"""
+    rec = {"cleanup_dirty": [{"kind": str(k), "path": str(p)} for k, p in items]}
+    print(CLEANUP_TAG + json.dumps(rec, ensure_ascii=False),
+          file=sys.stdout if stream is None else stream, flush=True)
+
+
+def parse_dirty(text):
+    """從子程序的輸出取出那筆記錄 → [{"kind":…, "path":…}, …]。
+
+    ⛔ 沒有可用記錄時回 **None**(不是 [])——呼叫端必須 fail-closed:
+       「解析不到」跟「乾淨」是兩件事,混在一起就會把一整份分軌講成沒事。
+    ⚠️ 取**最後一筆**:子程序自己也會發一筆,最外層那筆才是完整清單。
+    """
+    found = None
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln.startswith(CLEANUP_TAG):
+            continue
+        try:
+            items = json.loads(ln[len(CLEANUP_TAG):])["cleanup_dirty"]
+        except (ValueError, KeyError, TypeError):
+            continue                      # 半行/被截斷 → 當成沒有記錄
+        if not isinstance(items, list):
+            continue
+        got = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            k, p = it.get("kind"), it.get("path")
+            if isinstance(k, str) and isinstance(p, str) and p:
+                got.append({"kind": k, "path": p})
+        found = got
+    return found
 
 
 def take_ex(path):

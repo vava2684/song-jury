@@ -1076,7 +1076,13 @@ def test_sh在分軌體檢被中斷時要立刻停下來(tmp_path, sig, rc_want,
         "pid=$!\n"
         # ⚠️ 要等**心跳**不是等 PID 檔:PID 一寫完就送訊號的話,可能還沒跳第一下,
         #    下面「心跳有沒有停」就成了 '' == '' 的假通過(自己踩到,TERM 那組先紅)。
-        f"for i in $(seq 1 300); do [ -s '{posix(beat)}' ] && break; sleep 0.1; done\n"
+        f"for i in $(seq 1 600); do [ -s '{posix(beat)}' ] && break; sleep 0.1; done\n"
+        # ⚠️ 等逾時了要**講出來**(不然是誤診):心跳還是空的時候,下面
+        #    「心跳有沒有往前走」會變成 '' vs '',於是報成「handler 沒把訊號
+        #    轉下去」—— 實際上是機器太忙、探針還沒跳第一下就被砍了。
+        #    ⛔ 誤診比紅燈更糟:會有人跑去改一個根本沒壞的 trap(跑全量變異
+        #       的時候機器很滿,這條就是這樣紅的)。
+        f"[ -s '{posix(beat)}' ] && echo 'BEAT_READY=1' || echo 'BEAT_READY=0'\n"
         "start=$SECONDS\n"
         f"kill -{sig} \"$pid\"\n"
         "wait \"$pid\"; rc=$?\n"
@@ -1089,6 +1095,10 @@ def test_sh在分軌體檢被中斷時要立刻停下來(tmp_path, sig, rc_want,
     got = dict(x.split("=", 1) for x in (r.stdout or "").splitlines() if "=" in x)
     out = (d / "out.txt").read_text(encoding="utf-8", errors="replace")
     assert beat.exists(), f"🔴 探針還沒開始就結束了,這次沒驗到中斷:\n{out[-600:]}"
+    # ⛔ 「沒驗到」要講成沒驗到,不可以借別的斷言的嘴巴報一個錯的死因
+    assert got.get("BEAT_READY") == "1", (
+        "🔴 探針在 60 秒內還沒跳第一下 —— 這次**沒驗到**中斷(不是 handler 壞掉)。"
+        f"機器負載太高時會這樣,重跑即可;輸出尾巴:\n{out[-600:]}")
     assert got.get("RC") == str(rc_want), \
         f"🔴 {sig} 之後應該回 {rc_want},拿到 {got.get('RC')};輸出尾巴:\n{out[-600:]}"
     # ⛔ 立刻:探針還要睡 60 秒,若我們等它自然結束就不叫「中斷」

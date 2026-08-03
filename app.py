@@ -18,8 +18,9 @@ from pathlib import Path
 import gradio as gr
 
 from 子程序 import run_tree
-from 狀態目錄 import state_root
-from 暫存清理 import ACQUIRED, force_rmtree, is_busy, release, take_ex
+from 狀態目錄 import ensure_private_subdir, state_root
+from 暫存清理 import (ACQUIRED, force_rmtree, is_busy, parse_dirty,
+                      release, take_ex)
 from 設定讀取 import ConfigError, positive_finite
 import requests
 from urllib.parse import urlparse
@@ -119,9 +120,10 @@ _WEB_TMP_TTL = max(60.0, positive_finite("SONG_JURY_WEB_TMP_TTL", 3600.0,
 
 
 def _web_tmp_root() -> Path:
-    d = state_root() / "web-tmp"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    # ⛔ 不可以只 mkdir(Codex R30-P2-3):`web-tmp` 被換成指向外面的
+    #    symlink/junction 時,租約照樣拿得到,而歌詞已經寫到狀態目錄外面。
+    #    → 與 `_locks` 同一套驗證:拒 symlink/reparse point、0700、驗擁有者。
+    return ensure_private_subdir(state_root(), "web-tmp", "網頁暫存目錄 web-tmp")
 
 
 _ACTIVE = ".active"          # 還在跑的請求會**持有**這個鎖檔(不是只是放著)
@@ -305,12 +307,14 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
         return [], None, "", f"❌ 音訊評分失敗:\n```\n{(r.stderr or r.stdout)[-1000:]}\n```"
     _snap_warn = ""
     if r.returncode == 4:
-        # ⚠️ 種類要跟著出來(Codex R29-P1-1):四種暫存的處理方式不同,
-        #    一律寫「來源快照」會把 demucs 分軌誤導成別的東西。
-        _lines = [ln.strip() for ln in (r.stdout or "").splitlines() if "沒清乾淨" in ln]
+        # ⛔ 讀**機器記錄**,不切人話(Codex R30-P2-1):切字串會讓種類消失、
+        #    還把「(裡面是一整份分軌…)」這種說明併進路徑。
+        # ⛔ 解析不到 ≠ 乾淨:rc=4 是退出碼契約,fail-closed 照樣要講出來。
+        _rec = parse_dirty(r.stdout or "") or [
+            {"kind": "unknown", "path": "(路徑不明 —— 見伺服器輸出)"}]
         _snap_warn = ("\n\n⛔ **有暫存沒清乾淨**(評測本身有效):"
-                      + ("；".join(_lines) if _lines else "見伺服器輸出")
-                      + " —— 請手動刪掉(方括號裡是種類:來源快照/上傳補正檔/分軌)。")
+                      + "；".join(f"[{x['kind']}] {x['path']}" for x in _rec)
+                      + " —— 請手動刪掉。")
     jpath = _jpath_from_stdout(r.stdout)
     if not jpath or not jpath.exists():
         return [], None, "", f"❌ 找不到結果 JSON。\n```\n{r.stdout[-600:]}\n```"
@@ -354,6 +358,11 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
                     + "\n".join(f"- {n}" for n in _notes) + "\n\n</details>\n")
 
     arc_img = None
+    # ⛔ 完成訊息要跟著**實際結果**降級(Codex R30-P2-2 實測):租約拿不到時
+    #    弧線根本沒跑,訊息卻照樣寫「✅ 音訊+情感完成」,只在下面附一行小字
+    #    「情感弧線跳過」——上下矛盾,而使用者會相信那個 ✅。
+    #    no_lyrics(沒詞)/ done(有圖)/ skipped(沒跑)/ failed(跑了沒圖)
+    arc_status = "no_lyrics"
     # ⭐ SUNO 連結會自動抓到歌詞(評審團.py 存在 fetched_lyrics)—— 原本只看文字框,
     #    導致「只貼連結」時明明抓到詞卻說「沒給歌詞」,白白跳過詞評與情感弧線。
     if not (lyrics or "").strip():
@@ -367,10 +376,12 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
         #    情感弧線的子程序、寫檔、或任何未收斂的例外都會讓 request 中止,
         #    但服務程序還活著 → holder 的 fd 與 _HELD 會留到整個 Gradio 重啟為止,
         #    而 sweep 對 _HELD 內的路徑一律跳過 → 那份歌詞永遠不會被回收。
+        arc_status = "failed"        # 先當作沒成功,拿到圖才升級(fail-closed)
         try:
             _reqdir = _web_workdir()
         except RuntimeError as e:
             _reqdir = None
+            arc_status = "skipped"
             notes_md += f"\n\n⚠️ 情感弧線跳過:{e}"
         if _reqdir is not None:
             try:
@@ -379,6 +390,10 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
                 _run([_venv_py(".venv"), str(BASE / "情感弧線.py"), str(tmp)])
                 cand = tmp.with_name(tmp.stem + "_情感弧線.png")
                 arc_img = str(cand) if cand.exists() else None
+                if arc_img:
+                    arc_status = "done"
+                else:
+                    notes_md += "\n\n⚠️ 情感弧線沒有產出圖檔"
             finally:
                 # 產物已經交給 Gradio(或這次失敗了)→ 兩種情況都要放掉租約
                 _web_done(_reqdir)
@@ -387,13 +402,17 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     if not has_lyrics:
         note = "✅ 音訊完成。沒給歌詞→跳過情感弧線與詞評。"
     elif not model:
-        note = ("✅ 音訊+情感完成。**第三關詞評需要本機 Ollama**——請裝 "
+        note = (("✅ 音訊+情感完成。" if arc_status == "done"
+                 else "✅ 音訊完成(情感弧線未完成,見下方)。")
+                + "**第三關詞評需要本機 Ollama**——請裝 "
                 "[Ollama](https://ollama.com)、`ollama pull qwen3`,再重開本頁選模型評分。")
     else:
         progress(0.75, desc=f"第三關詞評中(本機 {model},27B 需 1–3 分鐘)…")
         try:
             lyric_eval = ollama_judge(model, _lyric_prompt(lyrics))
-            note = (f"✅ 三關完成。第三關詞評由本機 **{model}** 產出(免費/離線)。"
+            note = ((("✅ 三關完成。" if arc_status == "done"
+                      else "✅ 音訊+詞評完成(情感弧線未完成,見下方)。")
+                     + f"第三關詞評由本機 **{model}** 產出(免費/離線)。")
                     if lyric_eval else
                     f"⚠️ **{model}** 詞評回傳空白——換個模型再試(建議 qwen3 系列)。")
         except Exception as e:

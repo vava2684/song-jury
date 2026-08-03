@@ -115,6 +115,19 @@ def test_提示詞明講只評詞不評曲(A):
     assert "只評詞" in seg
 
 
+def _cleanup_line(items):
+    """產生一行**真的**清理記錄(直接用產品的 emit_dirty)。
+
+    ⛔ 不要在測試裡手抄那個前綴/JSON:stub 與線上格式一旦漂開,測試就會
+       對著一個現實中不存在的輸出過關(R30 收尾時真的踩到:兩條舊測試的 stub
+       還在吐 R30 之前的人話,而產品早就改讀機器記錄了)。"""
+    import io as _io
+    T = load("暫存清理")
+    buf = _io.StringIO()
+    T.emit_dirty(items, stream=buf)
+    return buf.getvalue()
+
+
 def test_網頁版要處理快照殘留的退出碼(A, tmp_path, monkeypatch):
     """🔴 Codex R25-P1-1 實測:4 =「報告已產出,但來源快照沒收乾淨」——
     舊版把它當成 `❌ 音訊評分失敗`,表格 0 列、報告完全不讀。
@@ -133,13 +146,15 @@ def test_網頁版要處理快照殘留的退出碼(A, tmp_path, monkeypatch):
     left = "C:/Temp/song-jury-src-xxxx"
     monkeypatch.setattr(A, "_run", lambda *a, **k: _t.SimpleNamespace(
         returncode=4,
-        stdout=f"完整報告:{rep}\n⛔ 暫存沒清乾淨[source_snapshot]:{left}\n",
+        stdout=(f"完整報告:{rep}\n⛔ 暫存沒清乾淨[source_snapshot]:{left}\n"
+                + _cleanup_line([("source_snapshot", left)])),
         stderr=""))
     song = tmp_path / "甲.wav"
     song.write_bytes(b"RIFF")
     table, _img, _lyr, note = A.evaluate("", str(song), "", None)
     assert table, f"🔴 rc=4 的有效報告沒被讀進來(表格是空的):{note}"
-    assert "快照" in note and left in note, f"🔴 沒把殘留路徑講給使用者:{note}"
+    # ⭐ R30:種類與**純路徑**都要出現(舊版只查得到「快照」兩個字)
+    assert f"[source_snapshot] {left}" in note, f"🔴 沒把殘留講清楚給使用者:{note}"
 
 
 def test_網頁版的歌詞與圖要放進受管暫存並會被回收(A, tmp_path, monkeypatch):
@@ -189,11 +204,13 @@ def test_網頁版遇到損壞的報告不可以炸掉request(A, tmp_path, monke
     bad.write_text("這不是 JSON", encoding="utf-8")
     monkeypatch.setattr(A, "_run", lambda *a, **k: _ty.SimpleNamespace(
         returncode=rc,
-        stdout=f"完整報告:{bad}\n⛔ 暫存沒清乾淨[source_snapshot]:X\n", stderr=""))
+        stdout=(f"完整報告:{bad}\n⛔ 暫存沒清乾淨[source_snapshot]:X\n"
+                + _cleanup_line([("source_snapshot", "X")])), stderr=""))
     table, _img, _lyr, note = A.evaluate("", str(tmp_path / "甲.wav"), "", None)
     assert table == [] and "讀不了" in note, f"🔴 沒有收斂成產品訊息:{note!r}"
     if rc == 4:
-        assert "快照" in note, "🔴 報告壞掉時把快照殘留的警告也弄丟了"
+        assert "[source_snapshot] X" in note, \
+            "🔴 報告壞掉時把殘留的警告也弄丟了(那份音訊還在伺服器上)"
 
 
 def test_網頁回收不可以刪掉還在跑的請求(A, tmp_path, monkeypatch):
@@ -358,3 +375,151 @@ def test_啟動回收失敗時錯誤處理不可以再踩同一顆地雷(tmp_pat
     out = (r.stdout or "") + (r.stderr or "")
     assert "IMPORT_OK" in out, f"🔴 狀態目錄壞掉時 import 直接裸爆:\n{out[-600:]}"
     assert "回收失敗" in out, f"🔴 沒有印出具名告警:\n{out[-400:]}"
+
+
+# ── R30 ──────────────────────────────────────────────────────────
+def _web_eval(A, tmp_path, monkeypatch, *, jury_stdout_extra="", rc=0,
+              arc_ok=True, lease_ok=True, model=None):
+    """跑一次 app.evaluate(),回 (成績表, 弧線圖, 詞評, 說明)。"""
+    import json
+    import types as _ty
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    P8 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")
+    pt = {"完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
+          "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in P8},
+          "曲側含柱": list(P8)}
+    rep = tmp_path / "甲_評審團.json"
+    rep.write_text(json.dumps({"scoring_contract": "2026-07-25-v1", "pillar_totals": pt,
+                               "scores": {"total": 70.0}}, ensure_ascii=False),
+                   encoding="utf-8")
+
+    def _run(cmd, timeout=None):
+        joined = " ".join(str(c) for c in cmd)
+        if "情感弧線.py" in joined:
+            if arc_ok:                       # 真的產出那張圖
+                src = Path(cmd[-1])
+                src.with_name(src.stem + "_情感弧線.png").write_bytes(b"PNG")
+            return _ty.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return _ty.SimpleNamespace(returncode=rc,
+                                   stdout=f"完整報告:{rep}\n" + jury_stdout_extra,
+                                   stderr="")
+
+    monkeypatch.setattr(A, "_run", _run)
+    if not lease_ok:
+        T = load("暫存清理")
+        monkeypatch.setattr(A, "take_ex", lambda _p: (None, T.BACKEND_ERROR,
+                                                      "filesystem locking unsupported"))
+    if model:
+        monkeypatch.setattr(A, "ollama_judge", lambda *_a, **_k: "(詞評內容)")
+    return A.evaluate("", str(tmp_path / "甲.wav"), "夜風吹過窗縫 帶來輕輕的呢喃", model)
+
+
+def test_弧線沒跑出來就不可以說音訊加情感完成(A, tmp_path, monkeypatch):
+    """🔴 Codex R30-P2-2(實跑重現):`_web_workdir()` 回 BACKEND_ERROR 時弧線
+    整段沒跑、`arc_image` 是 None,訊息卻照樣寫「✅ 音訊+情感完成」,
+    只在下面附一行小字「情感弧線跳過」—— ⛔ 上下矛盾,而使用者只會看那個 ✅。"""
+    _t, arc, _l, note = _web_eval(A, tmp_path, monkeypatch, lease_ok=False)
+    assert arc is None, "這個情境本來就不該有圖(不然沒驗到)"
+    assert "音訊+情感完成" not in note, f"🔴 弧線沒跑卻說完成了:\n{note}"
+    assert "情感弧線" in note and ("跳過" in note or "未完成" in note), \
+        f"🔴 也沒有講清楚弧線怎麼了:\n{note}"
+
+
+def test_弧線沒跑出來時選了模型也不可以說三關完成(A, tmp_path, monkeypatch):
+    """同一件事的另一支訊息:選了 Ollama 模型時寫「✅ 三關完成」——
+    第二關根本沒跑完(Codex R30-P2-2 指的 app.py:396 那條路徑)。"""
+    _t, arc, lyric, note = _web_eval(A, tmp_path, monkeypatch,
+                                     lease_ok=False, model="qwen3")
+    assert arc is None and lyric, "要驗的是「詞評有、弧線沒有」"
+    assert "三關完成" not in note, f"🔴 只跑了兩關卻說三關完成:\n{note}"
+
+
+def test_弧線跑了卻沒產出圖也要降級(A, tmp_path, monkeypatch):
+    """⚠️ 租約拿到了、子程序也回 0,但就是沒有那張 png(磁碟滿、字型缺、
+    子程序自己吞掉錯誤)。⛔ 這時候一樣不可以說「情感完成」。"""
+    _t, arc, _l, note = _web_eval(A, tmp_path, monkeypatch, arc_ok=False)
+    assert arc is None
+    assert "音訊+情感完成" not in note, f"🔴 沒有圖卻說情感完成:\n{note}"
+
+
+def test_弧線正常時才說音訊加情感完成(A, tmp_path, monkeypatch):
+    """反向:一切正常時訊息**不可以**被降級講法蓋掉(不然這組測試只證明了
+    「永遠不說完成」——那是另一種不誠實)。"""
+    _t, arc, _l, note = _web_eval(A, tmp_path, monkeypatch)
+    assert arc is not None, "正常情境要有圖"
+    assert "音訊+情感完成" in note, f"🔴 正常跑完卻沒說完成:\n{note}"
+
+
+def test_網頁的殘留提示要有種類與純路徑(A, tmp_path, monkeypatch):
+    """🔴 Codex R30-P2-1:網頁抓的是含「沒清乾淨」的**人話那一行**,
+    `[demucs_stems]` 不見、說明文字還被當成路徑的一部分。"""
+    extra = ("⛔ 分軌暫存沒清乾淨:C:/Temp/stems-left(裡面是一整份分軌,請手動刪掉)\n"
+             + _cleanup_line([("demucs_stems", "C:/Temp/stems-left")]))
+    _t, _a, _l, note = _web_eval(A, tmp_path, monkeypatch, rc=4, jury_stdout_extra=extra)
+    assert "[demucs_stems] C:/Temp/stems-left" in note, \
+        f"🔴 種類或純路徑沒送到網頁:\n{note}"
+    assert "裡面是一整份分軌" not in note.split("[demucs_stems]", 1)[-1].split("」")[0], \
+        f"🔴 說明文字被併進路徑了:\n{note}"
+
+
+def test_網頁讀不到清理記錄也要照樣示警(A, tmp_path, monkeypatch):
+    """⛔ fail-closed:rc=4 但沒有機器記錄(舊版子程序/輸出被截斷)——
+    不可以因為「解析不到」就不提醒,那份音訊還在伺服器上。"""
+    _t, _a, _l, note = _web_eval(A, tmp_path, monkeypatch, rc=4,
+                                 jury_stdout_extra="(這裡什麼記錄都沒有)\n")
+    assert "有暫存沒清乾淨" in note, f"🔴 讀不到記錄就整個不提了:\n{note}"
+    # ⛔ 光是留著那句抬頭不算數:抬頭後面如果是空的,使用者看到
+    #    「有暫存沒清乾淨: —— 請手動刪掉。」等於沒講,他不知道要去哪裡刪。
+    assert "路徑不明" in note, f"🔴 只留了抬頭、沒說「路徑不明去看伺服器輸出」:\n{note}"
+
+
+def test_web_tmp的父目錄也要是私人普通目錄(A, tmp_path, monkeypatch):
+    """🔴 Codex R30-P2-3(WSL 實證):`.active` 這個**葉節點**走了 safe_open_lock,
+    可是 `web-tmp` 這層只用 `mkdir(exist_ok=True)` 就開了 —— 預植
+    `web-tmp -> 外面` 之後租約照樣拿得到,而 request 目錄與**還沒公開的歌詞**
+    已經寫到狀態目錄外面。⛔ 產品承諾的是「自己的受管私人目錄」,每一層都要算數。"""
+    import os as _os
+    root = tmp_path / "state"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        _os.symlink(outside, root / "web-tmp", target_is_directory=True)
+    except OSError:
+        pytest.skip("這台建不了 symlink(Windows 需要管理員;junction 版見另一條)")
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    # ⚠️ 用「基底類別 + 類別名」比對:conftest 的 load() 每次都重新 exec 模組,
+    #    load("狀態目錄").StateDirError 跟 app 當初 import 到的**不是同一個類別物件**。
+    with pytest.raises(RuntimeError) as e:
+        A._web_workdir()
+    assert type(e.value).__name__ == "StateDirError", type(e.value).__name__
+    assert "web-tmp" in str(e.value)
+    assert list(outside.iterdir()) == [], \
+        f"🔴 已經寫到狀態目錄外面去了:{[x.name for x in outside.iterdir()]}"
+
+
+def test_web_tmp是junction也要拒絕(A, tmp_path, monkeypatch):
+    """Windows 版的同一件事:junction 不需要管理員就建得出來,
+    所以這條在一般 Windows 開發機/CI 上都真的會跑。"""
+    import subprocess as _sp
+    import sys as _sys
+    if _sys.platform != "win32":
+        pytest.skip("junction 是 Windows 的東西")
+    root = tmp_path / "state"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    # ⚠️ 一定要指定 encoding:mklink 在中文 Windows 會吐 cp950 以外的位元組,
+    #    text=True 用系統預設編碼解 → reader thread 裡 UnicodeDecodeError(自己踩到)。
+    r = _sp.run(["cmd", "/c", "mklink", "/J", str(root / "web-tmp"), str(outside)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        pytest.skip(f"這台建不了 junction:{r.stdout or r.stderr}")
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    with pytest.raises(RuntimeError) as e:
+        A._web_workdir()
+    assert type(e.value).__name__ == "StateDirError", type(e.value).__name__
+    assert "web-tmp" in str(e.value)
+    assert list(outside.iterdir()) == [], \
+        f"🔴 已經寫到狀態目錄外面去了:{[x.name for x in outside.iterdir()]}"
