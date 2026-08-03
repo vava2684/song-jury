@@ -190,3 +190,39 @@ def test_網頁版遇到損壞的報告不可以炸掉request(A, tmp_path, monke
     assert table == [] and "讀不了" in note, f"🔴 沒有收斂成產品訊息:{note!r}"
     if rc == 4:
         assert "快照" in note, "🔴 報告壞掉時把快照殘留的警告也弄丟了"
+
+
+def test_網頁回收不可以刪掉還在跑的請求(A, tmp_path, monkeypatch):
+    """🔴 Codex R27-P2-1:舊版只看 mtime —— 一個還在跑的請求(情感弧線/Ollama 詞評
+    可能好幾分鐘)只要超過保留期,**下一個請求就會把它正在用的目錄刪掉**,
+    使用者拿到一張不存在的圖。⛔ 要有租約:active 的目錄不可以被當成過期產物。"""
+    import os as _os
+    import time as _t
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    active = A._web_workdir()                    # 模擬「正在跑」
+    (active / "歌詞.txt").write_text("還在用", encoding="utf-8")
+    old = _t.time() - 3600
+    _os.utime(active, (old, old))
+    assert A._sweep_web_tmp(ttl=60) == 0, "🔴 把還在跑的請求刪掉了"
+    assert active.exists() and (active / "歌詞.txt").exists()
+    # 完成之後(解除租約)才可以被回收
+    A._web_done(active)
+    _os.utime(active, (old, old))
+    assert A._sweep_web_tmp(ttl=60) == 1, "🔴 完成且過期了卻沒回收"
+    assert not active.exists()
+
+
+def test_被中斷的請求最後還是要回收(A, tmp_path, monkeypatch):
+    """⚠️ 租約不可以變成「永遠不刪」的免死金牌:程序被砍時 active 標記會留著,
+    所以超過**放棄期**就要當成孤兒回收(否則受管目錄會無限長大)。"""
+    import os as _os
+    import time as _t
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    d = A._web_workdir()
+    (d / "歌詞.txt").write_text("被中斷的", encoding="utf-8")
+    very_old = _t.time() - 99999
+    _os.utime(d, (very_old, very_old))
+    assert A._sweep_web_tmp(ttl=60, abandon=3600) == 1, "🔴 孤兒目錄永遠不會被回收"
+    assert not d.exists()

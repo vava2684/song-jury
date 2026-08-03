@@ -727,3 +727,87 @@ def test_批次要把暫存殘留寫進store與總結(tmp_path, monkeypatch, cap
     dirty = data.get("_cleanup_dirty")
     assert dirty and "song-jury-src-xxxx" in dirty[0], \
         f"🔴 殘留路徑沒有進到結果(store 就存不到):{data.get('_cleanup_dirty')!r}"
+
+
+def test_上傳補正檔複製到一半失敗也不可以留下暫存(tmp_path, monkeypatch):
+    """🔴 Codex R27-P1-1:目錄是在 `resolve_input()` 裡建的,而 main 的 try/finally
+    **還沒進場** —— 複製失敗(磁碟滿、來源消失、權限)時那個目錄(可能已經有
+    半份甚至接近完整的音訊)就沒有人清,而且 OSError 會裸奔。"""
+    J = load("評審團")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
+    up = tmp_path / "no_ext_upload"
+    up.write_bytes(b"RIFF" + b"z" * 500)
+
+    def _half_then_boom(src, dst, *a, **k):
+        Path(dst).write_bytes(b"RIFF" + b"z" * 200)      # 先寫一半
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(J.shutil, "copyfile", _half_then_boom)
+    owned = []
+    with pytest.raises(SystemExit) as e:
+        J.resolve_input(str(up), owned)
+    msg = str(e.value.code)
+    assert "複製上傳檔失敗" in msg and "Traceback" not in msg, f"🔴 不是人話:{msg!r}"
+    assert sorted(x.name for x in iso.iterdir()) == [], \
+        f"🔴 半份音訊留在 TEMP:{sorted(x.name for x in iso.iterdir())}"
+    assert owned == [], "🔴 已經刪掉的目錄還留在 owned 裡(main 會再刪一次並誤報)"
+
+
+def test_song_scorer的分軌暫存要有人清(tmp_path, monkeypatch):
+    """🔴 Codex R27-P1-2:`song_scorer.py --demucs` 的 `tempfile.mkdtemp()` 沒有主人 ——
+    那裡面是 Demucs 的**完整分軌**(等於整首歌再一份),不是一個小 JSON。"""
+    S = load("song_scorer")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(S.tempfile, "tempdir", str(iso)) if hasattr(S, "tempfile") else None
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(iso))
+    mix = tmp_path / "mix.wav"
+    mix.write_bytes(b"RIFF0000")
+
+    def fake_run(cmd, **kw):
+        out = Path(cmd[cmd.index("-o") + 1])
+        d = out / "htdemucs" / "song"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "vocals.wav").write_bytes(b"RIFF" + b"v" * 500)
+        return None
+
+    monkeypatch.setattr(S.subprocess, "run", fake_run) if hasattr(S, "subprocess") else None
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    owned = []
+    voc, d = S.separate_with_demucs(str(mix), owned)
+    assert Path(voc).exists() and owned == [d], "🔴 沒有把暫存目錄交給呼叫端"
+    # 呼叫端清掉之後,系統 TEMP 要乾淨
+    import shutil as _sh
+    for x in owned:
+        _sh.rmtree(x, ignore_errors=True)
+    assert sorted(x.name for x in iso.iterdir()) == [], \
+        f"🔴 分軌暫存留下來了:{sorted(x.name for x in iso.iterdir())}"
+    # 而且 main 真的有那條 finally(不是只有函式回傳而已)
+    src = (REPO / "song_scorer.py").read_text(encoding="utf-8")
+    assert "for _d in _owned_tmp:" in src and "finally:" in src, \
+        "🔴 main 沒有負責清掉暫存目錄"
+
+
+def test_song_scorer的分軌失敗時就地清乾淨(tmp_path, monkeypatch):
+    """⛔ demucs 自己炸掉時,呼叫端還沒拿到任何東西 —— 這時候要就地清,
+    不可以留一個半成品目錄等別人。"""
+    S = load("song_scorer")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    import subprocess as _sp
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "tempdir", str(iso))
+
+    def boom(cmd, **kw):
+        raise _sp.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(_sp, "run", boom)
+    owned = []
+    with pytest.raises(_sp.CalledProcessError):
+        S.separate_with_demucs(str(tmp_path / "mix.wav"), owned)
+    assert owned == [] and sorted(x.name for x in iso.iterdir()) == [], \
+        f"🔴 失敗路徑留下暫存:{sorted(x.name for x in iso.iterdir())}"

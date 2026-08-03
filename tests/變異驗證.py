@@ -1221,6 +1221,43 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R27 ────────────────────────────────────────────────
+    ('上傳補正檔複製失敗時不收拾(半份音訊留在 TEMP + 裸 OSError)',
+     '評審團.py',
+     '            try:\n                # ⛔ copyfile 不 copy2:不要把唯讀屬性帶過來(收工會刪不掉,R24-P1-1)\n                shutil.copyfile(p, fixed)',
+     '            if True:\n                shutil.copyfile(p, fixed)',
+     'tests/test_來源身分.py::test_上傳補正檔複製到一半失敗也不可以留下暫存'),
+
+    ('song_scorer 的分軌暫存不交給呼叫端(整份分軌沒人清)',
+     'song_scorer.py',
+     '    if owned_out is not None:\n        owned_out.append(out)',
+     '    pass   # 變異:不登記',
+     'tests/test_來源身分.py::test_song_scorer的分軌暫存要有人清'),
+
+    ('song_scorer 的 main 不清暫存(留一整份分軌在 TEMP)',
+     'song_scorer.py',
+     '        for _d in _owned_tmp:',
+     '        for _d in []:   # 變異:不清',
+     'tests/test_來源身分.py::test_song_scorer的分軌暫存要有人清'),
+
+    ('分軌失敗時不就地清乾淨(留一個半成品目錄)',
+     'song_scorer.py',
+     '        shutil.rmtree(out, ignore_errors=True)\n        raise',
+     '        raise',
+     'tests/test_來源身分.py::test_song_scorer的分軌失敗時就地清乾淨'),
+
+    ('網頁回收不看租約(把還在跑的請求目錄刪掉)',
+     'app.py',
+     '            if age <= (abandon if active else ttl):',
+     '            if age <= ttl:   # 變異:不看租約',
+     'tests/test_rubric_pick.py::test_網頁回收不可以刪掉還在跑的請求'),
+
+    ('網頁的租約變成免死金牌(被中斷的請求永遠不回收)',
+     'app.py',
+     '            if age <= (abandon if active else ttl):',
+     '            if active or age <= ttl:   # 變異:active 就永遠不刪',
+     'tests/test_rubric_pick.py::test_被中斷的請求最後還是要回收'),
+
     # ── Codex R26 ────────────────────────────────────────────────
     ('上傳補正檔沒人清(一整份音訊永久留在 TEMP)',
      '評審團.py',
@@ -1240,17 +1277,17 @@ MUTATIONS = [
      '        pass   # 變異:只印不記',
      'tests/test_來源身分.py::test_批次要把暫存殘留寫進store與總結'),
 
-    ('網頁版又把歌詞丟進系統 TEMP(沒有主人、沒有 TTL)',
-     'app.py',
-     '        tmp = _web_workdir() / "歌詞.txt"',
-     '        tmp = Path(tempfile.mkdtemp()) / "歌詞.txt"',
-     'tests/test_rubric_pick.py::test_網頁版的歌詞與圖要放進受管暫存並會被回收'),
+    ("網頁版又把歌詞丟進系統 TEMP(沒有主人、沒有 TTL)",
+     "app.py",
+     '        _reqdir = _web_workdir()',
+     '        _reqdir = Path(tempfile.mkdtemp())',
+     "tests/test_rubric_pick.py::test_網頁版的歌詞與圖要放進受管暫存並會被回收"),
 
-    ('網頁版的舊產物不回收(受管目錄變成永久堆積)',
-     'app.py',
-     '            if d.is_dir() and (now - d.stat().st_mtime) > ttl:',
-     '            if False:   # 變異:不回收',
-     'tests/test_rubric_pick.py::test_網頁版的歌詞與圖要放進受管暫存並會被回收'),
+    ("網頁版的舊產物不回收(受管目錄變成永久堆積)",
+     "app.py",
+     "            if age <= (abandon if active else ttl):\n                continue",
+     "            continue   # 變異:什麼都不回收",
+     "tests/test_rubric_pick.py::test_網頁版的歌詞與圖要放進受管暫存並會被回收"),
 
     ('網頁版讀損壞報告直接炸掉 request',
      'app.py',

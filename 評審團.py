@@ -1084,8 +1084,21 @@ def resolve_input(arg, owned_out=None):
             if owned_out is not None:
                 owned_out.append(d)
             fixed = d / (_safe_name(p.stem or "upload") + ".mp3")
-            # ⛔ copyfile 不 copy2:不要把唯讀屬性帶過來(收工會刪不掉,R24-P1-1)
-            shutil.copyfile(p, fixed)
+            try:
+                # ⛔ copyfile 不 copy2:不要把唯讀屬性帶過來(收工會刪不掉,R24-P1-1)
+                shutil.copyfile(p, fixed)
+            except OSError as e:
+                # ⛔ 這裡**還沒進到 main 的 try/finally**(Codex R27-P1-1):
+                #    複製失敗時如果直接讓 OSError 冒出去,剛建的目錄(以及已經
+                #    寫進去的半份甚至接近完整的音訊)就沒有任何人清 —— 所以
+                #    這一段要自己收拾乾淨,再給一句人話。
+                if owned_out is not None and d in owned_out:
+                    owned_out.remove(d)
+                gone = _force_rmtree(d)
+                sys.exit(f"✗ 複製上傳檔失敗({type(e).__name__}: {e})。\n"
+                         + (f"⛔ 而且暫存沒清乾淨:{gone}(裡面可能有半份音訊,請手動刪掉)\n"
+                            if gone else "")
+                         + f"→ 檢查 TEMP/TMPDIR 的空間與權限(需要約等於音檔大小)。")
             print(f"📎 上傳檔補正音檔副檔名: {fixed}")
             return p, fixed          # 命名照舊用原路徑,內容讀補正檔
         return p, p

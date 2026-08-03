@@ -19,6 +19,7 @@ song_scorer.py — 原創歌曲自動評分系統(無參考基準版)
 
 import argparse
 import json
+import shutil
 import sys
 import warnings
 from pathlib import Path
@@ -647,14 +648,29 @@ def render_report(meta, vocal_res, mix_res, vocal_score, mix_score, total):
     return "\n".join(lines)
 
 
-def separate_with_demucs(mix_path):
-    """可選:呼叫 demucs 把人聲分離出來(需 pip install demucs)。"""
+def separate_with_demucs(mix_path, owned_out=None):
+    """可選:呼叫 demucs 把人聲分離出來(需 pip install demucs)。
+
+    回 (人聲軌路徑, 暫存目錄)。
+
+    🔴 Codex R27-P1-2:舊版 `tempfile.mkdtemp()` 之後沒有任何人負責刪 ——
+       而那裡面不是一個小 JSON,是 Demucs 產出的**完整分軌**(等於整首歌再一份)。
+       ⛔ 暫存目錄登記給呼叫端,由 main 的最外層 finally 清掉;
+          demucs 失敗時這裡就地清乾淨(那時候呼叫端還沒拿到任何東西)。"""
     import subprocess
     import tempfile
-    out = Path(tempfile.mkdtemp())
-    subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals",
-                    "-o", str(out), str(mix_path)], check=True)
-    return str(next(out.rglob("vocals.wav")))
+    out = Path(tempfile.mkdtemp(prefix="song-jury-demucs-"))
+    if owned_out is not None:
+        owned_out.append(out)
+    try:
+        subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals",
+                        "-o", str(out), str(mix_path)], check=True)
+        return str(next(out.rglob("vocals.wav"))), out
+    except Exception:
+        if owned_out is not None and out in owned_out:
+            owned_out.remove(out)
+        shutil.rmtree(out, ignore_errors=True)
+        raise
 
 
 def main():
@@ -677,73 +693,85 @@ def main():
             user_w = json.load(f)
         weights = {k: {**DEFAULT_WEIGHTS[k], **user_w.get(k, {})} for k in DEFAULT_WEIGHTS}
 
-    vocal_path = args.vocal
-    if args.demucs and not vocal_path:
-        print("正在用 demucs 分離人聲(第一次會下載模型,較久)...")
-        vocal_path = separate_with_demucs(args.mix)
+    # ⛔ 從這裡開始都要在 try 裡(Codex R27-P1-2):demucs 產出的是**整份分軌**,
+    #    後面任何一步炸掉都不可以把它留在 TEMP。
+    _owned_tmp = []
+    try:
+        vocal_path = args.vocal
+        if args.demucs and not vocal_path:
+            print("正在用 demucs 分離人聲(第一次會下載模型,較久)...")
+            vocal_path, _ = separate_with_demucs(args.mix, _owned_tmp)
 
-    print("分析編曲混音中...")
-    mix_res, beats, y22 = analyze_mix(args.mix)
-    key_info = estimate_key(y22, SR_MUSIC)
-    duration = len(y22) / SR_MUSIC
+        print("分析編曲混音中...")
+        mix_res, beats, y22 = analyze_mix(args.mix)
+        key_info = estimate_key(y22, SR_MUSIC)
+        duration = len(y22) / SR_MUSIC
 
-    vocal_res = None
-    if vocal_path:
-        print("分析演唱表現中(音高追蹤較花時間)...")
-        # ⚖️ rhythm 修復(2026-07-24 H2 D1 裁決「網格改建於鼓+貝斯」):
-        #    舊法拿「全混音」抓拍 —— 人聲自己就在混音裡,等於拿自己當自己的節奏參照,
-        #    加上追蹤雜訊,乾淨歌只得 55.6、同內容能盪 28 分。
-        #    有 --accomp(鼓+貝斯)時改用它建網格;沒有則沿用舊法(分數仍凍結不進總分)。
-        vocal_grid = beats["beat_times"]
-        if getattr(args, "accomp", None):
-            try:
-                y_acc, sr_acc = librosa.load(args.accomp, sr=SR_MUSIC, mono=True)
-                vocal_grid = estimate_beats(y_acc, SR_MUSIC)["beat_times"]
-                print("  (節奏網格:鼓+貝斯伴奏軌)")
-            except Exception as e:
-                print(f"  (伴奏軌讀取失敗,退回全混音網格:{type(e).__name__})")
-        vocal_res = analyze_vocal(vocal_path, key_info, vocal_grid)
+        vocal_res = None
+        if vocal_path:
+            print("分析演唱表現中(音高追蹤較花時間)...")
+            # ⚖️ rhythm 修復(2026-07-24 H2 D1 裁決「網格改建於鼓+貝斯」):
+            #    舊法拿「全混音」抓拍 —— 人聲自己就在混音裡,等於拿自己當自己的節奏參照,
+            #    加上追蹤雜訊,乾淨歌只得 55.6、同內容能盪 28 分。
+            #    有 --accomp(鼓+貝斯)時改用它建網格;沒有則沿用舊法(分數仍凍結不進總分)。
+            vocal_grid = beats["beat_times"]
+            if getattr(args, "accomp", None):
+                try:
+                    y_acc, sr_acc = librosa.load(args.accomp, sr=SR_MUSIC, mono=True)
+                    vocal_grid = estimate_beats(y_acc, SR_MUSIC)["beat_times"]
+                    print("  (節奏網格:鼓+貝斯伴奏軌)")
+                except Exception as e:
+                    print(f"  (伴奏軌讀取失敗,退回全混音網格:{type(e).__name__})")
+            vocal_res = analyze_vocal(vocal_path, key_info, vocal_grid)
 
-    vocal_score = weighted_category(vocal_res, weights["vocal"]) if vocal_res else None
-    mix_score = weighted_category(mix_res, weights["mix"])
+        vocal_score = weighted_category(vocal_res, weights["vocal"]) if vocal_res else None
+        mix_score = weighted_category(mix_res, weights["mix"])
 
-    # ⭐ 演唱分要不要併進總分,由 --blend-vocal 決定(預設【不併】)。
-    #
-    # 為什麼預設不併:在接上 Demucs 之前,從來沒有人傳 --vocal,所以 scores.total 一直等於混音分,
-    # 而那個數字正是報告上「物理技術 X/100」以及 web 總分裡物理 10% 的來源。一旦開始餵人聲軌,
-    # 若照舊自動套 55/45,total 會【無聲改變語義】,新舊報告與排行榜就再也對不起來。
-    # 演唱各項照樣完整列分(見 vocal_detail 與報告的【演唱表現】段),只是先不進這個 total;
-    # 它在總分裡佔多少,跟其他新元件一起等八家對決裁定。
-    #
-    # ⚠️ else 分支的順序是【混音優先】,不可寫回舊的 vocal 優先:舊順序在兩者都有值時本來不可達,
-    #    加了開關之後會踩到,寫錯就會讓沒開 blend 的情況變成「總分=演唱分」。
-    if args.blend_vocal and vocal_score is not None and mix_score is not None:
-        ow = weights["overall"]
-        total = round((vocal_score * ow["vocal"] + mix_score * ow["mix"])
-                      / (ow["vocal"] + ow["mix"]), 1)
-        blended = True
-    else:
-        total = mix_score if mix_score is not None else vocal_score
-        blended = False
+        # ⭐ 演唱分要不要併進總分,由 --blend-vocal 決定(預設【不併】)。
+        #
+        # 為什麼預設不併:在接上 Demucs 之前,從來沒有人傳 --vocal,所以 scores.total 一直等於混音分,
+        # 而那個數字正是報告上「物理技術 X/100」以及 web 總分裡物理 10% 的來源。一旦開始餵人聲軌,
+        # 若照舊自動套 55/45,total 會【無聲改變語義】,新舊報告與排行榜就再也對不起來。
+        # 演唱各項照樣完整列分(見 vocal_detail 與報告的【演唱表現】段),只是先不進這個 total;
+        # 它在總分裡佔多少,跟其他新元件一起等八家對決裁定。
+        #
+        # ⚠️ else 分支的順序是【混音優先】,不可寫回舊的 vocal 優先:舊順序在兩者都有值時本來不可達,
+        #    加了開關之後會踩到,寫錯就會讓沒開 blend 的情況變成「總分=演唱分」。
+        if args.blend_vocal and vocal_score is not None and mix_score is not None:
+            ow = weights["overall"]
+            total = round((vocal_score * ow["vocal"] + mix_score * ow["mix"])
+                          / (ow["vocal"] + ow["mix"]), 1)
+            blended = True
+        else:
+            total = mix_score if mix_score is not None else vocal_score
+            blended = False
 
-    meta = {"file": Path(args.mix).name, "key": key_info["name"],
-            "key_conf": key_info["confidence"], "bpm": beats["bpm"],
-            "duration": duration}
-    print()
-    print(render_report(meta, vocal_res, mix_res, vocal_score, mix_score, total))
+        meta = {"file": Path(args.mix).name, "key": key_info["name"],
+                "key_conf": key_info["confidence"], "bpm": beats["bpm"],
+                "duration": duration}
+        print()
+        print(render_report(meta, vocal_res, mix_res, vocal_score, mix_score, total))
 
-    if args.json_out:
-        payload = {"meta": meta, "scores": {"vocal": vocal_score, "mix": mix_score,
-                                            "total": total, "grade": grade(total)},
-                   # 讓讀 JSON 的人一眼看出這個 total 是不是含演唱,免得跨版本比較時被誤導
-                   "weighting": {"vocal_blended_into_total": blended,
-                                 "overall_weights_applied": weights["overall"] if blended else None,
-                                 "note": "各項均已列分;演唱在總分中的權重待八家對決裁定,"
-                                         "未 blend 時 total = 混音分(與歷來報告同義)"},
-                   "vocal_detail": vocal_res, "mix_detail": mix_res}
-        with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-        print(f"\nJSON 報告已存至:{args.json_out}")
+        if args.json_out:
+            payload = {"meta": meta, "scores": {"vocal": vocal_score, "mix": mix_score,
+                                                "total": total, "grade": grade(total)},
+                       # 讓讀 JSON 的人一眼看出這個 total 是不是含演唱,免得跨版本比較時被誤導
+                       "weighting": {"vocal_blended_into_total": blended,
+                                     "overall_weights_applied": weights["overall"] if blended else None,
+                                     "note": "各項均已列分;演唱在總分中的權重待八家對決裁定,"
+                                             "未 blend 時 total = 混音分(與歷來報告同義)"},
+                       "vocal_detail": vocal_res, "mix_detail": mix_res}
+            with open(args.json_out, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+            print(f"\nJSON 報告已存至:{args.json_out}")
+    finally:
+        for _d in _owned_tmp:
+            _left = _d if Path(_d).exists() else None
+            shutil.rmtree(_d, ignore_errors=True)
+            if Path(_d).exists():
+                print(f"⛔ 分軌暫存沒清乾淨:{_d}(裡面是一整份分軌,請手動刪掉)",
+                      file=sys.stderr)
+            _ = _left
 
 
 if __name__ == "__main__":

@@ -123,25 +123,69 @@ def _web_tmp_root() -> Path:
     return d
 
 
-def _sweep_web_tmp(ttl: float = None) -> int:
-    """回收超過 TTL 的舊產物;回收掉幾個目錄就回幾。"""
+# 一個請求最久允許「還在跑」多久 —— 超過就當成被中斷的孤兒,可以回收。
+# ⚠️ 它必須 **>> 一次評測的時間**(首次還會下載模型),預設 6 小時。
+_WEB_ABANDON = max(_WEB_TMP_TTL, positive_finite("SONG_JURY_WEB_ABANDON_AGE",
+                                                 21600.0, lo=0.0, hi=604800.0))
+_ACTIVE = ".active"          # 還在跑的請求會有這個標記
+
+
+def _sweep_web_tmp(ttl: float = None, abandon: float = None) -> int:
+    """回收「已完成而且過了保留期」的舊產物;回幾個目錄被清掉。
+
+    🔴 Codex R27-P2-1:舊版只看 mtime —— 一個還在跑的請求(情感弧線/Ollama 詞評
+       可能好幾分鐘)只要超過保留期,**下一個請求就會把它正在用的目錄刪掉**,
+       使用者拿到一張不存在的圖。目錄的 mtime 也不會因為裡面的檔案被寫入而更新。
+    ⭐ 所以改成租約:請求開始時放 `.active`,回傳前拿掉(= completed)。
+       · completed 且超過保留期 → 回收;
+       · 還 active 但超過**放棄期**(預設 6 小時)→ 當成被中斷的孤兒,才回收。
+    ⛔ 刪不掉不可以靜靜吞掉(那又回到「以為清了、其實沒有」)—— 印出完整路徑。"""
     ttl = _WEB_TMP_TTL if ttl is None else ttl
+    abandon = _WEB_ABANDON if abandon is None else abandon
     now = time.time()
     n = 0
     for d in _web_tmp_root().iterdir():
         try:
-            if d.is_dir() and (now - d.stat().st_mtime) > ttl:
-                shutil.rmtree(d, ignore_errors=True)
-                n += 1 if not d.exists() else 0
-        except OSError:
-            pass          # 別讓回收把請求弄掛 —— 下次還會再掃
+            if not d.is_dir():
+                continue
+            age = now - d.stat().st_mtime
+            active = (d / _ACTIVE).exists()
+            if age <= (abandon if active else ttl):
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            if d.exists():
+                print(f"⛔ 網頁暫存清不掉:{d}(請手動刪掉)", flush=True)
+            else:
+                n += 1
+        except OSError as e:
+            print(f"⛔ 網頁暫存回收失敗:{d}({type(e).__name__}: {e})", flush=True)
     return n
 
 
 def _web_workdir() -> Path:
-    """給這一次請求用的目錄(先回收舊的,再開新的)。"""
+    """給這一次請求用的目錄(先回收舊的,再開新的;開出來的先標成 active)。"""
     _sweep_web_tmp()
-    return Path(tempfile.mkdtemp(prefix="req-", dir=_web_tmp_root()))
+    d = Path(tempfile.mkdtemp(prefix="req-", dir=_web_tmp_root()))
+    (d / _ACTIVE).write_text("1", encoding="utf-8")
+    return d
+
+
+def _web_done(d) -> None:
+    """請求結束:拿掉 active 標記 → 之後就照保留期回收。"""
+    try:
+        if d is not None:
+            (Path(d) / _ACTIVE).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# ⭐ 啟動時也掃一次(Codex R27-P2-2):只在「下一個請求」才回收的話,
+#    最後一位使用者離開之後,那份歌詞可以留到下次有人來為止 —— 可能是好幾個月。
+#    ⚠️ 誠實邊界:這是**機會性**回收(啟動 + 每次請求),不是背景排程的時間保證。
+try:
+    _sweep_web_tmp()
+except Exception:            # noqa: BLE001 —— 回收失敗絕不可以擋住服務啟動
+    pass
 
 
 def _score_table(merged):
@@ -292,7 +336,8 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     has_lyrics = bool((lyrics or "").strip())
     if has_lyrics:
         progress(0.6, desc="情感弧線分析中…")
-        tmp = _web_workdir() / "歌詞.txt"
+        _reqdir = _web_workdir()
+        tmp = _reqdir / "歌詞.txt"
         tmp.write_text(lyrics, encoding="utf-8")
         _run([_venv_py(".venv"), str(BASE / "情感弧線.py"), str(tmp)])
         cand = tmp.with_name(tmp.stem + "_情感弧線.png")
@@ -317,6 +362,8 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
         note = "⛔ **評測不完整**(詳見下方)——" + note.lstrip("✅⚠️ ") + incomplete_md
     note += notes_md          # 細項提醒獨立附加,不影響上面的完整性判定
     note += _snap_warn        # ⛔ 快照殘留是伺服器上的一整份音訊,不可以只留在 log
+    # ⭐ 產物已經交給 Gradio 了 → 解除租約,之後就照保留期回收(R27-P2-1)
+    _web_done(_reqdir if has_lyrics else None)
     return table, arc_img, lyric_eval, note
 
 
