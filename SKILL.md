@@ -57,8 +57,13 @@ $juryRc = $LASTEXITCODE   # ⛔ 立刻保存 —— 退出碼是完整性契約,
 #         原因與 shape 要互相成立,裁判會驗)。
 #      ⭐ 評測一開始就把來源複製成不可變快照:所有階段與身分只讀它,
 #         中途換檔不會再產生「分數 A、身分 B」的報告(R23-P1-1)。
-#      📁 每份暫存都有主人:快照、上傳補正檔用完就刪,刪不掉 → 退出碼 4 並印路徑;
-#         網頁版產物放進受管目錄 + TTL 回收(R24/R26)。
+#      📁 每份暫存都有主人:快照、上傳補正檔用完就刪,刪不掉 → 退出碼 4 並印路徑
+#         (訊息標種類:[source_snapshot]/[upload_copy]/[demucs_stems]);
+#         ⭐ 子階段自己回 4 也照樣把報告發布出來、保留 4(R29-P1-1)。
+#         網頁版產物放進受管目錄 + 租約 + TTL 回收(R24/R26/R27)。
+#      🔒 租約三態(acquired / busy / backend_error):寫入端拿不到租約就**不寫**
+#         (fail-closed),回收端兩種都當「有人在用」不回收;
+#         鎖檔一律走 狀態目錄.safe_open_lock(擋 symlink/hardlink,R29)。
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" pk    --lang zh 甲_評審團.json 乙_評審團.json
 & "$T\.venv\Scripts\python.exe" "$T\比較.py" takes --group A t1_評審團.json t2_評審團.json
 

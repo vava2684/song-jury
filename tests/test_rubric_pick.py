@@ -133,7 +133,8 @@ def test_網頁版要處理快照殘留的退出碼(A, tmp_path, monkeypatch):
     left = "C:/Temp/song-jury-src-xxxx"
     monkeypatch.setattr(A, "_run", lambda *a, **k: _t.SimpleNamespace(
         returncode=4,
-        stdout=f"完整報告:{rep}\n⛔ 來源快照沒清乾淨:{left}\n", stderr=""))
+        stdout=f"完整報告:{rep}\n⛔ 暫存沒清乾淨[source_snapshot]:{left}\n",
+        stderr=""))
     song = tmp_path / "甲.wav"
     song.write_bytes(b"RIFF")
     table, _img, _lyr, note = A.evaluate("", str(song), "", None)
@@ -187,7 +188,8 @@ def test_網頁版遇到損壞的報告不可以炸掉request(A, tmp_path, monke
     bad = tmp_path / "壞_評審團.json"
     bad.write_text("這不是 JSON", encoding="utf-8")
     monkeypatch.setattr(A, "_run", lambda *a, **k: _ty.SimpleNamespace(
-        returncode=rc, stdout=f"完整報告:{bad}\n⛔ 來源快照沒清乾淨:X\n", stderr=""))
+        returncode=rc,
+        stdout=f"完整報告:{bad}\n⛔ 暫存沒清乾淨[source_snapshot]:X\n", stderr=""))
     table, _img, _lyr, note = A.evaluate("", str(tmp_path / "甲.wav"), "", None)
     assert table == [] and "讀不了" in note, f"🔴 沒有收斂成產品訊息:{note!r}"
     if rc == 4:
@@ -276,3 +278,83 @@ def test_解除租約失敗要講出來(A, tmp_path, monkeypatch, capsys):
     A._web_done(d)
     out = capsys.readouterr().out
     assert "租約" in out and str(d) in out, f"🔴 沒有講出哪個目錄解不掉:{out!r}"
+
+
+def test_request中途拋例外也要放掉租約(A, tmp_path, monkeypatch):
+    """🔴 Codex R29-P1-2:`_web_done()` 只在正常尾端呼叫 —— 情感弧線子程序或任何
+    未收斂例外都會讓 request 中止,但**服務程序還活著**,holder 的 fd 與 `_HELD`
+    會留到整個 Gradio 重啟為止;而 sweep 對 `_HELD` 內的路徑一律跳過
+    → 那份還沒公開的歌詞永遠不會被回收。"""
+    import json
+    import types as _ty
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    P8 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")
+    pt = {"完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
+          "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in P8},
+          "曲側含柱": list(P8)}
+    rep = tmp_path / "甲_評審團.json"
+    rep.write_text(json.dumps({"scoring_contract": "2026-07-25-v1", "pillar_totals": pt,
+                               "scores": {"total": 70.0}}, ensure_ascii=False),
+                   encoding="utf-8")
+    calls = {"n": 0}
+
+    def _run(cmd, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:                       # 評審團:正常回報告
+            return _ty.SimpleNamespace(returncode=0, stdout=f"完整報告:{rep}\n", stderr="")
+        raise RuntimeError("情感弧線炸了")          # 第二段:未收斂例外
+
+    monkeypatch.setattr(A, "_run", _run)
+    with pytest.raises(RuntimeError):
+        A.evaluate("", str(tmp_path / "甲.wav"), "夜風吹過窗縫 帶來輕輕的呢喃", None)
+    assert A._HELD == {}, f"🔴 例外之後租約還握在手上:{list(A._HELD)}"
+    left = list((root / "web-tmp").iterdir())
+    assert left, "這次沒有建出 request 目錄,等於沒驗到"
+    for d in left:
+        assert not A.is_busy(d / A._ACTIVE), f"🔴 {d.name} 的租約沒放掉 —— 永遠不會被回收"
+
+
+def test_拿不到租約就不可以寫網頁產物(A, tmp_path, monkeypatch):
+    """⛔ writer fail-closed(Codex R29-P2-1):沒有互斥保護就產出檔案,
+    之後可能被別的請求當成孤兒回收 —— 使用者拿到一張不存在的圖。"""
+    T = load("暫存清理")
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    monkeypatch.setattr(A, "take_ex", lambda p: (None, T.BACKEND_ERROR, "假裝鎖壞了"))
+    with pytest.raises(RuntimeError) as e:
+        A._web_workdir()
+    assert "租約" in str(e.value)
+    assert sorted(x.name for x in (root / "web-tmp").iterdir()) == [], \
+        "🔴 拿不到租約卻留下了 request 目錄"
+
+
+def test_啟動回收失敗時錯誤處理不可以再踩同一顆地雷(tmp_path):
+    """🔴 Codex R29-P2-3:`except` 為了印路徑又呼叫一次 `state_root()` ——
+    如果原始失敗正是「狀態目錄不能用」,錯誤處理器自己再拋一次,
+    模組 import 直接裸爆,而註解還寫著「絕不擋住服務啟動」。"""
+    import subprocess as _sp
+    import sys as _sys
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import sys, types\n"
+        f"sys.path.insert(0, r'{REPO}')\n"
+        "class _Any:\n"
+        "    def __init__(self, *a, **k): pass\n"
+        "    def __call__(self, *a, **k): return _Any()\n"
+        "    def __getattr__(self, _): return _Any()\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "gr = types.ModuleType('gradio')\n"
+        "gr.__getattr__ = lambda n: _Any\n"
+        "sys.modules['gradio'] = gr\n"
+        "import 狀態目錄\n"
+        "狀態目錄.state_root = lambda: (_ for _ in ()).throw("
+        "PermissionError('狀態目錄不能用'))\n"
+        "import app\n"
+        "print('IMPORT_OK')\n", encoding="utf-8")
+    r = _sp.run([_sys.executable, str(probe)], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=300)
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "IMPORT_OK" in out, f"🔴 狀態目錄壞掉時 import 直接裸爆:\n{out[-600:]}"
+    assert "回收失敗" in out, f"🔴 沒有印出具名告警:\n{out[-400:]}"

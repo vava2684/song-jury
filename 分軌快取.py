@@ -35,7 +35,7 @@ import time
 import uuid
 from pathlib import Path
 
-from 暫存清理 import force_rmtree, is_busy, release, take
+from 暫存清理 import ACQUIRED, force_rmtree, is_busy, release, take_ex
 
 # ⛔ 沒有身分紀錄的舊快取預設**不採信**(它可能是另一首同名歌的分軌,一旦認領就永遠錯下去)。
 #    確知舊快取正確的人,才用這個環境變數明確授權沿用。
@@ -199,6 +199,27 @@ def sweep_stale_tmp(stems_dir: Path, grace: float = None) -> int:
     return n
 
 
+def open_tmp_workdir(stems_dir: Path, cache_name: str):
+    """開一個**持有租約**的暫存工作夾;回 (路徑, 持有物)。
+
+    ⛔ 暫存夾只能從這裡生出來(Codex R29-P2-1):沒有租約就直接拋錯,
+       絕不可以在沒有互斥保護的情況下開始寫 —— 那套分軌之後可能被別的程序
+       當成孤兒回收,或兩邊互相覆寫。
+    ⚠️ 拿不到分兩種(有人在用 / 鎖後端壞掉),**兩種都要停**:
+       後者常見於不支援 flock 的網路磁碟,那正是最需要 fail-closed 的環境。
+    """
+    tmp = Path(stems_dir) / f".tmp_{cache_name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    if tmp.exists():
+        force_rmtree(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
+    hold, state, why = take_ex(tmp / ".lock")
+    if state != ACQUIRED:
+        force_rmtree(tmp)
+        raise RuntimeError(f"分軌暫存拿不到租約({state}:{why})——"
+                           f"這個檔案系統不支援可靠的檔案鎖,請把 _stems 放在本機磁碟")
+    return tmp, hold
+
+
 def separate(audio_path: Path, stems_dir: Path, model_name: str):
     """用 demucs 分軌;已有快取就直接讀。回 (dict[stem]=波形, sr, sources順序, from_cache)。
 
@@ -300,13 +321,7 @@ def separate(audio_path: Path, stems_dir: Path, model_name: str):
     #    改名在同一個檔案系統上是原子操作 → 讀取端只會看到「還沒有」或「完整的」。
     # ⛔ 暫存名要帶 UUID,不能只用 PID:同一個程序裡的兩個執行緒 PID 相同,
     #    會共用同一個暫存夾互相覆寫。
-    tmp = stems_dir / f".tmp_{cache.name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    if tmp.exists():
-        force_rmtree(tmp)
-    tmp.mkdir(parents=True, exist_ok=True)
-    # ⭐ 這一份正在寫 → 持有租約(Codex R28-P2-3):別的程序掃到它時,
-    #    鎖拿不到就知道「有人正在寫」,不會把寫到一半的分軌刪掉。
-    _hold = take(tmp / ".lock")
+    tmp, _hold = open_tmp_workdir(stems_dir, cache.name)
     stems = {}
     try:
         for i, s in enumerate(sources):

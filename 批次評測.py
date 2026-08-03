@@ -166,7 +166,9 @@ def run_one(song: Path, timeout=3600):
     # ⛔ 殘留路徑要**結構化地帶出去**(Codex R26-P1-2):只印在即時輸出的話,
     #    幾十首之後就被推走了,批次結束後沒人知道要刪哪裡;--skip-existing 下次
     #    跳過這首時更不會再提醒一次。→ 寫進結果 dict → 進 store → 進總結。
-    _dirty = [ln.split("清乾淨:", 1)[-1].strip()
+    # ⚠️ 種類要跟著出來(Codex R29-P1-1):四種暫存的處理方式不同,
+    #    一律寫「來源快照」會把 demucs 分軌誤導成別的東西。
+    _dirty = [ln.split("沒清乾淨", 1)[-1].lstrip("::").strip()
               for ln in (r.stdout or "").splitlines()
               if "沒清乾淨" in ln]
     if r.returncode == 4:

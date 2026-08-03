@@ -19,7 +19,7 @@ import gradio as gr
 
 from 子程序 import run_tree
 from 狀態目錄 import state_root
-from 暫存清理 import force_rmtree, is_busy, release, take
+from 暫存清理 import ACQUIRED, force_rmtree, is_busy, release, take_ex
 from 設定讀取 import ConfigError, positive_finite
 import requests
 from urllib.parse import urlparse
@@ -166,12 +166,15 @@ def _web_workdir() -> Path:
     """給這一次請求用的目錄(先回收舊的,再開新的;開出來的**持有**租約)。"""
     _sweep_web_tmp()
     d = Path(tempfile.mkdtemp(prefix="req-", dir=_web_tmp_root()))
-    h = take(d / _ACTIVE)
-    if h is None:
-        # 理論上不會發生(目錄是剛建的)—— 但不可以假裝有租約
-        print(f"⛔ 網頁暫存拿不到租約:{d}(這個請求的產物可能被提早回收)", flush=True)
-    else:
-        _HELD[str(d)] = h
+    h, state, why = take_ex(d / _ACTIVE)
+    if state != ACQUIRED:
+        # ⛔ 沒有租約就**不要開始寫**(Codex R29-P2-1):那等於在沒有互斥保護的
+        #    情況下產出檔案 —— 之後可能被別的請求當成孤兒回收,使用者拿到壞掉的圖。
+        #    (常見原因:網路磁碟不支援 flock、狀態目錄權限壞掉、鎖檔被預植。)
+        force_rmtree(d)
+        raise RuntimeError(f"拿不到暫存租約({state}:{why})—— 這個環境的狀態目錄"
+                           f"不支援可靠的檔案鎖,請把狀態目錄放在本機磁碟")
+    _HELD[str(d)] = h
     return d
 
 
@@ -194,11 +197,19 @@ def _web_done(d) -> None:
 #    最後一位使用者離開之後,那份歌詞可以留到下次有人來為止 —— 可能是好幾個月。
 #    ⚠️ 誠實邊界:這是**機會性**回收(啟動 + 每次請求),不是背景排程的時間保證。
 try:
+    # ⚠️ 路徑要**先**算好(Codex R29-P2-3):錯誤處理器裡再呼叫一次 state_root()
+    #    的話,原本的失敗如果正是「狀態目錄不能用」,處理器自己會再拋一次 ——
+    #    於是「絕不擋住服務啟動」的註解變成謊言,import 直接裸爆。
+    _root_hint = "(狀態目錄不可用)"
+    try:
+        _root_hint = str(state_root() / "web-tmp")
+    except Exception:        # noqa: BLE001
+        pass
     _sweep_web_tmp()
 except Exception as _e:      # noqa: BLE001 —— 回收失敗絕不可以擋住服務啟動
     # ⛔ 但也不可以靜靜吞掉(Codex R28-P2-2):「啟動時有掃」不等於「掃成功」。
     print(f"⛔ 啟動時的網頁暫存回收失敗({type(_e).__name__}: {_e});"
-          f"目錄:{state_root() / 'web-tmp'}", flush=True)
+          f"目錄:{_root_hint}", flush=True)
 
 
 def _score_table(merged):
@@ -294,9 +305,12 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
         return [], None, "", f"❌ 音訊評分失敗:\n```\n{(r.stderr or r.stdout)[-1000:]}\n```"
     _snap_warn = ""
     if r.returncode == 4:
-        _lines = [ln for ln in (r.stdout or "").splitlines() if "快照沒清乾淨" in ln]
-        _snap_warn = ("\n\n⛔ **來源快照沒清乾淨**(評測本身有效):"
-                      f"{_lines[-1] if _lines else '見伺服器輸出'} —— 請手動刪掉。")
+        # ⚠️ 種類要跟著出來(Codex R29-P1-1):四種暫存的處理方式不同,
+        #    一律寫「來源快照」會把 demucs 分軌誤導成別的東西。
+        _lines = [ln.strip() for ln in (r.stdout or "").splitlines() if "沒清乾淨" in ln]
+        _snap_warn = ("\n\n⛔ **有暫存沒清乾淨**(評測本身有效):"
+                      + ("；".join(_lines) if _lines else "見伺服器輸出")
+                      + " —— 請手動刪掉(方括號裡是種類:來源快照/上傳補正檔/分軌)。")
     jpath = _jpath_from_stdout(r.stdout)
     if not jpath or not jpath.exists():
         return [], None, "", f"❌ 找不到結果 JSON。\n```\n{r.stdout[-600:]}\n```"
@@ -349,12 +363,25 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     has_lyrics = bool((lyrics or "").strip())
     if has_lyrics:
         progress(0.6, desc="情感弧線分析中…")
-        _reqdir = _web_workdir()
-        tmp = _reqdir / "歌詞.txt"
-        tmp.write_text(lyrics, encoding="utf-8")
-        _run([_venv_py(".venv"), str(BASE / "情感弧線.py"), str(tmp)])
-        cand = tmp.with_name(tmp.stem + "_情感弧線.png")
-        arc_img = str(cand) if cand.exists() else None
+        # ⛔ 建立之後**一定要**在 finally 放掉租約(Codex R29-P1-2):
+        #    情感弧線的子程序、寫檔、或任何未收斂的例外都會讓 request 中止,
+        #    但服務程序還活著 → holder 的 fd 與 _HELD 會留到整個 Gradio 重啟為止,
+        #    而 sweep 對 _HELD 內的路徑一律跳過 → 那份歌詞永遠不會被回收。
+        try:
+            _reqdir = _web_workdir()
+        except RuntimeError as e:
+            _reqdir = None
+            notes_md += f"\n\n⚠️ 情感弧線跳過:{e}"
+        if _reqdir is not None:
+            try:
+                tmp = _reqdir / "歌詞.txt"
+                tmp.write_text(lyrics, encoding="utf-8")
+                _run([_venv_py(".venv"), str(BASE / "情感弧線.py"), str(tmp)])
+                cand = tmp.with_name(tmp.stem + "_情感弧線.png")
+                arc_img = str(cand) if cand.exists() else None
+            finally:
+                # 產物已經交給 Gradio(或這次失敗了)→ 兩種情況都要放掉租約
+                _web_done(_reqdir)
 
     lyric_eval = ""
     if not has_lyrics:
@@ -375,8 +402,6 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
         note = "⛔ **評測不完整**(詳見下方)——" + note.lstrip("✅⚠️ ") + incomplete_md
     note += notes_md          # 細項提醒獨立附加,不影響上面的完整性判定
     note += _snap_warn        # ⛔ 快照殘留是伺服器上的一整份音訊,不可以只留在 log
-    # ⭐ 產物已經交給 Gradio 了 → 解除租約,之後就照保留期回收(R27-P2-1)
-    _web_done(_reqdir if has_lyrics else None)
     return table, arc_img, lyric_eval, note
 
 

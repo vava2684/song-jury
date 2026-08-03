@@ -183,7 +183,9 @@ MUTATIONS = [
 
     ("同一份報告可以重複上場(A 對 A 被當成合法 PK)",
      "比較.py",
-     '    _reject_duplicates(paths)\n    items = [load_report(p) for p in paths]',
+     '            "bad_language", {"lang": lang})\n    _reject_duplicates(paths)\n'
+     '    items = [load_report(p) for p in paths]',
+     '            "bad_language", {"lang": lang})\n'
      '    items = [load_report(p) for p in paths]',
      "tests/test_compare.py::test_同一份報告不可以重複上場"),
 
@@ -1221,6 +1223,67 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R29 ────────────────────────────────────────────────
+    ('子程序回 4 但訊息認不得就當成沒殘留(整條鏈退回 0)',
+     '評審團.py',
+     '        if not _hits:',
+     '        if False:',
+     'tests/test_來源身分.py::test_子程序回4但訊息認不得也不可以當成沒殘留'),
+
+    ('物理階段不接受 4(報告連發布的機會都沒有,退出碼被洗成 1)',
+     '評審團.py',
+     '    _phys = _run_stage(cmd, cwd=BASE, label="物理技術(song_scorer)", accepted=(4,))',
+     '    _phys = _run_stage(cmd, cwd=BASE, label="物理技術(song_scorer)")',
+     'tests/test_來源身分.py::test_物理階段回4時報告照樣發布而且退出碼保留'),
+
+    ('_run_stage 退回 check=True(任何非零碼都變成失敗)',
+     '評審團.py',
+     '        if r.returncode != 0 and r.returncode not in tuple(accepted):',
+     '        if r.returncode != 0:',
+     'tests/test_來源身分.py::test_run_stage要放行指定的非零碼其他碼照樣算失敗'),
+
+    ('_run_stage 變成非零碼一律放行(真失敗被當成成功往下走)',
+     '評審團.py',
+     '        if r.returncode != 0 and r.returncode not in tuple(accepted):',
+     '        if False:',
+     'tests/test_來源身分.py::test_run_stage要放行指定的非零碼其他碼照樣算失敗'),
+
+    ('鎖檔改回普通 open(跟隨 symlink、接受 hardlink)',
+     '暫存清理.py',
+     '        f = safe_open_lock(path)',
+     '        f = open(path, "a+b")',
+     'tests/test_來源身分.py::test_鎖檔不可以接受hardlink'),
+
+    ('拿不到鎖時不分「有人在用」與「機制壞掉」',
+     '暫存清理.py',
+     '        state = BUSY if e.errno in busy_errnos else BACKEND_ERROR',
+     '        state = BUSY',
+     'tests/test_來源身分.py::test_鎖後端壞掉不可以被說成有人在用'),
+
+    ('分軌沒有租約也照樣開始寫(整套分軌在無互斥保護下產出)',
+     '分軌快取.py',
+     '    if state != ACQUIRED:\n        force_rmtree(tmp)\n        raise RuntimeError',
+     '    if False:\n        force_rmtree(tmp)\n        raise RuntimeError',
+     'tests/test_來源身分.py::test_分軌拿不到租約就不可以開始寫'),
+
+    ('force_rmtree 改回用 exists 判乾淨(dangling symlink 被說成已清掉)',
+     '暫存清理.py',
+     '        if not os.path.lexists(d):\n            return ""\n        try:',
+     '        if not d.exists():\n            return ""\n        try:',
+     'tests/test_來源身分.py::test_force_rmtree的乾淨要以目錄項為準'),
+
+    ('網頁 request 例外時不放租約(那份歌詞到重啟前都不會被回收)',
+     'app.py',
+     '            finally:\n                # 產物已經交給 Gradio(或這次失敗了)→ 兩種情況都要放掉租約\n                _web_done(_reqdir)',
+     '            finally:\n                pass   # 變異:不放租約',
+     'tests/test_rubric_pick.py::test_request中途拋例外也要放掉租約'),
+
+    ('啟動回收的錯誤處理又呼叫一次剛失敗的 state_root',
+     'app.py',
+     '          f"目錄:{_root_hint}", flush=True)',
+     '          f"目錄:{state_root()}", flush=True)',
+     'tests/test_rubric_pick.py::test_啟動回收失敗時錯誤處理不可以再踩同一顆地雷'),
+
     # ── Codex R28 ────────────────────────────────────────────────
     ('分軌失敗時先放掉 owner 再刪(刪不掉就沒人負責那份分軌)',
      'song_scorer.py',
@@ -1399,14 +1462,14 @@ MUTATIONS = [
 
     ("快照收尾改回 ignore_errors(刪不掉整個吞掉,音訊留在 TEMP)",
      "暫存清理.py",
-     '    for _ in range(max(1, retries)):\n        if not d.exists():\n            return ""',
-     '    for _ in range(0):\n        if not d.exists():\n            return ""',
+     "    for _ in range(max(1, retries)):",
+     "    for _ in range(0):",
      "tests/test_來源身分.py::test_唯讀來源的快照也要刪得掉"),
 
     ("快照沒收乾淨時沿用正常退出碼(自動化永遠不知道 TEMP 留了音訊)",
      "評審團.py",
-     "    if left:",
-     "    if False:   # 變異:當作沒事",
+     "    if left:\n        # ⛔ 收尾失敗要有**自己的**退出碼",
+     "    if False:   # 變異:當作沒事\n        # ⛔ 收尾失敗要有**自己的**退出碼",
      "tests/test_來源身分.py::test_快照刪不掉時要大聲講而且退出碼要不一樣"),
 
     ('快照建不出來時直接讓 OSError 冒出去(使用者只拿到 traceback)',
@@ -1724,6 +1787,17 @@ def main(argv=None):
             print(f"\n[{i}/{len(MUTATIONS)}] ⚠ 跳過:在 {fname} 找不到要變異的字串")
             print(f"        ({desc})  ← 程式改過了?請更新這條變異")
             bad.append(desc)
+            continue
+        # ⛔ 錨點必須**唯一**:下面是 replace(..., 1),只換第一處 ——
+        #    同一段字出現兩次的話,「改到哪一處」由檔案裡的先後順序決定,
+        #    有人在上面插一段程式就會**靜靜換去改另一個地方**,而這條變異
+        #    照樣印「✅ 抓到了」。那正是這支工具存在要防的東西:
+        #    看起來驗過了,其實驗的是別的東西 —— 一律當失敗,不給模糊空間。
+        if norm.count(old) > 1:
+            print(f"\n[{i}/{len(MUTATIONS)}] ❌ 錨點不唯一:在 {fname} 出現 {norm.count(old)} 次")
+            print(f"        → 只會改到第一處,改的是不是你要的那處無從得知({desc})")
+            print(f"        → 請把上下文加進錨點,讓它只對應一個位置")
+            bad.append(desc + "(錨點不唯一)")
             continue
         mutated = norm.replace(old, new, 1)
         if crlf:

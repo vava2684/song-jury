@@ -940,12 +940,20 @@ def _venv_exe(venv, name):
     return str(alt) if alt.exists() else name
 
 
-def _run_stage(cmd, cwd, label, env=None):
+def _run_stage(cmd, cwd, label, env=None, accepted=()):
     """跑一個評分子程序;失敗時印出工具名+stderr 尾段+自救提示再退出(不再吞錯讓用戶無從下手)。
     env=None 用預設;吃 GPU 的階段請傳 _pick_device_env() 挑好的那份。"""
     try:
-        return subprocess.run(cmd, cwd=str(cwd), env=(env or ENV), check=True,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        # ⛔ accepted:某些階段的非零碼**有語意**,不是失敗(Codex R29-P1-1)——
+        #    song_scorer 的 4 是「評分做完了,但分軌暫存清不掉」,報告已經寫出來了。
+        #    check=True 會把它變成 SystemExit,連讀 JSON 的機會都沒有,最外層再
+        #    洗成 1 —— 使用者只看到「安裝壞了」,而那份完整分軌還留在 TEMP。
+        r = subprocess.run(cmd, cwd=str(cwd), env=(env or ENV), check=False,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0 and r.returncode not in tuple(accepted):
+            raise subprocess.CalledProcessError(r.returncode, cmd,
+                                                output=r.stdout, stderr=r.stderr)
+        return r
     except FileNotFoundError:
         sys.exit(f"✗ {label}:找不到執行檔 `{cmd[0]}`。\n"
                  f"→ 對應的 venv 可能沒建好(用 uv 建 .venv / .venv-ml)。")
@@ -1278,7 +1286,7 @@ def main():
     try:
         with _job_lock(song), _immutable_input(source, left) as audio:
             try:
-                _evaluate(song, audio)      # 它自己 sys.exit(0/2)
+                _evaluate(song, audio, left)      # 它自己 sys.exit(0/2)
             except SystemExit as e:
                 rc = e.code if isinstance(e.code, int) else 1
     finally:
@@ -1287,15 +1295,17 @@ def main():
         for d in owned:
             gone = _force_rmtree(d)
             if gone:
-                print(f"\n⛔ 上傳補正檔沒清乾淨:{gone}\n"
+                print(f"\n⛔ 暫存沒清乾淨[upload_copy]:{gone}\n"
                       f"   裡面有一整份音訊 —— 請手動刪掉。")
-                left.append(gone)
+                left.append(("upload_copy", gone))
     if left:
         # ⛔ 收尾失敗要有**自己的**退出碼(Codex R24-P1-1):沿用 0/2 等於
         #    「一切正常」,只看退出碼的自動化永遠不會知道 TEMP 裡留了一份音訊。
         # ⚠️ 4 會蓋掉原本的 2 —— 所以下游**不可以**把 4 當成「完整評測」,
         #    完整性一律讀報告裡的 pillar_totals.完整評測(三個下游都這樣做)。
-        print(f"⛔ 退出碼 4:評測完成,但快照沒收乾淨({len(left)} 個)")
+        print(f"⛔ 退出碼 4:評測完成,但有 {len(left)} 份暫存沒收乾淨:")
+        for _kind, _path in left:
+            print(f"   · [{_kind}] {_path}")
         sys.exit(4)
     sys.exit(rc)
 
@@ -1342,18 +1352,21 @@ def _immutable_input(song: Path, left_out=None):
         if left:
             # ⛔ 刪不掉不可以無聲帶過:那是一整份音訊留在 TEMP。大聲講,
             #    而且讓 main 用一個**不同的退出碼**收場(見 _final_exit_code 旁的說明)。
-            print(f"\n⛔ 來源快照沒清乾淨:{left}\n"
+            print(f"\n⛔ 暫存沒清乾淨[source_snapshot]:{left}\n"
                   f"   評測本身已完成,但那個目錄裡有一份完整音訊 —— 請手動刪掉。\n"
                   f"   (常見原因:來源是唯讀檔、或還有程式開著那個檔案)")
             # ⛔ 回報用**呼叫端給的 list**,不是模組全域(Codex R25-P2-1 實測):
             #    全域狀態不會在下一次 main() 開頭清空 —— 被嵌入/測試/長跑服務
             #    重用時,上一輪的殘留會讓下一輪(其實乾淨)也回 4。
             if left_out is not None:
-                left_out.append(left)
+                left_out.append(("source_snapshot", left))
 
 
-def _evaluate(song: Path, audio: Path):
-    """song = 使用者給的路徑(只用來命名輸出與顯示);audio = 不可變快照(所有階段都讀它)。"""
+def _evaluate(song: Path, audio: Path, dirty_out=None):
+    """song = 使用者給的路徑(只用來命名輸出與顯示);audio = 不可變快照(所有階段都讀它)。
+
+    dirty_out:子階段回報的「暫存沒清乾淨」——(種類, 路徑),由 main 決定退出碼。"""
+    dirty_out = [] if dirty_out is None else dirty_out
     print(f"🎵 評審對象: {song.name}\n")
 
     notes = []          # 新元件若失敗/降級,理由收在這裡,最後誠實印出來
@@ -1401,7 +1414,23 @@ def _evaluate(song: Path, audio: Path):
             cmd += ["--accomp", str(_acc)]
         else:
             notes.append(_acc_err or "伴奏節奏軌:未產出")
-    _run_stage(cmd, cwd=BASE, label="物理技術(song_scorer)")
+    # ⭐ 4 = 「評分完成但分軌暫存沒清掉」(song_scorer 的專屬碼)——
+    #    照樣往下讀報告,但把殘留帶到最外層(退出碼與訊息見 main)。
+    _phys = _run_stage(cmd, cwd=BASE, label="物理技術(song_scorer)", accepted=(4,))
+    if _phys.returncode == 4:
+        _hits = [ln for ln in ((_phys.stderr or "") + (_phys.stdout or "")).splitlines()
+                 if "沒清乾淨" in ln]
+        for _ln in _hits:
+            _path = _ln.split("沒清乾淨:", 1)[-1].strip()
+            notes.append(f"分軌暫存沒清乾淨:{_path}")
+            dirty_out.append(("demucs_stems", _path))
+        if not _hits:
+            # ⛔ 子程序已經明講「有殘留」(rc=4),訊息認不得**不等於**沒事 ——
+            #    這裡若什麼都不記,最外層的 left 是空的 → 整條鏈退回 0,
+            #    那份分軌就從「講出來的殘留」變成「沒有人知道的殘留」。
+            #    訊息格式會改,退出碼契約不會 —— 以退出碼為準。
+            notes.append("分軌暫存沒清乾淨(song_scorer 回 4,但訊息裡沒有路徑)")
+            dirty_out.append(("demucs_stems", "(路徑不明 —— 見上面 song_scorer 的輸出)"))
     physical = json.loads(phys_json.read_text(encoding="utf-8"))
     phys_json.unlink()  # 內容已併入 _評審團.json,不留中間檔
     if vocal_stem:

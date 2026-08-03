@@ -224,7 +224,7 @@ def test_評分階段與來源身分只讀同一份不可變快照(tmp_path, mon
         _rec(cmd)
         return None, f"{label}:stub"
 
-    def _run(cmd, cwd, label, env=None):
+    def _run(cmd, cwd, label, env=None, accepted=()):
         _rec(cmd)
         if "--json" in cmd:
             Path(cmd[cmd.index("--json") + 1]).write_text("{}", encoding="utf-8")
@@ -396,7 +396,8 @@ def test_快照刪不掉時要大聲講而且退出碼要不一樣(tmp_path, mon
         J.main()
     out = capsys.readouterr().out
     assert e.value.code == 4, f"🔴 快照沒收乾淨卻回 {e.value.code}(要 4)"
-    assert "快照沒清乾淨" in out and "song-jury-src-" in out, out
+    # ⚠️ R29 起訊息帶種類標籤(來源快照 / 上傳補正檔 / 分軌暫存要分得開)
+    assert "沒清乾淨[source_snapshot]" in out and "song-jury-src-" in out, out
     # 真的把那個目錄清掉(這條測試自己製造的殘留不可以留下;它在 tmp_path 裡,
     # 就算這裡漏了 pytest 也會收走 —— 兩層保險)
     for d in iso.glob("song-jury-src-*"):
@@ -533,7 +534,7 @@ def _rc4_stub(tmp_path, complete=True, broken=False):
         ("out.write_text('這不是 JSON', encoding='utf-8')" if broken
          else "out.write_text(json.dumps(d, ensure_ascii=False), encoding='utf-8')"),
         "print(f'完整報告:{out}')",
-        "print('⛔ 來源快照沒清乾淨:C:/Temp/song-jury-src-xxxx')",
+        "print('⛔ 暫存沒清乾淨[source_snapshot]:C:/Temp/song-jury-src-xxxx')",
         "sys.exit(4)",
     ]
     f = tmp_path / "評審團.py"
@@ -929,3 +930,230 @@ def test_song_scorer的分軌失敗時就地清乾淨(tmp_path, monkeypatch):
         S.separate_with_demucs(str(tmp_path / "mix.wav"), owned)
     assert owned == [] and sorted(x.name for x in iso.iterdir()) == [], \
         f"🔴 失敗路徑留下暫存:{sorted(x.name for x in iso.iterdir())}"
+
+
+# ── R29:song_scorer 的 rc=4 要穿過整條鏈 ─────────────────────────
+def test_物理階段回4時報告照樣發布而且退出碼保留(tmp_path, monkeypatch):
+    """🔴 Codex R29-P1-1:song_scorer 先寫好物理評分 JSON 才 exit 4(分軌暫存清不掉),
+    但 `_run_stage(check=True)` 把任何非零碼變成字串型 SystemExit,最外層再洗成 1 ——
+    ⛔ 報告根本沒機會發布,下游那些「rc=4 照樣讀報告」的分支永遠到不了,
+       使用者只看到「安裝壞了」,而那份**完整分軌**還留在 TEMP。"""
+    import contextlib as _ctx
+    import types as _types
+    J = load("評審團")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF" + b"z" * 200)
+    stuck = "C:/Temp/song-jury-demucs-stuck"
+
+    def _run(cmd, cwd, label, env=None, accepted=()):
+        if "song_scorer.py" in " ".join(str(c) for c in cmd):
+            Path(cmd[cmd.index("--json") + 1]).write_text("{}", encoding="utf-8")
+            rc = 4
+            if rc not in tuple(accepted):
+                raise SystemExit(f"{label} 失敗(exit {rc})")
+            return _types.SimpleNamespace(
+                returncode=rc, stdout="",
+                stderr=f"⛔ 分軌暫存沒清乾淨:{stuck}(裡面是一整份分軌)\n")
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(J, "_run_stage", _run)
+    monkeypatch.setattr(J, "_optional_stage", lambda cmd, label, **kw: (None, f"{label}:stub"))
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: (song, song))
+    monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: _ctx.nullcontext())
+    monkeypatch.setenv("SONG_JURY_SKIP_GEMINI", "1")
+    monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
+    with pytest.raises(SystemExit) as e:
+        J.main()
+    assert (song.with_name("甲_評審團.json")).exists(), \
+        "🔴 物理階段回 4 就把整份評測丟掉了 —— 報告根本沒發布"
+    assert e.value.code == 4, f"🔴 退出碼被洗成 {e.value.code}(要保留 4)"
+
+
+# ── R29:鎖原語不可以比既有的安全開檔弱 ──────────────────────────
+def test_鎖檔不可以接受hardlink(tmp_path):
+    """🔴 Codex R29-P1-3:新的共用 take() 用普通 `open(path, "a+b")` ——
+    Windows 實測預植 hardlink 後照樣拿到鎖(st_nlink=2),而同一個專案的
+    `狀態目錄.safe_open_lock` 早就會拒絕。⛔ 兩份真理,而且新的那份比較弱。"""
+    import os as _os
+    T = load("暫存清理")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("重要資料", encoding="utf-8")
+    hard = tmp_path / "x.lock"
+    try:
+        _os.link(victim, hard)
+    except OSError:
+        pytest.skip("這台建不了 hardlink")
+    h, state, why = T.take_ex(hard)
+    T.release(h)
+    assert state == T.BACKEND_ERROR and "硬連結" in why, \
+        f"🔴 hardlink 預植的鎖檔被接受了:{state}/{why}"
+    assert victim.read_text(encoding="utf-8") == "重要資料"
+
+
+def test_鎖檔不可以跟隨symlink(tmp_path):
+    """POSIX 版的同一件事(Windows 建 symlink 需要管理員 → 誠實跳過)。"""
+    import os as _os
+    T = load("暫存清理")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("重要資料", encoding="utf-8")
+    link = tmp_path / "y.lock"
+    try:
+        _os.symlink(victim, link)
+    except OSError:
+        pytest.skip("這台建不了 symlink(Windows 需要管理員/開發者模式)")
+    h, state, why = T.take_ex(link)
+    T.release(h)
+    assert state == T.BACKEND_ERROR, f"🔴 symlink 鎖檔被接受了:{state}/{why}"
+
+
+def test_拿不到租約要分得出是有人在用還是機制壞掉(tmp_path):
+    """🔴 Codex R29-P2-1:`take() -> None` 把「有人在用」與「鎖後端壞掉」混在一起,
+    於是寫入端在**沒有租約**的情況下照樣開始寫。三態要分開。"""
+    T = load("暫存清理")
+    lock = tmp_path / "a.lock"
+    h1, s1, _ = T.take_ex(lock)
+    assert s1 == T.ACQUIRED
+    _h2, s2, _ = T.take_ex(lock)
+    assert s2 == T.BUSY, f"🔴 有人在用卻回 {s2}"
+    T.release(h1)
+    # 機制壞掉:鎖檔的位置是個目錄 → 開不起來
+    bad = tmp_path / "as_dir.lock"
+    bad.mkdir()
+    _h3, s3, why3 = T.take_ex(bad)
+    assert s3 == T.BACKEND_ERROR and why3, f"🔴 機制壞掉卻回 {s3}"
+    # ⛔ 回收端對兩種都要保守(不可以刪)
+    assert T.is_busy(bad) is True
+
+
+def test_分軌拿不到租約就不可以開始寫(tmp_path, monkeypatch):
+    """⛔ writer 一定要 fail-closed(Codex R29-P2-1):沒有互斥保護就寫出整套分軌,
+    之後可能被別的程序當成孤兒回收,或兩邊互相覆寫。
+    ⚠️ 暫存夾只能從 open_tmp_workdir 生出來 —— 那裡擋住,就不可能有無租約的寫入。"""
+    import sys as _sys
+    import types as _t
+    for n in ("torch", "torchaudio", "demucs"):
+        if n not in _sys.modules:
+            mod = _t.ModuleType(n)
+            mod.__getattr__ = lambda _n: (lambda *a, **k: None)
+            monkeypatch.setitem(_sys.modules, n, mod)
+    C = load("分軌快取")
+    T = load("暫存清理")
+    stems = tmp_path / "_stems"
+    stems.mkdir()
+    # ① 正常:拿得到租約 → 有目錄、有持有物
+    d, hold = C.open_tmp_workdir(stems, "song__m__abc")
+    assert d.exists() and hold is not None
+    T.release(hold)
+    C.force_rmtree(d)
+    # ② 鎖後端壞掉 → 直接拋錯,而且**不留下暫存夾**
+    monkeypatch.setattr(C, "take_ex", lambda p: (None, T.BACKEND_ERROR, "假裝鎖壞了"))
+    with pytest.raises(RuntimeError) as e:
+        C.open_tmp_workdir(stems, "song__m__abc")
+    assert "租約" in str(e.value)
+    assert sorted(x.name for x in stems.iterdir()) == [],         f"🔴 拿不到租約卻留下了暫存夾:{sorted(x.name for x in stems.iterdir())}"
+
+
+def test_force_rmtree的乾淨要以目錄項為準(tmp_path):
+    """🔴 Codex R29-P2-2:`Path.exists()` 會跟隨 symlink —— dangling symlink 的
+    exists() 是 False,於是 helper 回報「乾淨了」,但那個目錄項還在。"""
+    import os as _os
+    T = load("暫存清理")
+    link = tmp_path / "dead"
+    try:
+        _os.symlink(tmp_path / "不存在", link, target_is_directory=True)
+    except OSError:
+        pytest.skip("這台建不了 symlink")
+    left = T.force_rmtree(link)
+    assert left == "" and not _os.path.lexists(link), \
+        f"🔴 回報 {left!r} 但目錄項還在:lexists={_os.path.lexists(link)}"
+
+
+def test_run_stage要放行指定的非零碼其他碼照樣算失敗(tmp_path):
+    """⛔ 上面那條端對端測試把 `_run_stage` 換成 stub —— 它驗的是**呼叫端**有沒有
+    傳 `accepted=(4,)`,`_run_stage` 自己退回 `check=True` 也不會被抓到
+    (實測:那條變異存活)。這條直接跑**真子程序**驗實作。"""
+    import sys as _sys
+    J = load("評審團")
+    r = J._run_stage([_sys.executable, "-c",
+                      "import sys; sys.stdout.write('報告已寫好'); sys.exit(4)"],
+                     cwd=tmp_path, label="測試階段", accepted=(4,))
+    assert r.returncode == 4 and "報告已寫好" in r.stdout, \
+        "🔴 放行清單內的碼被當成失敗了 —— 報告連讀的機會都沒有"
+    # 沒有放行清單 → 同一個碼要照樣算失敗(不可以變成「非零碼一律放行」)
+    with pytest.raises(SystemExit) as e1:
+        J._run_stage([_sys.executable, "-c", "import sys; sys.exit(4)"],
+                     cwd=tmp_path, label="測試階段")
+    assert "exit 4" in str(e1.value.code)
+    # 放行 4 不等於放行別的碼
+    with pytest.raises(SystemExit) as e2:
+        J._run_stage([_sys.executable, "-c", "import sys; sys.exit(3)"],
+                     cwd=tmp_path, label="測試階段", accepted=(4,))
+    assert "exit 3" in str(e2.value.code), "🔴 放行清單被當成「非零都放行」"
+
+
+def test_鎖後端壞掉不可以被說成有人在用(tmp_path, monkeypatch):
+    """⛔ 三態的**分類那一行**要真的被踩到(Codex R29-P2-1)。
+    ⚠️ 用「鎖檔位置是個目錄」製造的失敗是在 `safe_open_lock` **開檔**就爆了,
+       走的是另一個 except —— 分類那行從來沒被執行(實測:那條變異存活)。
+       這裡讓 `_lock_fd` 以**非 busy 的 errno** 失敗,才踩得到。"""
+    import errno as _errno
+    T = load("暫存清理")
+    lock = tmp_path / "b.lock"
+    # ① 真的有人在用 → BUSY(真鎖,不是模擬)
+    h1, s1, _ = T.take_ex(lock)
+    assert s1 == T.ACQUIRED
+    _h, s2, _ = T.take_ex(lock)
+    assert s2 == T.BUSY
+    T.release(h1)
+    # ② 檔案系統不支援鎖(ENOLCK:NFS/網路磁碟的典型症狀)→ BACKEND_ERROR
+    def _boom(_fd):
+        raise OSError(_errno.ENOLCK, "no locks available")
+    monkeypatch.setattr(T, "_lock_fd", _boom)
+    _h3, s3, why3 = T.take_ex(tmp_path / "c.lock")
+    assert s3 == T.BACKEND_ERROR, \
+        f"🔴 鎖機制壞掉被說成「有人在用」({s3})—— 呼叫端會以為等一下就好,實際上永遠不會好"
+    assert "ENOLCK" in why3 or "no locks" in why3.lower(), f"說明要講得出原因:{why3}"
+    # ⛔ 但回收端對兩種都要保守(不可以刪)
+    assert T.is_busy(tmp_path / "c.lock") is True
+
+
+def test_子程序回4但訊息認不得也不可以當成沒殘留(tmp_path, monkeypatch):
+    """⛔ 認不得的訊息 ≠ 沒有殘留(R29 收尾):rc=4 是**退出碼契約**,
+    「沒清乾淨:<路徑>」只是人話 —— 人話改版(翻譯、換句、stderr 被吞)之後,
+    若解析不到就什麼都不記,最外層的 left 是空的 → 整條鏈退回 0,
+    那份分軌就從「講出來的殘留」變成**沒有人知道的殘留**。"""
+    import contextlib as _ctx
+    import types as _types
+    J = load("評審團")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF" + b"z" * 200)
+
+    def _run(cmd, cwd, label, env=None, accepted=()):
+        if "song_scorer.py" in " ".join(str(c) for c in cmd):
+            Path(cmd[cmd.index("--json") + 1]).write_text("{}", encoding="utf-8")
+            rc = 4
+            if rc not in tuple(accepted):
+                raise SystemExit(f"{label} 失敗(exit {rc})")
+            # ⚠️ 換了句型:沒有「沒清乾淨:」這個 token
+            return _types.SimpleNamespace(
+                returncode=rc, stdout="",
+                stderr="WARNING: leftover stems directory could not be removed\n")
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(J, "_run_stage", _run)
+    monkeypatch.setattr(J, "_optional_stage", lambda cmd, label, **kw: (None, f"{label}:stub"))
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: (song, song))
+    monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: _ctx.nullcontext())
+    monkeypatch.setenv("SONG_JURY_SKIP_GEMINI", "1")
+    monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
+    with pytest.raises(SystemExit) as e:
+        J.main()
+    assert (song.with_name("甲_評審團.json")).exists(), "報告還是要發布"
+    assert e.value.code == 4, \
+        f"🔴 訊息認不得就把 rc=4 吞掉了(回 {e.value.code})—— 殘留變成沒人知道"
