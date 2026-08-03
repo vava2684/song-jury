@@ -163,10 +163,14 @@ def run_one(song: Path, timeout=3600):
     #    才是錯的(Codex R25-P1-1 實測:舊版連 JSON 都不讀就丟)。
     if r.returncode not in (0, 2, 4):
         return None, f"評審團 結束碼 {r.returncode}:" + (r.stderr or r.stdout or "")[-260:]
+    # ⛔ 殘留路徑要**結構化地帶出去**(Codex R26-P1-2):只印在即時輸出的話,
+    #    幾十首之後就被推走了,批次結束後沒人知道要刪哪裡;--skip-existing 下次
+    #    跳過這首時更不會再提醒一次。→ 寫進結果 dict → 進 store → 進總結。
+    _dirty = [ln.split("清乾淨:", 1)[-1].strip()
+              for ln in (r.stdout or "").splitlines()
+              if "沒清乾淨" in ln]
     if r.returncode == 4:
-        _tail = [ln for ln in (r.stdout or "").splitlines() if "快照沒清乾淨" in ln]
-        print(f"      ⛔ 快照殘留(請手動刪掉):{_tail[-1] if _tail else '見上面輸出'}",
-              flush=True)
+        print(f"      ⛔ 暫存殘留(請手動刪掉):{_dirty or '見上面輸出'}", flush=True)
     if not out_json.exists():
         return None, (r.stderr or r.stdout or "")[-300:]
     # ⛔ 讀不開的報告要收斂成一則錯誤,不可以讓整批炸掉(R25 新測試踩到):
@@ -176,6 +180,9 @@ def run_one(song: Path, timeout=3600):
         d = json.loads(out_json.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         return None, f"結果 JSON 讀不了({type(e).__name__}),拒收"
+    if _dirty:
+        # ⚠️ 這**不是**評測失敗:報告有效,只是有暫存沒清掉。分開記,不混進失敗數。
+        d["_cleanup_dirty"] = _dirty
     # ⛔ 缺柱的結果不可以進批次表 —— 那是另一把尺,拿去算鑑別力會得到假結論。
     #    這裡必須 **fail-closed**:欄位不存在、型別不對,一律拒收。
     #    舊寫法是 `if _pt and not _pt.get("完整評測", True)` —— 完全沒有 pillar_totals 的
@@ -387,7 +394,9 @@ def main():
                 m["_label"] = label
                 m["_name"] = song.name          # 顯示名(鍵是路徑,不能拿來當標題)
                 results[key] = m
-                print(f"✓ {time.time()-t0:.0f}s")
+                # ⛔ 有殘留的不可以印成普通的 ✓(那會讓人以為一切乾淨)
+                _dty = m.get("_cleanup_dirty") or []
+                print(f"{'⚠ DIRTY' if _dty else '✓'} {time.time()-t0:.0f}s")
             _save_store(store, results)
 
         m = results.get(key)
@@ -399,6 +408,17 @@ def main():
         print(f"\n鑑別力報告:{out_dir / '鑑別力報告.md'}")
     else:
         print("\n⚠ 成功的歌少於 2 首,無法算鑑別力")
+    # ⛔ 暫存殘留要在**結尾**再講一次,而且要有完整路徑(Codex R26-P1-2):
+    #    即時那行早就被幾十首的輸出推走了,而那些目錄裡是一整份音訊。
+    _dirty_rows = [(k, v.get("_cleanup_dirty") or [])
+                   for k, v in results.items()
+                   if isinstance(v, dict) and v.get("_cleanup_dirty")]
+    if _dirty_rows:
+        print(f"\n⛔ 有 {len(_dirty_rows)} 首留下了暫存(評測本身有效,請手動刪掉):")
+        for k, paths in _dirty_rows:
+            print(f"   · {Path(k).name}")
+            for x in paths:
+                print(f"     {x}")
     print(f"完整數據:{store}")
 
 

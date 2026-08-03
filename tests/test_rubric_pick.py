@@ -137,3 +137,56 @@ def test_網頁版要處理快照殘留的退出碼(A, tmp_path, monkeypatch):
     table, _img, _lyr, note = A.evaluate("", str(song), "", None)
     assert table, f"🔴 rc=4 的有效報告沒被讀進來(表格是空的):{note}"
     assert "快照" in note and left in note, f"🔴 沒把殘留路徑講給使用者:{note}"
+
+
+def test_網頁版的歌詞與圖要放進受管暫存並會被回收(A, tmp_path, monkeypatch):
+    """🔴 Codex R26-P1-1:網頁版直接 `tempfile.mkdtemp()` 寫歌詞與弧線圖,
+    沒有 finally、沒有 TTL、沒有主人 —— 實測每評一首就在系統 TEMP 永久留下
+    `歌詞.txt` 與 `_情感弧線.png`。⛔ 那可能是**還沒公開的歌詞**。"""
+    import json
+    import time as _t
+    import types as _ty
+    from pathlib import Path as _P
+    root = tmp_path / "state"
+    monkeypatch.setattr(A, "state_root", lambda: root)
+    bare = tmp_path / "bare-temp"
+    bare.mkdir()
+    monkeypatch.setattr(A.tempfile, "tempdir", str(bare))
+    P8 = ("人聲", "和聲", "結構編曲", "聲學", "旋律記憶", "真實風格", "整體", "律動")
+    pt = {"完整評測": True, "缺柱": [], "缺柱權重合計": 0.0, "曲側合成": 70.0,
+          "柱分": {k: {"score": 70.0, "items": {"x": 70.0}, "missing": []} for k in P8},
+          "曲側含柱": list(P8)}
+    rep = tmp_path / "甲_評審團.json"
+    rep.write_text(json.dumps({"scoring_contract": "2026-07-25-v1", "pillar_totals": pt,
+                               "scores": {"total": 70.0}}, ensure_ascii=False),
+                   encoding="utf-8")
+    monkeypatch.setattr(A, "_run", lambda *a, **k: _ty.SimpleNamespace(
+        returncode=0, stdout=f"完整報告:{rep}\n", stderr=""))
+    A.evaluate("", str(tmp_path / "甲.wav"), "夜風吹過窗縫 帶來輕輕的呢喃", None)
+    made = sorted(x.name for x in (root / "web-tmp").iterdir())
+    assert made, "🔴 產物沒有放進產品自己的受管目錄"
+    assert sorted(x.name for x in bare.iterdir()) == [], \
+        f"🔴 還是往系統 TEMP 亂丟:{sorted(x.name for x in bare.iterdir())}"
+    # ⭐ 回收契約:超過 TTL 的舊產物,下一個請求會清掉
+    old = root / "web-tmp" / "req-old"
+    old.mkdir()
+    (old / "歌詞.txt").write_text("舊的", encoding="utf-8")
+    import os as _os
+    _os.utime(old, (_t.time() - 99999, _t.time() - 99999))
+    assert A._sweep_web_tmp(ttl=60) >= 1, "🔴 過期的產物沒有被回收"
+    assert not old.exists(), "🔴 回收沒有真的刪掉"
+
+
+@pytest.mark.parametrize("rc", [0, 4])
+def test_網頁版遇到損壞的報告不可以炸掉request(A, tmp_path, monkeypatch, rc):
+    """🔴 Codex R26-P2-1:`json.loads(jpath.read_text())` 沒有保護 —— 半份 JSON、
+    編碼錯誤、讀取競速都會讓整個 Gradio request 以例外結束,使用者只看到紅框。"""
+    import types as _ty
+    bad = tmp_path / "壞_評審團.json"
+    bad.write_text("這不是 JSON", encoding="utf-8")
+    monkeypatch.setattr(A, "_run", lambda *a, **k: _ty.SimpleNamespace(
+        returncode=rc, stdout=f"完整報告:{bad}\n⛔ 來源快照沒清乾淨:X\n", stderr=""))
+    table, _img, _lyr, note = A.evaluate("", str(tmp_path / "甲.wav"), "", None)
+    assert table == [] and "讀不了" in note, f"🔴 沒有收斂成產品訊息:{note!r}"
+    if rc == 4:
+        assert "快照" in note, "🔴 報告壞掉時把快照殘留的警告也弄丟了"

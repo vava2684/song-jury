@@ -48,7 +48,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # ⛔ log 不可用固定檔名(舊版共用一個 /tmp 下的固定 log):兩個安裝同時跑會互相
 #    truncate,失敗原因顯示成別人那一步的;固定名稱也有 symlink 風險(Codex R10)。
 #    mktemp 專屬檔 + trap 收尾。
-SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || SJ_STEP_LOG="${TMPDIR:-/tmp}/sj_step_$$.log"
+# ⛔ mktemp 失敗不可以退回固定檔名(Codex R26-P2-2):`sj_step_$$.log` 是**可預測**的,
+#    而最需要私密性的正是「TEMP 權限/工具異常」那種環境 —— 那時候退回可猜的名字
+#    等於把最壞情況做成最不安全的情況。沒有安全的暫存檔就直接停。
+SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || {
+  printf "✗ 建不出安全的暫存檔(mktemp 失敗)—— 請檢查 TEMP/TMPDIR 的權限與空間。\n" >&2
+  exit 1
+}
 # ⛔ shell 的 trap **不是堆疊**(Codex R24-P2-1 實測):後面的區塊若自己
 #    `trap ... EXIT`,就會把這一份整個蓋掉,之後再 `trap - EXIT` 連帶把它清空 ——
 #    於是 sj_step.* 每跑一次就留一份在 TEMP(裡面可能有命令診斷與本機路徑)。
@@ -293,7 +299,10 @@ if [ "$HAS_ENV" = 1 ]; then
   # ⛔ 輸出直接給終端(即時、不經手);判斷讀機器可讀的 UTF-8 JSON,不 grep 人類訊息
   #    (Codex R19-3:靠解析中文訊息本來就不該是契約,換個 code page 就會壞)
   # ⛔ mktemp 已經是私密隨機名;再加 trap 保證中斷也清掉(Codex R20-P2-1)
-  _line_status="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX")"   # cleanup_all 會清
+  _line_status="$(mktemp "${TMPDIR:-/tmp}/song-jury-demucs.XXXXXX" 2>/dev/null)" || {
+    printf "✗ 建不出安全的暫存檔(mktemp 失敗)—— 請檢查 TEMP/TMPDIR 的權限與空間。\n" >&2
+    exit 1
+  }   # cleanup_all 會清
   # ⛔ INT/TERM 不可以只清檔就繼續(Codex R22-P2-4 實測):handler 沒有 exit
   #    的話,shell 清掉狀態檔之後**照樣往下裝**,Ctrl+C 變成「什麼都沒發生」,
   #    最外層還回 0 —— 與 --verify-models 的 130 契約、與 PowerShell 都不一致。
@@ -449,7 +458,10 @@ if [ "$HAS_ENV" = 1 ]; then
   # ⛔ 隨機私密檔名 + 一建立就登記進 cleanup_all(Codex R25-P2-3):
   #    固定的 $$ 名字既可預測、又只在線性路徑刪 —— 在 song_scorer 跑到一半
   #    被中斷(或宿主終止)時就留在 TEMP 裡。
-  _sj="$(mktemp "${TMPDIR:-/tmp}/song_jury_smoke.XXXXXX")" || _sj="${TMPDIR:-/tmp}/song_jury_smoke_$$.json"
+  _sj="$(mktemp "${TMPDIR:-/tmp}/song_jury_smoke.XXXXXX" 2>/dev/null)" || {
+    printf "✗ 建不出安全的暫存檔(mktemp 失敗)—— 請檢查 TEMP/TMPDIR 的權限與空間。\n" >&2
+    exit 1
+  }
   _smoke_json="$_sj"
   OUT=$(PYTHONUTF8=1 .venv/bin/python song_scorer.py demo_mix.wav --json "$_sj" 2>&1); RC=$?
   if [ "$RC" -ne 0 ]; then

@@ -343,13 +343,18 @@ def test_兩個互斥的身分旗標不可以同時給(tmp_path, order):
 
 
 # ── 快照的收尾(Codex R24-P1-1)────────────────────────────────────
-def test_唯讀來源的快照也要刪得掉(tmp_path):
+def test_唯讀來源的快照也要刪得掉(tmp_path, monkeypatch):
     """🔴 R24-P1-1 實測:copy2 會把**唯讀屬性**一起複製過來,rmtree 因此失敗,
     而 ignore_errors=True 把失敗整個吞掉 —— 一整份可能還沒公開的歌就留在 TEMP。
     (Windows 上「來源是唯讀」非常普通:雲端同步、備份還原、防寫的素材夾。)"""
     import os as _os
     import stat as _stat
     J = load("評審團")
+    # ⚠️ 也要隔離暫存目錄:變異驗證會把收尾改成 no-op,那時候這條會**故意**留下
+    #    殘留 —— 沒隔離就留在真的 TEMP(自己踩到,實測撈到一份唯讀.wav)。
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
     src = tmp_path / "唯讀.wav"
     src.write_bytes(b"RIFF" + b"x" * 300)
     _os.chmod(src, _stat.S_IREAD)
@@ -382,7 +387,8 @@ def test_快照刪不掉時要大聲講而且退出碼要不一樣(tmp_path, mon
     for var in ("TMPDIR", "TEMP", "TMP"):
         monkeypatch.setenv(var, str(iso))
     monkeypatch.setattr(J, "_force_rmtree", lambda d, **kw: str(d))   # 假裝刪不掉
-    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: song)
+    # ⚠️ R26 起 resolve_input 回 (命名用的來源, 實際要讀的音檔) 兩個值
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: (song, song))
     monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: __import__("contextlib").nullcontext())
     monkeypatch.setattr(J, "_evaluate", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
     monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
@@ -603,7 +609,8 @@ def test_同一個程序連跑兩次不可以繼承上一輪的快照殘留(tmp_
     monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
     for var in ("TMPDIR", "TEMP", "TMP"):
         monkeypatch.setenv(var, str(iso))
-    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: song)
+    # ⚠️ R26 起 resolve_input 回 (命名用的來源, 實際要讀的音檔) 兩個值
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: (song, song))
     monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: _ctx.nullcontext())
     monkeypatch.setattr(J, "_evaluate", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
     monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(song)])
@@ -656,3 +663,67 @@ def test_樣本格式表是鎖住的契約_整份都要對():
     # s64 一定要在表裡而且對到空字串(那是「刻意不發布身分」的明確宣告,
     # 不是「忘了列」——後者會走 fallback,那正是 R21 修掉的碰撞來源)
     assert J._CANONICAL_BY_FMT["s64"] == "" and V.CANONICAL_BY_FMT["s64"] == ""
+
+
+# ── 暫存的主人(Codex R26-P1-1)────────────────────────────────────
+def test_上傳檔補正的那份音訊要有人清(tmp_path, monkeypatch):
+    """🔴 Codex R26-P1-1:上傳檔沒有(或非小寫)音檔副檔名時,產品會把**一整份音訊**
+    複製到系統 TEMP 當補正檔 —— 而那份檔案沒有任何人負責刪(快照清的是另一份)。
+    ⛔ 註解自己就寫著「gradio 上傳暫存路徑常沒有合適副檔名」,所以這不是死路徑。"""
+    import contextlib as _ctx
+    J = load("評審團")
+    iso = tmp_path / "temp"
+    iso.mkdir()
+    monkeypatch.setattr(J.tempfile, "tempdir", str(iso))
+    up = tmp_path / "gradio_upload_no_ext"          # 故意沒有副檔名
+    up.write_bytes(b"RIFF" + b"z" * 500)
+    # ① resolve_input 要把「命名用的來源」與「實際要讀的音檔」分開回傳,
+    #    並且把自己建的暫存目錄登記給呼叫端
+    owned = []
+    song, source = J.resolve_input(str(up), owned)
+    assert song == up, f"🔴 命名應該還是用原路徑(報告才不會被寫進 TEMP):{song}"
+    assert source != up and source.suffix == ".mp3", f"🔴 沒有補正副檔名:{source}"
+    assert owned and Path(owned[0]).exists(), "🔴 補正檔的暫存目錄沒有登記給呼叫端"
+    # ② 走完整條 main():收工後那個目錄要不見
+    monkeypatch.setattr(J, "resolve_input", lambda *_a, **_k: (up, source))
+    monkeypatch.setattr(J, "_job_lock", lambda *_a, **_k: _ctx.nullcontext())
+    monkeypatch.setattr(J, "_evaluate", lambda *a, **k: (_ for _ in ()).throw(SystemExit(0)))
+    monkeypatch.setattr(J.sys, "argv", ["評審團.py", str(up)])
+
+    def _resolve(arg, owned_out=None):
+        if owned_out is not None:
+            owned_out.append(Path(owned[0]))
+        return up, source
+
+    monkeypatch.setattr(J, "resolve_input", _resolve)
+    with pytest.raises(SystemExit) as e:
+        J.main()
+    assert e.value.code == 0, f"退出碼應該照舊:{e.value.code}"
+    assert not Path(owned[0]).exists(), \
+        f"🔴 補正檔(一整份音訊)留在 TEMP 了:{owned[0]}"
+    assert sorted(x.name for x in iso.iterdir()) == [], \
+        f"🔴 TEMP 還有殘留:{sorted(x.name for x in iso.iterdir())}"
+
+
+def test_批次要把暫存殘留寫進store與總結(tmp_path, monkeypatch, capsys):
+    """🔴 Codex R26-P1-2:rc=4 的殘留路徑只印在即時輸出 —— 幾十首之後就被推走,
+    批次結束後沒人知道要刪哪裡;store 裡也沒有,--skip-existing 下次更不會提醒。"""
+    import types as _types
+    B = load("批次評測")
+    song = tmp_path / "甲.wav"
+    song.write_bytes(b"RIFF")
+    stub = _rc4_stub(tmp_path)
+
+    def fake_run_tree(cmd, **kw):
+        out = subprocess.run([sys.executable, str(stub), str(song)], capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=300)
+        return _types.SimpleNamespace(returncode=out.returncode, stdout=out.stdout,
+                                      stderr=out.stderr)
+
+    monkeypatch.setattr(B, "run_tree", fake_run_tree)
+    monkeypatch.setattr(B, "VENV_PY", sys.executable)
+    data, err = B.run_one(song)
+    assert data is not None and not err
+    dirty = data.get("_cleanup_dirty")
+    assert dirty and "song-jury-src-xxxx" in dirty[0], \
+        f"🔴 殘留路徑沒有進到結果(store 就存不到):{data.get('_cleanup_dirty')!r}"

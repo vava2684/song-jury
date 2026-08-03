@@ -8,14 +8,17 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import gradio as gr
 
 from 子程序 import run_tree
+from 狀態目錄 import state_root
 from 設定讀取 import ConfigError, positive_finite
 import requests
 from urllib.parse import urlparse
@@ -104,6 +107,43 @@ def ollama_judge(model, prompt):
 
 
 # ── 成績單整理 ─────────────────────────────────────────────────
+# ── 網頁版產物的受管暫存(Codex R26-P1-1)────────────────────────
+# 🔴 舊版直接 `tempfile.mkdtemp()` 寫歌詞與弧線圖,沒有 finally、沒有 TTL、
+#    沒有主人 —— 實測每評一首就在系統 TEMP 永久留下 `歌詞.txt` 與 `_情感弧線.png`。
+#    ⛔ 那可能是**還沒公開的歌詞**,不可以靠「作業系統某天也許會清 TEMP」當生命週期。
+# ⚠️ 回傳前不能刪(Gradio 要讀那張圖),所以契約是:放進**產品自己的**目錄,
+#    每次新請求先回收超過 TTL 的舊產物 —— 可量測、可測試。
+_WEB_TMP_TTL = max(60.0, positive_finite("SONG_JURY_WEB_TMP_TTL", 3600.0,
+                                         lo=0.0, hi=86400.0))
+
+
+def _web_tmp_root() -> Path:
+    d = state_root() / "web-tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _sweep_web_tmp(ttl: float = None) -> int:
+    """回收超過 TTL 的舊產物;回收掉幾個目錄就回幾。"""
+    ttl = _WEB_TMP_TTL if ttl is None else ttl
+    now = time.time()
+    n = 0
+    for d in _web_tmp_root().iterdir():
+        try:
+            if d.is_dir() and (now - d.stat().st_mtime) > ttl:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1 if not d.exists() else 0
+        except OSError:
+            pass          # 別讓回收把請求弄掛 —— 下次還會再掃
+    return n
+
+
+def _web_workdir() -> Path:
+    """給這一次請求用的目錄(先回收舊的,再開新的)。"""
+    _sweep_web_tmp()
+    return Path(tempfile.mkdtemp(prefix="req-", dir=_web_tmp_root()))
+
+
 def _score_table(merged):
     # ⛔ 巢狀容器不可假定型別:引擎異常時 scores 可能是 []、mix_detail 可能是 list
     #    (Codex R10 探針:scores: [] → TypeError)。昂貴評測已寫進 JSON,
@@ -203,7 +243,13 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     jpath = _jpath_from_stdout(r.stdout)
     if not jpath or not jpath.exists():
         return [], None, "", f"❌ 找不到結果 JSON。\n```\n{r.stdout[-600:]}\n```"
-    _data = json.loads(jpath.read_text(encoding="utf-8"))
+    # ⛔ 讀不開要收斂成產品訊息(Codex R26-P2-1):半份 JSON / 編碼錯誤 /
+    #    讀取競速都會讓整個 Gradio request 以例外結束,使用者只看到紅框。
+    try:
+        _data = json.loads(jpath.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return [], None, "", (f"❌ 報告讀不了({type(e).__name__})——"
+                              f"評測可能被中斷或檔案損壞。{_snap_warn}")
     table = _score_table(_data)
 
     # ⛔ 完整性警語一定要在網頁版也顯示出來 —— CLI 印得很大聲,網頁版原本整段吃掉,
@@ -246,7 +292,7 @@ def evaluate(link, audio_file, lyrics, model, progress=gr.Progress()):
     has_lyrics = bool((lyrics or "").strip())
     if has_lyrics:
         progress(0.6, desc="情感弧線分析中…")
-        tmp = Path(tempfile.mkdtemp()) / "歌詞.txt"
+        tmp = _web_workdir() / "歌詞.txt"
         tmp.write_text(lyrics, encoding="utf-8")
         _run([_venv_py(".venv"), str(BASE / "情感弧線.py"), str(tmp)])
         cand = tmp.with_name(tmp.stem + "_情感弧線.png")

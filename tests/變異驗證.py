@@ -690,8 +690,8 @@ MUTATIONS = [
 
     ("安裝 log 退回固定共用檔(並行安裝互相 truncate)",
      "install.sh",
-     'SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || SJ_STEP_LOG="${TMPDIR:-/tmp}/sj_step_$$.log"',
-     'SJ_STEP_LOG="/tmp/_sj_step.log"',
+     'SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || {',
+     'SJ_STEP_LOG="/tmp/_sj_step.log"; false || {',
      "tests/test_packaging.py::test_install_sh不可用固定tmp檔且要容忍BOM"),
 
     ("讀 .env 不吃 BOM(PS5.1 寫的 .env 被判成沒金鑰)",
@@ -1221,6 +1221,49 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── Codex R26 ────────────────────────────────────────────────
+    ('上傳補正檔沒人清(一整份音訊永久留在 TEMP)',
+     '評審團.py',
+     '            if owned_out is not None:\n                owned_out.append(d)',
+     '            pass   # 變異:不登記給呼叫端',
+     'tests/test_來源身分.py::test_上傳檔補正的那份音訊要有人清'),
+
+    ('補正檔變成命名來源(報告被寫進 TEMP,跟著暫存一起消失)',
+     '評審團.py',
+     '            return p, fixed          # 命名照舊用原路徑,內容讀補正檔',
+     '            return fixed, fixed',
+     'tests/test_來源身分.py::test_上傳檔補正的那份音訊要有人清'),
+
+    ('批次不把暫存殘留寫進結果(批次結束後沒人知道要刪哪裡)',
+     '批次評測.py',
+     '        d["_cleanup_dirty"] = _dirty',
+     '        pass   # 變異:只印不記',
+     'tests/test_來源身分.py::test_批次要把暫存殘留寫進store與總結'),
+
+    ('網頁版又把歌詞丟進系統 TEMP(沒有主人、沒有 TTL)',
+     'app.py',
+     '        tmp = _web_workdir() / "歌詞.txt"',
+     '        tmp = Path(tempfile.mkdtemp()) / "歌詞.txt"',
+     'tests/test_rubric_pick.py::test_網頁版的歌詞與圖要放進受管暫存並會被回收'),
+
+    ('網頁版的舊產物不回收(受管目錄變成永久堆積)',
+     'app.py',
+     '            if d.is_dir() and (now - d.stat().st_mtime) > ttl:',
+     '            if False:   # 變異:不回收',
+     'tests/test_rubric_pick.py::test_網頁版的歌詞與圖要放進受管暫存並會被回收'),
+
+    ('網頁版讀損壞報告直接炸掉 request',
+     'app.py',
+     '    try:\n        _data = json.loads(jpath.read_text(encoding="utf-8"))',
+     '    if True:\n        _data = json.loads(jpath.read_text(encoding="utf-8"))',
+     'tests/test_rubric_pick.py::test_網頁版遇到損壞的報告不可以炸掉request'),
+
+    ('install.sh 的暫存檔又退回可預測的固定名',
+     'install.sh',
+     'SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || {\n  printf "✗ 建不出安全的暫存檔(mktemp 失敗)—— 請檢查 TEMP/TMPDIR 的權限與空間。\\n" >&2\n  exit 1\n}',
+     'SJ_STEP_LOG="$(mktemp "${TMPDIR:-/tmp}/sj_step.XXXXXX" 2>/dev/null)" || SJ_STEP_LOG="${TMPDIR:-/tmp}/sj_step_$$.log"',
+     'tests/test_installer_order.py::test_sh在mktemp失敗時不可以退回固定檔名'),
+
     # ── Codex R25 ────────────────────────────────────────────────
     # ⚠️ 這三件事(兩道訊號各自送、有上限的等待、逾時升級 KILL)**互相是後備**:
     #    單獨拿掉任何一條,另外兩條都會把它接住 —— 那是好的防禦深度,但也表示
@@ -1262,11 +1305,11 @@ MUTATIONS = [
      '            elif False:   # 變異:4 當一般失敗',
      'tests/test_來源身分.py::test_完整驗證遇到退出碼4要驗報告但不可以說VERIFY_OK'),
 
-    ('快照殘留改回模組全域(上一輪的殘留算到下一輪)',
-     '評審團.py',
-     '    left = []                       # ⭐ 本輪的快照殘留(每次 main 都是新的)',
+    ("快照殘留改回模組全域(上一輪的殘留算到下一輪)",
+     "評審團.py",
+     "    left = []                       # ⭐ 本輪沒清乾淨的暫存路徑(每次 main 都是新的)",
      '    left = main.__dict__.setdefault("_left", [])   # 變異:跨呼叫共用',
-     'tests/test_來源身分.py::test_同一個程序連跑兩次不可以繼承上一輪的快照殘留'),
+     "tests/test_來源身分.py::test_同一個程序連跑兩次不可以繼承上一輪的快照殘留"),
 
     ("樣本格式表少一列(u8 的來源從此走不到 canonical)",
      "評審團.py",

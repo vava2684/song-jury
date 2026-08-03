@@ -1267,3 +1267,50 @@ def test_sh在探針不理會TERM時要升級成KILL(tmp_path):
     time.sleep(1.5)
     assert beat.read_text(encoding="utf-8") == b1, "🔴 探針還活著 —— 升級終止沒生效"
     assert sorted(x.name for x in tmpdir.iterdir()) == [], "🔴 TMPDIR 還有殘留"
+
+
+def test_sh在mktemp失敗時不可以退回固定檔名(tmp_path):
+    """🔴 Codex R26-P2-2:`mktemp || 固定的 $$ 檔名` —— 「隨機私密」只在 mktemp
+    成功時成立,而最需要私密性的正是 TEMP 權限/工具異常那種環境。
+    ⛔ 那等於把最壞情況做成最不安全的情況:直接停,不要退回可預測的名字。"""
+    bash = _git_bash()
+    if not bash:
+        pytest.skip("這台沒有 Git Bash")
+    d = _stub_repo(tmp_path, 0)
+    # ⚠️ 假的 mktemp 不可以放在 tmp_path:pytest 的目錄名帶了這條測試的**中文**名字,
+    #    Git Bash 解不了那個 PATH 項目 → 直接忽略 → 用到真的 mktemp,
+    #    這條就變成「什麼都沒驗到卻綠燈」(自己踩到)。放到純 ASCII 的暫存目錄。
+    import tempfile as _tf
+    fake_bin = Path(_tf.mkdtemp(prefix="sj-fakebin-"))
+    (fake_bin / "mktemp").write_text("#!/usr/bin/env bash\nexit 1\n",
+                                     encoding="utf-8", newline="\n")
+    (fake_bin / "mktemp").chmod(0o755)
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    posix = lambda q: str(q).replace(chr(92), "/")
+    # ⚠️ PATH 的項目要是**這個 shell 認得的**格式:Git Bash 看不懂 `C:/…`,
+    #    整個項目會被靜靜忽略 → 用到真的 mktemp,這條又變成驗不到東西
+    #    (自己踩到第二次:第一次是中文路徑,這次是路徑格式)。用 cygpath 轉。
+    r = subprocess.run(
+        [bash, "-c",
+         f"p='{posix(fake_bin)}'; "
+         "command -v cygpath >/dev/null 2>&1 && p=\"$(cygpath -u \"$p\")\"; "
+         "export PATH=\"$p:$PATH\"; "
+         "command -v mktemp | grep -q sj-fakebin || "
+         "{ echo 'FAKE_MKTEMP_NOT_ON_PATH'; exit 99; }; "
+         f"export TMPDIR='{posix(tmpdir)}'; "
+         f"cd '{posix(d)}'; bash install.sh --check-only --no-auto-tools"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=600)
+    assert "FAKE_MKTEMP_NOT_ON_PATH" not in (r.stdout or ""), \
+        "🔴 假的 mktemp 沒有蓋過真的 —— 這次什麼都沒驗到"
+    out = (r.stdout or "") + (r.stderr or "")
+    assert r.returncode != 0, f"🔴 mktemp 壞掉卻照樣往下跑:\n{out[-500:]}"
+    assert "mktemp" in out and "暫存檔" in out, f"🔴 沒有講清楚為什麼停:\n{out[-500:]}"
+    # ⛔ 要停在**第一個** mktemp:退回固定檔名的話會一路跑到自我檢查,才因為
+    #    別處的 mktemp 失敗而停 —— 那樣「rc 非零 + 有訊息」照樣成立,變異就驗不到
+    #    (變異驗證抓到我這條是裝飾品)。
+    assert "自我檢查" not in out, f"🔴 沒有在第一個 mktemp 就停下來:\n{out[-500:]}"
+    left = sorted(x.name for x in tmpdir.iterdir())
+    assert not [x for x in left if "$$" in x or x.startswith("sj_step_")], \
+        f"🔴 還是產生了可預測的固定檔名:{left}"

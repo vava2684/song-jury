@@ -1058,8 +1058,16 @@ def _download_youtube(url):
     return mp3
 
 
-def resolve_input(arg):
-    """本機路徑直接用;SUNO/YouTube 連結、直連 mp3 先下載到 下載\\ 再評。"""
+def resolve_input(arg, owned_out=None):
+    """回 **(命名用的來源路徑, 實際要讀的音檔路徑)**。
+
+    本機路徑直接用;SUNO/YouTube 連結、直連 mp3 先下載到 下載\\ 再評。
+
+    🔴 Codex R26-P1-1:上傳檔補正副檔名時會把**一整份音訊**複製到系統 TEMP,
+       而那份檔案沒有任何人負責刪 —— 主流程後來只清「評測快照」,不是它。
+       ⛔ 現在補正檔只當**內容來源**(第二個回傳值),報告照舊寫在使用者原本的
+          檔案旁邊;建立的暫存目錄登記進 owned_out,由 main 的最外層 finally 清掉。
+    """
     if not re.match(r"^https?://", arg, re.I):
         p = Path(arg).resolve()
         if not p.exists():
@@ -1068,13 +1076,22 @@ def resolve_input(arg):
         # 判斷是不是音檔,對不到就誤把音檔當清單檔用文字讀 → UnicodeDecodeError 0xff 崩。
         # 對不到就複製一份成 .mp3(librosa/soundfile 依內容解碼,副檔名只給 SongEval 判斷用)。
         if not str(p).endswith((".wav", ".mp3")):
-            fixed = Path(tempfile.mkdtemp(prefix="song_jury_up_")) / (_safe_name(p.stem or "upload") + ".mp3")
-            shutil.copy(p, fixed)
+            try:
+                d = Path(tempfile.mkdtemp(prefix="song-jury-up-"))
+            except OSError as e:
+                sys.exit(f"✗ 建不出暫存目錄({type(e).__name__}: {e})。\n"
+                         f"→ 檢查 TEMP/TMPDIR 的空間與權限。")
+            if owned_out is not None:
+                owned_out.append(d)
+            fixed = d / (_safe_name(p.stem or "upload") + ".mp3")
+            # ⛔ copyfile 不 copy2:不要把唯讀屬性帶過來(收工會刪不掉,R24-P1-1)
+            shutil.copyfile(p, fixed)
             print(f"📎 上傳檔補正音檔副檔名: {fixed}")
-            return fixed
-        return p
+            return p, fixed          # 命名照舊用原路徑,內容讀補正檔
+        return p, p
     if _is_youtube(arg):
-        return _download_youtube(arg)
+        yt = _download_youtube(arg)
+        return yt, yt
     lyrics = None
     uuid = re.search(_UUID_RE, arg)
     if not uuid and "suno.com" in arg.lower():
@@ -1138,7 +1155,7 @@ def resolve_input(arg):
         (res_dir / f"{dest.stem}_歌詞.txt").write_text(lyrics + "\n", encoding="utf-8")
         print(f"📝 歌詞已自動抓取: {res_dir / (dest.stem + '_歌詞.txt')}")
     print(f"已存: {dest}\n")
-    return dest
+    return dest, dest
 
 
 def _lock_path_for(song: Path) -> Path:
@@ -1239,15 +1256,26 @@ def main():
     if len(sys.argv) < 2:
         sys.exit("用法: python 評審團.py <歌曲檔路徑 或 SUNO/YouTube 連結>\n"
                  "  含空白的路徑請用引號括起。")
-    song = resolve_input(sys.argv[1])
+    left = []                       # ⭐ 本輪沒清乾淨的暫存路徑(每次 main 都是新的)
+    owned = []                      # 這一輪自己建立、自己要負責刪的暫存目錄
+    song, source = resolve_input(sys.argv[1], owned)
     rc = 0
-    left = []                       # ⭐ 本輪的快照殘留(每次 main 都是新的)
     # ⛔ 鎖 → 快照 → 評測:順序不能反過來(先鎖住才輪得到我們複製那一份)
-    with _job_lock(song), _immutable_input(song, left) as audio:
-        try:
-            _evaluate(song, audio)      # 它自己 sys.exit(0/2)
-        except SystemExit as e:
-            rc = e.code if isinstance(e.code, int) else 1
+    try:
+        with _job_lock(song), _immutable_input(source, left) as audio:
+            try:
+                _evaluate(song, audio)      # 它自己 sys.exit(0/2)
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 1
+    finally:
+        # ⛔ 補正檔(一整份音訊)一定要清:它跟快照走同一條契約 ——
+        #    刪不掉就講出來並用退出碼 4,不可以無聲留在 TEMP(Codex R26-P1-1)。
+        for d in owned:
+            gone = _force_rmtree(d)
+            if gone:
+                print(f"\n⛔ 上傳補正檔沒清乾淨:{gone}\n"
+                      f"   裡面有一整份音訊 —— 請手動刪掉。")
+                left.append(gone)
     if left:
         # ⛔ 收尾失敗要有**自己的**退出碼(Codex R24-P1-1):沿用 0/2 等於
         #    「一切正常」,只看退出碼的自動化永遠不會知道 TEMP 裡留了一份音訊。
