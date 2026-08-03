@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-NOTE ON THIRD-PARTY MODELS (not included in this repository):
-- SongEval — licensed CC BY-NC-SA (non-commercial); fetch separately.
-- NRC-VAD Lexicon — redistribution prohibited; fetch separately.
-- Meta Audiobox Aesthetics — see its own license.
-These are downloaded by the user at install time and are NOT part of this MIT-licensed work.

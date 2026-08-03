@@ -605,3 +605,134 @@ def test_分軌前要掃掉沒人在寫的舊暫存(tmp_path, monkeypatch):
     except Exception:
         pass
     assert seen.get("d") == stems, "🔴 分軌入口沒有先掃舊的 .tmp_"
+
+
+def test_LICENSE要是純MIT不可以夾帶附加條款():
+    """🔴 R31 實測:MIT 全文後面接了一段「NOTE ON THIRD-PARTY MODELS」——
+    GitHub 的 licensee 就把授權判成 **Other**,而不是 MIT。
+    ⛔ 那不是排版問題:別人(尤其公司法務)看 repo 首頁的第一眼是那個標籤,
+       判成 Other 等於「這東西授權要自己讀、先別用」——開源門面直接少一角。
+    第三方聲明本來就該獨立成檔,LICENSE 只放那份授權本身。"""
+    lic = (REPO / "LICENSE").read_text(encoding="utf-8")
+    assert lic.lstrip().startswith("MIT License"), "LICENSE 要以 MIT 全文開頭"
+    assert "Copyright (c) 2026 vava2684" in lic
+    # ⛔ 授權檔裡不可以有第三方/非商用之類的附加段落
+    for 髒字 in ("THIRD-PARTY", "THIRD PARTY", "CC BY-NC-SA", "NRC-VAD",
+                 "non-commercial", "SongEval", "Audiobox"):
+        assert 髒字 not in lic, \
+            f"🔴 LICENSE 又被塞進附加條款「{髒字}」—— GitHub 會把授權判成 Other"
+    # 最後一段一定是 MIT 的免責聲明,後面不再有別的東西
+    assert lic.rstrip().endswith("SOFTWARE."), \
+        f"🔴 MIT 全文之後還有東西:{lic.rstrip()[-120:]!r}"
+
+
+def test_第三方聲明要真的進得了repo():
+    """⛔ 這個 repo 的 .gitignore 是**白名單**:新增檔案預設一律被忽略。
+    第三方聲明沒進 repo 的話,LICENSE 又不寫,那些非商用限制就等於沒講 ——
+    比夾在 LICENSE 裡更糟(Codex R31 只點出前半,這是後半)。"""
+    import subprocess as _sp
+    f = REPO / "THIRD_PARTY_NOTICES.md"
+    assert f.exists(), "🔴 第三方聲明檔不見了"
+    # ⚠️ 一定要 --no-index:檔案一旦被 git 追蹤,`git check-ignore` 就一律回
+    #    「沒被忽略」,不管 .gitignore 寫什麼 —— 那樣驗到的是「它已經被 add 過」,
+    #    而不是「白名單有放行它」(變異實測:拿掉白名單那行,測試照樣過)。
+    # ⚠️ 也不能只看退出碼:放行與不放行**兩種都是 rc=0**,差別在命中哪條規則
+    #    (`/*` 全部忽略 vs `!THIRD_PARTY_NOTICES.md` 放行)。
+    _tracked()          # ⚠️ 非 git 目錄(下載 ZIP / git archive 解出來的)在這裡誠實跳過
+    r = _sp.run(["git", "check-ignore", "--no-index", "-v", "THIRD_PARTY_NOTICES.md"],
+                cwd=str(REPO), capture_output=True, text=True,
+                encoding="utf-8", errors="replace")
+    rule = (r.stdout or "").split("\t")[0].split(":")[-1].strip()
+    assert rule.startswith("!"), (
+        f"🔴 白名單沒放行 THIRD_PARTY_NOTICES.md(命中的規則是 {rule!r})——"
+        " 這個 repo 的 .gitignore 是白名單,新檔預設一律被忽略,"
+        " 別人 clone 下來不會有這個檔")
+    tracked = _sp.run(["git", "ls-files", "THIRD_PARTY_NOTICES.md"], cwd=str(REPO),
+                      capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert tracked.stdout.strip(), "🔴 檔案存在但沒被 git 追蹤(等於沒發布)"
+    body = f.read_text(encoding="utf-8")
+    # ⛔ 那些「使用者要自己去拿、而且有限制」的東西一個都不能漏
+    for 必提 in ("SongEval", "NRC-VAD", "Audiobox"):
+        assert 必提 in body, f"🔴 第三方聲明漏了 {必提}"
+    assert "CC BY-NC-SA" in body and "non-commercial" in body.lower(), \
+        "🔴 沒把「非商用」這個真正會咬人的限制講出來"
+    assert "LICENSE" in body and "MIT" in body, "🔴 要說清楚本專案自己是 MIT"
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "THIRD_PARTY_NOTICES.md" in readme, \
+        "🔴 README 沒指到第三方聲明 —— 沒人會知道要看它"
+
+
+def _gh_slug(title):
+    """GitHub(github-slugger)的錨點規則:小寫 → 去掉非「字/空白/連字號」→
+    每個空白各換一個 `-`。
+    ⚠️ **不可以**把連續空白併成一個 `-`:標題裡的 `·` 被移除後會留下兩個空白,
+       GitHub 產出的是 `--`;併起來的話這條測試會把正確的連結報成壞掉(自己踩到)。"""
+    import re as _re
+    import unicodedata as _ud
+    s = _re.sub(r"[`*_]", "", title.strip().lower())
+    s = "".join(c for c in s if c.isalnum() or c in " -"
+                or _ud.category(c).startswith(("L", "N")))
+    return s.strip().replace(" ", "-")
+
+
+def test_文件裡的連結不可以是死的():
+    """🔴 README 精簡之後,深入細節搬到 docs/ 只留連結 —— 連結一旦壞掉,
+    那些內容就等於**消失**了,而且沒有人會發現(壞連結不會讓任何程式失敗)。
+    ⛔ 這個 repo 的 .gitignore 是白名單,所以還要驗「連到的檔案真的會進 repo」:
+       本機看得到 ≠ 別人 clone 下來看得到。"""
+    import re as _re
+    import subprocess as _sp
+    # ⚠️ 白名單那一半需要 git。非 git 目錄(下載 ZIP / git archive 解出來的)
+    #    要**明講跳過**,不可以讓 `rule` 變成空字串就靜靜當作通過 ——
+    #    那樣這條測試在乾淨 clone 裡只剩一半功能,而輸出還是綠的(自己踩到)。
+    有git = _sp.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(REPO),
+                    capture_output=True, text=True).returncode == 0
+    問題 = []
+    for md in (REPO / "README.md", REPO / "THIRD_PARTY_NOTICES.md",
+               REPO / "docs" / "設計契約.md"):
+        assert md.exists(), f"🔴 {md.name} 不見了"
+        text = md.read_text(encoding="utf-8")
+        anchors = {_gh_slug(m) for m in _re.findall(r"^#{1,6}\s+(.+)$", text, _re.M)}
+        for label, target in _re.findall(r"\[([^\]]+)\]\(([^)]+)\)", text):
+            if target.startswith(("http://", "https://", "mailto:")):
+                continue
+            if target.startswith("#"):
+                if target[1:] not in anchors:
+                    問題.append(f"{md.name}:錨點對不上 [{label}]({target})")
+                continue
+            f = (md.parent / target.split("#")[0]).resolve()
+            if not f.exists():
+                問題.append(f"{md.name}:檔案不存在 [{label}]({target})")
+                continue
+            if not 有git:
+                continue
+            rel = f.relative_to(REPO).as_posix()
+            r = _sp.run(["git", "check-ignore", "--no-index", "-v", rel], cwd=str(REPO),
+                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+            rule = (r.stdout or "").split("\t")[0].split(":")[-1].strip()
+            if not rule.startswith("!"):
+                問題.append(f"{md.name}:連到的檔案不會進 repo(命中 {rule!r})→ {rel}")
+    assert not 問題, "🔴 文件連結有問題:\n  " + "\n  ".join(問題)
+    if not 有git:
+        pytest.skip("非 git 目錄 → 連結檔案存在與錨點已驗過,"
+                    "但「連到的檔案會不會進 repo」這半段沒驗到(要驗請用 git clone)")
+
+
+def test_README不可以又長回一面牆():
+    """⛔ 這頁是給**第一次點進來的人**看的。工程推導屬於 docs/設計契約.md ——
+    兩種讀者混在同一頁,結果是兩邊都讀不下去(精簡前:716 行、38 處鑑識標記)。
+    ⚠️ 這條不是要求「不准寫字」,而是**寫在對的地方**:超標時把細節搬去
+       docs/,README 留一句話加連結。"""
+    L = (REPO / "README.md").read_text(encoding="utf-8").splitlines()
+    assert len(L) <= 620, (
+        f"🔴 README 又長到 {len(L)} 行了 —— 深入細節請搬到 docs/設計契約.md,"
+        " 這頁只留使用者要知道的")
+    鑑識 = sum(l.count("Codex R") for l in L)
+    assert 鑑識 <= 8, (
+        f"🔴 README 裡有 {鑑識} 處 `Codex Rxx-Px` 稽核標記 ——"
+        " 那是給審計看的脈絡,訪客看到的是雜訊,請搬到 docs/設計契約.md")
+    import re as _re
+    secs = [i for i, l in enumerate(L) if _re.match(r"^#{2,3} ", l)] + [len(L)]
+    最長 = max((b - a, L[a][:40]) for a, b in zip(secs, secs[1:]))
+    assert 最長[0] <= 110, (
+        f"🔴 章節「{最長[1]}」佔了 {最長[0]} 行 —— 一個章節就是一面牆,請拆或搬")

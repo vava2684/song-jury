@@ -1223,6 +1223,19 @@ MUTATIONS = [
      "from 設定讀取 import ConfigError, positive_finite   # noqa: E402\ntry:",
      "tests/test_installer_order.py::test_每一個本地模組的import爆掉都要收斂成4"),
 
+    # ── R31 收尾(開源門面)────────────────────────────────────────
+    ("LICENSE 又夾帶第三方附加條款(GitHub 把授權判成 Other)",
+     "LICENSE",
+     "SOFTWARE.",
+     "SOFTWARE.\n\n---\n\nNOTE ON THIRD-PARTY MODELS: SongEval is CC BY-NC-SA.",
+     "tests/test_packaging.py::test_LICENSE要是純MIT不可以夾帶附加條款"),
+
+    ("白名單沒放行第三方聲明(別人 clone 下來沒有那個檔)",
+     ".gitignore",
+     "!THIRD_PARTY_NOTICES.md\n",
+     "",
+     "tests/test_packaging.py::test_第三方聲明要真的進得了repo"),
+
     # ── Codex R30 ────────────────────────────────────────────────
     ("評審團退回切人話拿路徑(說明文字被當成路徑的一部分)",
      "評審團.py",

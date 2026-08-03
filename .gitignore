@@ -17,6 +17,7 @@
 !.gitattributes
 !README.md
 !LICENSE
+!THIRD_PARTY_NOTICES.md
 !SKILL.md
 !.env.example
 !requirements.txt
